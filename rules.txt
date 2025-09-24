@@ -1,0 +1,19 @@
+rocks and sticks
+played on a square grid
+aim of the game is to encapsulate an area, i.e. place a stick that completes a polygon
+players take turns placing either a rock or a stick
+sticks: placed from one vertex to any of the eight adjacent vertices
+rocks: placed on a single vertex, belongs to a player. prevents the opponent from placing sticks from (but not to) that vertex
+
+when playing on paper indicate sticks as lines between vertices and rocks as small circles around vertices. use different coloured pens for each player
+
+additionally:
+- sticks can only be placed from a vertex connected to an existing stick
+- starting position is one vertical stick
+- only one rock per vertex
+- passing your turn is allowed
+- cannot cross sticks diagonally 
+- cannot place three rocks successively, i.e. if you placed rocks on both of your last two turns you cannot place a rock this turn
+- the three sided polygon with area 0.5 does not count. it does not give you any area
+- you cannot place a rock on your first move
+- if the player who went first is the first to get area, the second player gets one additional move to match or exceed the area. if they match the area the game continues, otherwise the player with more area wins.
