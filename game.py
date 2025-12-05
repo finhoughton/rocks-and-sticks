@@ -4,7 +4,7 @@ from typing import Iterator, Any
 
 from constants import HALF_AREA_COUNTS, STARTING_STICK, N_ROCKS, second
 from models import D, Move, Node, PASS, Stick, calculate_area, calculate_end
-from players import AIPlayer, HumanPlayer, Player # type: ignore
+from players import AlphaBetaPlayer, MCTSPlayer, HumanPlayer, Player # type: ignore
 
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
@@ -14,7 +14,7 @@ class Game:
     def __init__(self):
         self.turn_number = 0
 
-        self.players: list[Player] = [HumanPlayer(0), AIPlayer(1)]
+        self.players: list[Player] = [HumanPlayer(0), MCTSPlayer(1)]
         self.players_scores: list[int] = [0 for _ in self.players]
         self.num_rocks: list[int] = [N_ROCKS for _ in self.players]
         self.num_players = len(self.players)
@@ -127,11 +127,19 @@ class Game:
             self.current_player = 0
             self.turn_number += 1
 
-            players_areas = sorted(enumerate(self.players_scores), key=second)
-            players, areas = zip(*players_areas)
-            max_a = max(areas)
-            if max_a > 0 and areas.count(max_a) == 1:
-                self.winner = players[areas.index(max_a)]
+            if self.turn_number > 0:
+                players_areas = sorted(enumerate(self.players_scores), key=second)
+                players, areas = zip(*players_areas)
+                max_a = max(areas)
+
+                if max_a > 0 and areas.count(max_a) == 1:
+                    leader_idx = areas.index(max_a)
+                    leader = players[leader_idx]
+                    if leader == 0 and self.turn_number == 1:
+                        # Player 1 scored first, player 2 gets this turn
+                        pass
+                    elif leader == 1 or (leader == 0 and self.turn_number > 1):
+                        self.winner = leader
 
         self.moves.append(m)
 
