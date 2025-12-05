@@ -1,17 +1,20 @@
 from __future__ import annotations
 
-from typing import Iterator
+from typing import Iterator, Any
 
 from constants import HALF_AREA_COUNTS, STARTING_STICK, N_ROCKS, second
 from models import Direction, Move, Node, PASS, Stick, calculate_area, calculate_end
 from players import AIPlayer, HumanPlayer, Player # type: ignore
+
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 
 
 class Game:
     def __init__(self):
         self.turn_number = 0
 
-        self.players: list[Player] = [AIPlayer(0), AIPlayer(1)]
+        self.players: list[Player] = [HumanPlayer(0), AIPlayer(1)]
         self.players_scores: list[int] = [0 for _ in self.players]
         self.num_rocks: list[int] = [N_ROCKS for _ in self.players]
         self.num_players = len(self.players)
@@ -26,6 +29,10 @@ class Game:
 
         self.moves: list[Move] = []
         self._history: list[tuple[int, int, list[int], list[int], int | None]] = []
+
+        self._render_fig: Figure | None = None
+        self._render_ax: Axes | None = None
+        self._render_warned = False
 
         self.add_node_and_neighbours((0, 0))
         if STARTING_STICK:
@@ -192,16 +199,56 @@ class Game:
                     yield Move(p.x, p.y, "R")
         yield PASS
 
-    def run(self) -> None:
+    def render(self, block: bool = False) -> None:
+        import matplotlib.pyplot as plt
+
+        if self._render_fig is None or self._render_ax is None:
+            fig_ax: tuple[Figure, Axes] = plt.subplots() #type: ignore
+            fig, ax = fig_ax
+            self._render_fig = fig
+            self._render_ax = ax
+
+        ax = self._render_ax
+        ax_any: Any = ax
+        ax.clear()
+
+        for stick in self.sticks:
+            ax_any.plot([stick.start.x, stick.end.x], [stick.start.y, stick.end.y], color="black", linewidth=2, zorder=1)
+
+        for point in self.points.values():
+            if point.rocked_by is not None:
+                color = f"C{point.rocked_by.number}"
+                marker = "o"
+                ax_any.scatter(point.x, point.y, c=color, marker=marker, s=80, zorder=2)
+
+        xs = [p.x for p in self.points.values() if p.connected or p.rocked_by is not None]
+        ys = [p.y for p in self.points.values() if p.connected or p.rocked_by is not None]
+        if xs and ys:
+            ax_any.set_xlim(min(xs) - 1, max(xs) + 1)
+            ax_any.set_ylim(min(ys) - 1, max(ys) + 1)
+
+        ax_any.set_aspect("equal", "box")
+        ax_any.grid(True, alpha=0.2)
+        ax_any.set_title(f"Turn {self.turn_number} — Player {self.current_player + 1} to move")
+
+        plt.pause(0.001)
+        if block:
+            plt.show() # type: ignore
+
+    def run(self, display: bool = True) -> None:
         while True:
             print(f"Turn {self.turn_number}")
             for player in self.players:
                 m: Move = player.get_move(self)
                 print(f"Player {player.number + 1} plays {m}")
                 self.do_move(player, m)
+                if display:
+                    self.render(block=False)
 
             if self.winner is not None:
                 print(
                     f"player {self.winner + 1} wins with area {self.players_scores[self.winner] / 2}"
                 )
+                if display:
+                    self.render(block=True)
                 break
