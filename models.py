@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 
 
 class Direction(Enum):
+    NO_DIR = -1, (0, 0)
     N = 0, (0, 1)
     E = 1, (1, 0)
     NE = 2, (1, 1)
@@ -28,9 +29,14 @@ class Direction(Enum):
         return self.value[1]
 
     @cached_property
-    def reversed(self) -> Direction:
-        return list(Direction)[7 - self.as_int]
+    def reversed(self) -> D:
+        return list(D)[7 - self.as_int]
+    
+    @cached_property
+    def is_diagonal(self) -> bool:
+        return 2 <= self.as_int <= 5
 
+D = Direction
 
 class Move:
     @cache
@@ -57,8 +63,8 @@ class Node:
         self.y = y
         self.c = (x, y)
         self.rocked_by: Player | None = None
-        self.neighbours: list[Node | None] = [None for _ in Direction]
-        self.empty_directions: set[Direction] = set(Direction)
+        self.neighbours: list[Node | None] = [None for _ in D]
+        self.empty_directions: set[D] = set(D)
         self.neighbour_count: int = 0
 
     @property
@@ -69,12 +75,12 @@ class Node:
     def connected(self) -> bool:
         return self.neighbour_count > 0
 
-    def set_neighbour(self, d: Direction, neighbour: Node) -> None:
+    def set_neighbour(self, d: D, neighbour: Node) -> None:
         self.neighbours[d.as_int] = neighbour
-        self.empty_directions.remove(d)
+        self.empty_directions.discard(d)
         self.neighbour_count += 1
 
-    def clear_neighbour(self, d: Direction) -> None:
+    def clear_neighbour(self, d: D) -> None:
         self.neighbours[d.as_int] = None
         self.empty_directions.add(d)
         self.neighbour_count -= 1
@@ -106,9 +112,7 @@ class Node:
                     queue.append((neighbor, [*path, neighbor]))
         return []
 
-
-@cache
-def calculate_end(p: tuple[int, int], d: Direction) -> tuple[int, int]:
+def calculate_end(p: tuple[int, int], d: D) -> tuple[int, int]:
     x, y = p
     dx, dy = d.delta
     return (x + dx, y + dy)
@@ -129,20 +133,25 @@ def calculate_area(ps: Iterable[Node]) -> int:
 
 
 class Stick:
-    def __init__(self, start: Node, end: Node, d: Direction):
+    def __init__(self, start: Node, end: Node, d: D):
         self.start = start
         self.d = d
         self.end = end
 
+    @cached_property
+    def ordered(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        return tuple(sorted((self.start.c, self.end.c))) # type: ignore
+
     def __eq__(self, value: object) -> bool:
         if not isinstance(value, Stick):
             return False
-        return (self.start == value.start and self.end == value.end) or (
-            self.start == value.end and self.end == value.start
-        )
+        return self.ordered == value.ordered
+
+    def __hash__(self) -> int:
+        return hash(self.ordered)
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}({self.start}, {self.end}, Direction.{self.d.name})"
+        return f"{self.__class__.__name__}({self.start}, {self.end}, D.{self.d.name})"
 
     def __str__(self) -> str:
         return f"{self.start} -> {self.end}"

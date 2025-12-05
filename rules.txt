@@ -17,3 +17,5 @@ additionally:
 - the three sided polygon with area 0.5 does not count. it does not give you any area
 - you cannot place a rock on your first move
 - if the player who went first is the first to get area, the second player gets one additional move to match or exceed the area. if they match the area the game continues, otherwise the player with more area wins.
+
+Moves are entered in the format: X Y D or X Y R meaning "A stick from X, Y in direction D" or "A rock at X, Y" or "P" to pass

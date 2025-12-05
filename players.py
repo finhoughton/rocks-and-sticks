@@ -46,7 +46,7 @@ class HumanPlayer(Player):
             if not game.valid_move(m, self):
                 raise ValueError("Invalid move")
 
-        except Exception as e:  # pragma: no cover - interactive path
+        except Exception as e:
             print(f"{str(e)}, try again")
             return self.get_move(game)
         return m

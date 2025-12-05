@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Iterator, Any
 
 from constants import HALF_AREA_COUNTS, STARTING_STICK, N_ROCKS, second
-from models import Direction, Move, Node, PASS, Stick, calculate_area, calculate_end
+from models import D, Move, Node, PASS, Stick, calculate_area, calculate_end
 from players import AIPlayer, HumanPlayer, Player # type: ignore
 
 from matplotlib.axes import Axes
@@ -36,37 +36,7 @@ class Game:
 
         self.add_node_and_neighbours((0, 0))
         if STARTING_STICK:
-            self.add_stick(self.points[(0, 0)], Direction.N)
-
-    def valid_move(self, m: Move, player: Player) -> bool:
-        if m is PASS:
-            return True
-        t = m.t
-        c = m.c
-        if not (t == "R" or t in Direction._member_names_):
-            raise ValueError("Invalid move type")
-
-        point = self.points.get(c)
-        if point is None:
-            return False
-
-        if t == "R":
-            if self.turn_number == 0:
-                return False
-            if point.rocked_by is not None:
-                return False
-            if self.num_rocks[player.number] <= 0:
-                return False
-            return True
-
-        if not point.connected:
-            return False
-        d = Direction[t]
-        if point.neighbours[d.as_int] is not None:
-            return False
-        if not player.can_place(point):
-            return False
-        return True
+            self.add_stick(self.points[(0, 0)], D.N)
 
     def get_node(self, c: tuple[int, int]) -> Node:
         if c in self.points:
@@ -77,7 +47,7 @@ class Game:
 
     def add_node_and_neighbours(self, c: tuple[int, int]) -> Node:
         p = self.get_node(c)
-        for d in Direction:
+        for d in D:
             end_c = calculate_end(c, d)
             if end_c not in self.points:
                 self.points[end_c] = Node(*end_c)
@@ -87,7 +57,7 @@ class Game:
         if point.c != (0, 0):
             self.connected_points.discard(point)
 
-    def add_stick(self, start: Node, d: Direction) -> int:
+    def add_stick(self, start: Node, d: D) -> int:
         end_coords = calculate_end(start.c, d)
         end = self.add_node_and_neighbours(end_coords)
 
@@ -106,6 +76,13 @@ class Game:
         if not path:
             return 0
         return calculate_area(path)
+
+    def is_stick(self, start: tuple[int, int], end: tuple[int, int]) -> bool:
+        if start not in self.points:
+            return False
+        if end not in self.points:
+            return False
+        return Stick(self.points[start], self.points[end], D.NO_DIR) in self.sticks
 
     def remove_stick(self, stick: Stick) -> None:
         stick.start.clear_neighbour(stick.d)
@@ -136,9 +113,9 @@ class Game:
             self.rocks.append(point)
             self.num_rocks[player.number] -= 1
 
-        elif m.t in Direction.__members__:
+        elif m.t in D.__members__:
             self.num_rocks[player.number] = N_ROCKS
-            v = self.add_stick(self.points[m.c], Direction[m.t])
+            v = self.add_stick(self.points[m.c], D[m.t])
             if HALF_AREA_COUNTS or v != 1:
                 self.players_scores[player.number] += v
         else:
@@ -176,21 +153,36 @@ class Game:
             assert q == point, "Undoing rock move failed"
             return
 
-        if last_move.t in Direction.__members__:
+        if last_move.t in D.__members__:
             stick = self.sticks.pop()
-            assert stick.start.c == last_move.c and stick.d == Direction[last_move.t], "Undoing stick move failed"
+            assert stick.start.c == last_move.c and stick.d == D[last_move.t], "Undoing stick move failed"
             self.remove_stick(stick)
             return
 
         raise ValueError("Invalid move type for undo")
+    
+    def intersects_stick(self, start: tuple[int, int], d: D) -> bool:
+        # to check if a diagonal stick intersects an existing stick
+        if not d.is_diagonal:
+            return False
+        (x1, y1) = start
+        (x2, y2) = calculate_end(start, d)
+        dx = x2 - x1
+        dy = y2 - y1
+        mx = x1 + x2
+        my = y1 + y2
+        a = ((mx - dy)//2, (my + dx)//2)
+        b = ((mx + dy)//2, (my - dx)//2)
+        return self.is_stick(a, b)
 
     def get_possible_moves(self, player: Player) -> Iterator[Move]:
         for p in list(self.connected_points):
             if not player.can_place(p):
                 continue
-            for d in p.empty_directions:
-                yield Move(p.x, p.y, d.name)
-
+            for d in list(p.empty_directions):
+                if not self.intersects_stick(p.c, d):
+                    yield Move(p.x, p.y, d.name)
+ 
         can_rock = (self.turn_number != 0) and (self.num_rocks[player.number] > 0)
 
         if can_rock:
@@ -198,6 +190,43 @@ class Game:
                 if p.rocked_by is None:
                     yield Move(p.x, p.y, "R")
         yield PASS
+
+    def valid_move(self, m: Move, player: Player) -> bool:
+        if m is PASS:
+            return True
+        t = m.t
+        c = m.c
+        if not (t == "R" or t in D._member_names_):
+            raise ValueError("Invalid move type")
+
+        point = self.points.get(c)
+        if point is None:
+            return False
+
+        if t == "R":
+            if self.turn_number == 0:
+                return False
+            if point.rocked_by is not None:
+                return False
+            if self.num_rocks[player.number] <= 0:
+                return False
+            return True
+
+        if not point.connected:
+            return False
+        d = D[t]
+        if point.neighbours[d.as_int] is not None:
+            return False
+        # Check if the end node also doesn't already have this connection
+        end_coords = calculate_end(c, d)
+        end_point = self.points.get(end_coords)
+        if end_point and end_point.neighbours[d.reversed.as_int] is not None:
+            return False
+        if not player.can_place(point):
+            return False
+        if self.intersects_stick(c, d):
+            return False
+        return True
 
     def render(self, block: bool = False) -> None:
         import matplotlib.pyplot as plt
