@@ -3,13 +3,18 @@ from __future__ import annotations
 from collections import deque
 from enum import Enum
 from functools import cache, cached_property
-from typing import Iterable, TYPE_CHECKING
+from typing import Iterable, TYPE_CHECKING, Iterator
 
 if TYPE_CHECKING:
     from players import Player
+from enum import EnumMeta
 
 
-class Direction(Enum):
+class DirectionMeta(EnumMeta):
+    def __iter__(cls) -> Iterator[Direction]:
+        return (m for m in super().__iter__() if m.value[0] != -1) # type: ignore
+
+class Direction(Enum, metaclass=DirectionMeta):
     NO_DIR = -1, (0, 0)
     N = 0, (0, 1)
     E = 1, (1, 0)
@@ -29,9 +34,14 @@ class Direction(Enum):
         return self.value[1]
 
     @cached_property
-    def reversed(self) -> D:
-        return list(D)[7 - self.as_int]
-    
+    def reversed(self) -> Direction:
+        # find the direction whose delta is the negation of this one
+        rev_delta = (-self.delta[0], -self.delta[1])
+        for m in type(self):
+            if m.delta == rev_delta:
+                return m
+        return Direction.NO_DIR
+
     @cached_property
     def is_diagonal(self) -> bool:
         return 2 <= self.as_int <= 5
