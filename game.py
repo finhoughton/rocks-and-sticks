@@ -1,20 +1,26 @@
 from __future__ import annotations
 
-from typing import Iterator, Any
+import copy
+from typing import TYPE_CHECKING, Any, Iterator
 
-from constants import HALF_AREA_COUNTS, STARTING_STICK, N_ROCKS, second
-from models import D, Move, Node, PASS, Stick, calculate_area, calculate_end
-from players import AlphaBetaPlayer, MCTSPlayer, HumanPlayer, Player # type: ignore
+from constants import HALF_AREA_COUNTS, MCTS_SEED, N_ROCKS, STARTING_STICK, second
+from models import PASS, D, Move, Node, Stick, calculate_area, calculate_end
+from players import HumanPlayer, MCTSPlayer, Player  # type: ignore
 
-from matplotlib.axes import Axes
-from matplotlib.figure import Figure
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 
 class Game:
-    def __init__(self):
+    def __init__(self, players: list[Player] | None = None):
         self.turn_number = 0
 
-        self.players: list[Player] = [HumanPlayer(0), MCTSPlayer(1)]
+        self.players: list[Player] = (
+            players
+            if players is not None
+            else [HumanPlayer(0), MCTSPlayer(1, seed=MCTS_SEED)]
+        )
         self.players_scores: list[int] = [0 for _ in self.players]
         self.num_rocks: list[int] = [N_ROCKS for _ in self.players]
         self.num_players = len(self.players)
@@ -30,13 +36,29 @@ class Game:
         self.moves: list[Move] = []
         self._history: list[tuple[int, int, list[int], list[int], int | None]] = []
 
-        self._render_fig: Figure | None = None
-        self._render_ax: Axes | None = None
+        self._render_fig: "Figure | None" = None
+        self._render_ax: "Axes | None" = None
         self._render_warned = False
 
         self.add_node_and_neighbours((0, 0))
         if STARTING_STICK:
             self.add_stick(self.points[(0, 0)], D.N)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Game:
+        # Deepcopy is used by MCTS to create a private working game.
+        # Never copy matplotlib objects: deepcopying figures/axes can create
+        # a second window and is not part of the logical game state.
+
+        result: Game = type(self).__new__(type(self))
+        memo[id(self)] = result
+
+        for key, value in self.__dict__.items():
+            if key in {"_render_fig", "_render_ax"}:
+                setattr(result, key, None)
+                continue
+            setattr(result, key, copy.deepcopy(value, memo))
+
+        return result
 
     def get_node(self, c: tuple[int, int]) -> Node:
         if c in self.points:
@@ -82,6 +104,7 @@ class Game:
             return False
         if end not in self.points:
             return False
+        # could also check if the end is a neighbour of start
         return Stick(self.points[start], self.points[end], D.NO_DIR) in self.sticks
 
     def remove_stick(self, stick: Stick) -> None:
@@ -150,7 +173,13 @@ class Game:
         last_move = self.moves.pop()
         point = self.points[last_move.c]
 
-        self.turn_number, self.current_player, self.players_scores, self.num_rocks, self.winner = self._history.pop()
+        (
+            self.turn_number,
+            self.current_player,
+            self.players_scores,
+            self.num_rocks,
+            self.winner,
+        ) = self._history.pop()
 
         if last_move is PASS:
             return
@@ -163,12 +192,14 @@ class Game:
 
         if last_move.t in D.__members__:
             stick = self.sticks.pop()
-            assert stick.start.c == last_move.c and stick.d == D[last_move.t], "Undoing stick move failed"
+            assert stick.start.c == last_move.c and stick.d == D[last_move.t], (
+                "Undoing stick move failed"
+            )
             self.remove_stick(stick)
             return
 
         raise ValueError("Invalid move type for undo")
-    
+
     def intersects_stick(self, start: tuple[int, int], d: D) -> bool:
         # to check if a diagonal stick intersects an existing stick
         if not d.is_diagonal:
@@ -179,8 +210,8 @@ class Game:
         dy = y2 - y1
         mx = x1 + x2
         my = y1 + y2
-        a = ((mx - dy)//2, (my + dx)//2)
-        b = ((mx + dy)//2, (my - dx)//2)
+        a = ((mx - dy) // 2, (my + dx) // 2)
+        b = ((mx + dy) // 2, (my - dx) // 2)
         return self.is_stick(a, b)
 
     def get_possible_moves(self, player: Player) -> Iterator[Move]:
@@ -190,12 +221,16 @@ class Game:
             for d in list(p.empty_directions):
                 if not self.intersects_stick(p.c, d):
                     yield Move(p.x, p.y, d.name)
- 
+
         can_rock = (self.turn_number != 0) and (self.num_rocks[player.number] > 0)
 
         if can_rock:
+            xs = [p.x for p in self.connected_points] + [r.x for r in self.rocks]
+            ys = [p.y for p in self.connected_points] + [r.y for r in self.rocks]
+            minx, maxx = min(xs) - 1, max(xs) + 1
+            miny, maxy = min(ys) - 1, max(ys) + 1
             for p in list(self.points.values()):
-                if p.rocked_by is None:
+                if p.rocked_by is None and minx <= p.x <= maxx and miny <= p.y <= maxy:
                     yield Move(p.x, p.y, "R")
         yield PASS
 
@@ -240,7 +275,7 @@ class Game:
         import matplotlib.pyplot as plt
 
         if self._render_fig is None or self._render_ax is None:
-            fig_ax: tuple[Figure, Axes] = plt.subplots() #type: ignore
+            fig_ax: tuple[Figure, Axes] = plt.subplots()  # type: ignore
             fig, ax = fig_ax
             self._render_fig = fig
             self._render_ax = ax
@@ -250,7 +285,13 @@ class Game:
         ax.clear()
 
         for stick in self.sticks:
-            ax_any.plot([stick.start.x, stick.end.x], [stick.start.y, stick.end.y], color="black", linewidth=2, zorder=1)
+            ax_any.plot(
+                [stick.start.x, stick.end.x],
+                [stick.start.y, stick.end.y],
+                color="black",
+                linewidth=2,
+                zorder=1,
+            )
 
         for point in self.points.values():
             if point.rocked_by is not None:
@@ -258,19 +299,25 @@ class Game:
                 marker = "o"
                 ax_any.scatter(point.x, point.y, c=color, marker=marker, s=80, zorder=2)
 
-        xs = [p.x for p in self.points.values() if p.connected or p.rocked_by is not None]
-        ys = [p.y for p in self.points.values() if p.connected or p.rocked_by is not None]
+        xs = [
+            p.x for p in self.points.values() if p.connected or p.rocked_by is not None
+        ]
+        ys = [
+            p.y for p in self.points.values() if p.connected or p.rocked_by is not None
+        ]
         if xs and ys:
             ax_any.set_xlim(min(xs) - 1, max(xs) + 1)
             ax_any.set_ylim(min(ys) - 1, max(ys) + 1)
 
         ax_any.set_aspect("equal", "box")
         ax_any.grid(True, alpha=0.2)
-        ax_any.set_title(f"Turn {self.turn_number} — Player {self.current_player + 1} to move")
+        ax_any.set_title(
+            f"Turn {self.turn_number} — Player {self.current_player + 1} to move"
+        )
 
-        plt.pause(0.001)
+        plt.pause(0.01)  # type: ignore
         if block:
-            plt.show() # type: ignore
+            plt.show()  # type: ignore
 
     def run(self, display: bool = True) -> None:
         while True:

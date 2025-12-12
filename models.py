@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 from collections import deque
-from enum import Enum
-from functools import cache, cached_property
-from typing import Iterable, TYPE_CHECKING, Iterator
+from enum import Enum, EnumMeta
+from functools import cached_property
+from typing import TYPE_CHECKING, Iterable, Iterator
 
 if TYPE_CHECKING:
     from players import Player
-from enum import EnumMeta
 
 
 class DirectionMeta(EnumMeta):
     def __iter__(cls) -> Iterator[Direction]:
-        return (m for m in super().__iter__() if m.value[0] != -1) # type: ignore
+        return (m for m in super().__iter__() if m.value[0] != -1)  # type: ignore
+
 
 class Direction(Enum, metaclass=DirectionMeta):
     NO_DIR = -1, (0, 0)
@@ -46,12 +46,12 @@ class Direction(Enum, metaclass=DirectionMeta):
     def is_diagonal(self) -> bool:
         return 2 <= self.as_int <= 5
 
+
 D = Direction
 
+
 class Move:
-    @cache
-    def __new__(cls, x: int, y: int, t: str) -> Move:  # type: ignore[override]
-        return super().__new__(cls)
+    __slots__ = ("c", "t")
 
     def __init__(self, x: int, y: int, t: str):
         self.c = (x, y)
@@ -63,8 +63,20 @@ class Move:
     def __bool__(self) -> bool:
         return True
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Move):
+            return False
+        return self.c == other.c and self.t == other.t
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Move:
+        return self  # since immutable-ish
+
 
 PASS = Move(0, 0, "P")
+
+
+def move_sort_key(m: Move) -> tuple[str, int, int]:
+    return (m.t, m.c[0], m.c[1])
 
 
 class Node:
@@ -122,6 +134,7 @@ class Node:
                     queue.append((neighbor, [*path, neighbor]))
         return []
 
+
 def calculate_end(p: tuple[int, int], d: D) -> tuple[int, int]:
     x, y = p
     dx, dy = d.delta
@@ -150,7 +163,7 @@ class Stick:
 
     @cached_property
     def ordered(self) -> tuple[tuple[int, int], tuple[int, int]]:
-        return tuple(sorted((self.start.c, self.end.c))) # type: ignore
+        return tuple(sorted((self.start.c, self.end.c)))  # type: ignore
 
     def __eq__(self, value: object) -> bool:
         if not isinstance(value, Stick):
