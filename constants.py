@@ -4,7 +4,7 @@ HALF_AREA_COUNTS = False
 STARTING_STICK = True
 
 N_ROCKS = 2
-AI_DEPTH = 3
+ALPHABETA_DEPTH = 3
 
 # Set to an int (e.g. 0) to make MCTS deterministic for testing.
 MCTS_SEED: int | None = 0
