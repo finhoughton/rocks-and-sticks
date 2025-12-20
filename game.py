@@ -6,7 +6,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator
 
 from constants import HALF_AREA_COUNTS, MCTS_SEED, N_ROCKS, STARTING_STICK, second
-from models import PASS, D, Move, Node, Stick, calculate_area, calculate_end
+from models import (
+    PASS,
+    D,
+    Move,
+    Node,
+    Stick,
+    calculate_area,
+    calculate_end,
+)
 from players import HumanPlayer, MCTSPlayer, Player  # type: ignore
 
 if TYPE_CHECKING:
@@ -106,6 +114,9 @@ class Game:
         self.stick_endpoints: set[Edge] = set()
         self.claimed_regions: list[ClaimedRegion] = []
 
+        # Cache for diagonal intersection checks: (x, y) -> bool
+        self._intersects_cache: set[tuple[int, int]] = set()
+
         self.moves: list[Move] = []
         self._history: list[tuple[int, int, list[int], list[int], int | None, int]] = []
 
@@ -135,54 +146,61 @@ class Game:
                 return True
         return False
 
-    def _shortest_paths(self, start: Node, end: Node, max_paths: int = 32) -> list[list[Node]]:
+    def _shortest_paths(self, start: Node, end: Node, max_paths: int = 4) -> list[list[Node]]:
         """Enumerate up to `max_paths` shortest paths from start to end in the current stick graph."""
-
-        if start == end:
+        if start is end:
             return [[start]]
-        if not start.connected or not end.connected:
+        if not (start.connected and end.connected):
             return []
 
-        dist: dict[Node, int] = {start: 0}
-        parents: dict[Node, list[Node]] = {start: []}
-        q: deque[Node] = deque([start])
-
+        # BFS from `end` to get shortest distances; stop expanding once `start` is reached.
+        dist: dict[Node, int] = {end: 0}
+        dist_start: int | None = None
+        q: deque[Node] = deque([end])
         while q:
             cur = q.popleft()
-            dcur = dist[cur]
-            if cur == end:
-                # Still continue; we want all parents at shortest distance.
-                continue
-            for nb in cur.neighbours_list:
-                nd = dcur + 1
-                if nb not in dist:
-                    dist[nb] = nd
-                    parents[nb] = [cur]
-                    q.append(nb)
-                elif dist[nb] == nd:
-                    parents[nb].append(cur)
-
-        if end not in dist:
+            cur_dist = dist[cur]
+            if dist_start is not None and cur_dist >= dist_start:
+                break
+            next_dist = cur_dist + 1
+            for nbr in cur.neighbours:
+                if nbr is None or nbr in dist:
+                    continue
+                dist[nbr] = next_dist
+                if nbr is start:
+                    dist_start = next_dist
+                    continue
+                if dist_start is None or next_dist < dist_start:
+                    q.append(nbr)
+        if start not in dist:
             return []
 
-        out: list[list[Node]] = []
-        path: list[Node] = [end]
+        paths: list[list[Node]] = []
+        neighbours_cache: dict[Node, tuple[Node, ...]] = {}
+        stack: list[tuple[Node, list[Node], set[Node]]] = [(start, [start], {start})]
 
-        def backtrack(node: Node) -> None:
-            if len(out) >= max_paths:
-                return
-            if node == start:
-                out.append(list(reversed(path)))
-                return
-            for p in parents.get(node, []):
-                path.append(p)
-                backtrack(p)
-                path.pop()
+        # DFS constrained to distance-descending neighbours to stay on shortest paths.
+        while stack and len(paths) < max_paths:
+            node, path, path_set = stack.pop()
+            node_dist = dist[node]
+            ordered = neighbours_cache.get(node)
+            if ordered is None:
+                ordered = tuple(sorted(node.neighbours_list, key=lambda n: n.c))
+                neighbours_cache[node] = ordered
+            for nbr in ordered:
+                if nbr in path_set:
+                    continue
+                if dist.get(nbr) != node_dist - 1:
+                    continue
+                next_path = path + [nbr]
+                if nbr is end:
+                    paths.append(next_path)
+                    if len(paths) >= max_paths:
+                        return paths
+                else:
+                    stack.append((nbr, next_path, path_set | {nbr}))
 
-        backtrack(end)
-        # Deterministic ordering.
-        out.sort(key=lambda ps: [(n.x, n.y) for n in ps])
-        return out
+        return paths
 
     def _best_unclaimed_cycle(self, start: Node, end: Node) -> tuple[int, tuple[tuple[int, int], ...], frozenset[Edge]] | None:
         """Pick the best (highest area) unclaimed cycle among shortest start->end paths."""
@@ -214,9 +232,8 @@ class Game:
 
     def __deepcopy__(self, memo: dict[int, object]) -> Game:
         # Deepcopy is used by MCTS to create a private working game.
-        # Never copy matplotlib objects: deepcopying figures/axes can create
-        # a second window and is not part of the logical game state.
-
+        # copying matplotlib objects can cause bugs, skip them.
+        
         result: Game = type(self).__new__(type(self))
         memo[id(self)] = result
 
@@ -250,6 +267,9 @@ class Game:
     def add_stick(self, start: Node, d: D, owner: int | None) -> int:
         end_coords = calculate_end(start.c, d)
         end = self.add_node_and_neighbours(end_coords)
+
+        # Invalidate only the cache entries that would have relied on this stick.
+        self._flip_intersects_cache_for_stick(start.c, d)
 
         # If there is already a path between the endpoints, adding this stick closes a cycle.
         # There can be multiple shortest paths; choose a cycle that is not already claimed.
@@ -286,6 +306,9 @@ class Game:
         stick = self.sticks.pop()
         stick.start.clear_neighbour(stick.d)
         stick.end.clear_neighbour(stick.d.reversed)
+
+        # Removing a stick flips the answer for any cached crossing checks involving it.
+        self._flip_intersects_cache_for_stick(stick.start.c, stick.d)
 
         if not stick.start.connected:
             self.remove_connected_point(stick.start)
@@ -388,27 +411,39 @@ class Game:
         if not d.is_diagonal:
             return False
         (x1, y1) = start
-        (x2, y2) = calculate_end(start, d)
-        dx = x2 - x1
-        dy = y2 - y1
-        mx = x1 + x2
-        my = y1 + y2
-        a = ((mx - dy) // 2, (my + dx) // 2)
-        b = ((mx + dy) // 2, (my - dx) // 2)
-        return self.is_stick(a, b)
+        (d1, d2) = d.delta
+        key = (2 * x1 + d1, 2 * y1 + d2)
+        return key in self._intersects_cache
+
+    def _flip_intersects_cache_for_stick(self, start: tuple[int, int], d: D) -> None:
+        if not d.is_diagonal:
+            return
+        (x1, y1) = start
+        (d1, d2) = d.delta
+        key = (2 * x1 + d1, 2 * y1 + d2)
+        if key in self._intersects_cache:
+            self._intersects_cache.remove(key)
+        else:
+            self._intersects_cache.add(key)
 
     def get_possible_moves(self, player: Player) -> Iterator[Move]:
+        coord_in_region = self.coord_in_claimed_region
+        intersects_stick = self.intersects_stick
+        end_fn = calculate_end
+
         for p in list(self.connected_points):
             if not player.can_place(p):
                 continue
-            if self.coord_in_claimed_region(p.c):
+            pc = p.c
+            if coord_in_region(pc):
                 continue
             for d in list(p.empty_directions):
-                if not self.intersects_stick(p.c, d):
-                    end_c = calculate_end(p.c, d)
-                    if self.coord_in_claimed_region(end_c):
-                        continue
-                    yield Move(p.x, p.y, d.name)
+                if intersects_stick(pc, d):
+                    continue
+                end_c = end_fn(pc, d)
+                if coord_in_region(end_c):
+                    continue
+                yield Move(p.x, p.y, d.name)
 
         can_rock = (self.turn_number != 0) and (self.num_rocks[player.number] > 0)
 
@@ -419,7 +454,7 @@ class Game:
             miny, maxy = min(ys) - 1, max(ys) + 1
             for p in list(self.points.values()):
                 if p.rocked_by is None and minx <= p.x <= maxx and miny <= p.y <= maxy:
-                    if self.coord_in_claimed_region(p.c):
+                    if coord_in_region(p.c):
                         continue
                     yield Move(p.x, p.y, "R")
         yield PASS

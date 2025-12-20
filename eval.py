@@ -17,6 +17,7 @@ class EvalConfig:
     max_turns: int = 200
     mcts_rollouts: int = 400
     mcts_sim_depth: int = 60
+    mcts_time_limit: float | None = None
     mcts0_seed: int | None = 0
     mcts1_seed: int | None = 1
     random_seed: int | None = 1
@@ -36,12 +37,14 @@ def play_one_game(cfg: EvalConfig, game_index: int) -> int | None:
             seed=None if cfg.mcts0_seed is None else cfg.mcts0_seed + game_index,
             n_rollouts=cfg.mcts_rollouts,
             max_sim_depth=cfg.mcts_sim_depth,
+            time_limit=cfg.mcts_time_limit,
         )
         p1 = MCTSPlayer(
             1,
             seed=None if cfg.mcts1_seed is None else cfg.mcts1_seed + game_index,
             n_rollouts=cfg.mcts_rollouts,
             max_sim_depth=cfg.mcts_sim_depth,
+            time_limit=cfg.mcts_time_limit,
         )
     elif cfg.mode == "mcts-vs-alphabeta":
         p0 = AlphaBetaPlayer(0)
@@ -50,6 +53,7 @@ def play_one_game(cfg: EvalConfig, game_index: int) -> int | None:
             seed=None if cfg.mcts1_seed is None else cfg.mcts1_seed + game_index,
             n_rollouts=cfg.mcts_rollouts,
             max_sim_depth=cfg.mcts_sim_depth,
+            time_limit=cfg.mcts_time_limit,
         )
     elif cfg.mode == "alphabeta-vs-mcts":
         p0 = MCTSPlayer(
@@ -57,6 +61,7 @@ def play_one_game(cfg: EvalConfig, game_index: int) -> int | None:
             seed=None if cfg.mcts0_seed is None else cfg.mcts0_seed + game_index,
             n_rollouts=cfg.mcts_rollouts,
             max_sim_depth=cfg.mcts_sim_depth,
+            time_limit=cfg.mcts_time_limit,
         )
         p1 = AlphaBetaPlayer(1)
     else:
@@ -68,6 +73,7 @@ def play_one_game(cfg: EvalConfig, game_index: int) -> int | None:
             seed=None if cfg.mcts1_seed is None else cfg.mcts1_seed + game_index,
             n_rollouts=cfg.mcts_rollouts,
             max_sim_depth=cfg.mcts_sim_depth,
+            time_limit=cfg.mcts_time_limit,
         )
 
     g = Game(players=[p0, p1])
@@ -129,6 +135,7 @@ def main() -> None:
     parser.add_argument("--max-turns", type=int, default=200)
     parser.add_argument("--rollouts", type=int, default=400)
     parser.add_argument("--sim-depth", type=int, default=60)
+    parser.add_argument("--time-limit", type=float, default=None, help="Per-move MCTS time limit in seconds (overrides rollout cap)")
     parser.add_argument("--mcts0-seed", type=int, default=0)
     parser.add_argument("--mcts1-seed", type=int, default=1)
     parser.add_argument("--random-seed", type=int, default=1)
@@ -159,6 +166,7 @@ def main() -> None:
         max_turns=args.max_turns,
         mcts_rollouts=args.rollouts,
         mcts_sim_depth=args.sim_depth,
+        mcts_time_limit=args.time_limit,
         mcts0_seed=None if args.mcts0_seed < 0 else args.mcts0_seed,
         mcts1_seed=None if args.mcts1_seed < 0 else args.mcts1_seed,
         random_seed=None if args.random_seed < 0 else args.random_seed,

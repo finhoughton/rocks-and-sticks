@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from enum import Enum, EnumMeta
-from functools import cached_property
+from functools import cache, cached_property
 from typing import TYPE_CHECKING, Iterable, Iterator
 
 if TYPE_CHECKING:
@@ -11,7 +11,9 @@ if TYPE_CHECKING:
 
 class DirectionMeta(EnumMeta):
     def __iter__(cls) -> Iterator[Direction]:
-        return (m for m in super().__iter__() if m.value[0] != -1)  # type: ignore
+        if not hasattr(cls, "_filtered_members"):
+            cls._filtered_members = tuple(m for m in super().__iter__() if m.value[0] != -1) # type: ignore
+        return iter(cls._filtered_members) # type: ignore
 
 
 class Direction(Enum, metaclass=DirectionMeta):
@@ -45,6 +47,13 @@ class Direction(Enum, metaclass=DirectionMeta):
     @cached_property
     def is_diagonal(self) -> bool:
         return 2 <= self.as_int <= 5
+
+@cache
+def delta_to_direction(delta: tuple[int, int]) -> Direction | None:
+    for d in Direction:
+        if d.delta == delta:
+            return d
+    return None
 
 
 D = Direction
@@ -97,7 +106,7 @@ class Node:
 
     @property
     def connected(self) -> bool:
-        return self.neighbour_count > 0
+        return self.neighbour_count != 0
 
     def set_neighbour(self, d: D, neighbour: Node) -> None:
         self.neighbours[d.as_int] = neighbour

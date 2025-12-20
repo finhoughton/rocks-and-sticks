@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, DefaultDict, Generator, Iterator, List, cast
+from typing import TYPE_CHECKING, DefaultDict, Iterator, List, cast
 
 from constants import ALPHABETA_DEPTH, HALF_AREA_COUNTS
 from models import PASS, D, Move, MoveKey, calculate_area, calculate_end, move_sort_key
@@ -63,23 +63,18 @@ class Player(ABC):
 
 
 @contextmanager
-def applied_move(game: Game, player: Player, move: Move) -> Generator[None, None, None]:
+def applied_move(game: Game, player: Player, move: Move):
     game.do_move(player, move)
-    try:
-        yield
-    finally:
-        game.undo_move()
+    yield
+    game.undo_move()
 
 
 @contextmanager
-def rollback_to(game: Game) -> Generator[None, None, None]:
+def rollback_to(game: Game):
     start_len = len(game.moves)
-    try:
-        yield
-    finally:
-        # `undo_move` rewinds the last move; player identity not needed.
-        while len(game.moves) > start_len:
-            game.undo_move()
+    yield
+    while len(game.moves) > start_len:
+        game.undo_move()
 
 
 class HumanPlayer(Player):
@@ -111,7 +106,7 @@ class RandomPlayer(Player):
     def get_move(self, game: Game) -> Move:
         moves = list(game.get_possible_moves(self))
         # Keep behavior deterministic under a fixed seed.
-        moves.sort(key=lambda m: (m.t, m.c[0], m.c[1]))
+        moves.sort(key=move_sort_key)
         return self._rng.choice(moves)
 
 
@@ -157,36 +152,33 @@ class AIPlayer(Player):
         if cached is not None:
             return cached
 
-        if game.winner is not None:
-            v = float("inf") if game.winner == player else float("-inf")
-            cls._eval_cache[cache_key] = v
-            return v
         opp_idx = 1 - player.number
-        score_diff = game.players_scores[player.number] - game.players_scores[opp_idx]
-        # if player 0 scores on turn 1, the game doesn't end yet.
-        if game.turn_number == 1 and player.number == 0 and score_diff > 0:
-            score_diff *= 0.4  # random number < 1
 
-        my_ts = cls._tactical_stats(game, player, state_key)
-        opp_ts = cls._tactical_stats(game, game.players[opp_idx], state_key)
-        turn_me = game.current_player == player
-        (w_me, w_opp) = (1.0, 0.4) if turn_me else (0.4, 1.0)
+        if game.winner == player.number:
+            v = float("inf")
+        elif game.winner == opp_idx:
+            v = float("-inf")
+        else:
+            my_ts = cls._tactical_stats(game, player, state_key)
+            opp_ts = cls._tactical_stats(game, game.players[opp_idx], state_key)
 
-        v = (
-              3.0 * score_diff
-            + 1.2 * my_ts.blocking_power
-            + 0.7 * my_ts.stick_opportunities
-            + 1.3 * my_ts.potential_area
-            - 2.0 * opp_ts.potential_area
-            + 1.8 * (my_ts.rock_value - opp_ts.rock_value)
-            + 1.2 * (my_ts.max_immediate_gain - opp_ts.max_immediate_gain)
-            + 0.3 * (my_ts.top3_gain_sum - opp_ts.top3_gain_sum)
-            + 0.3 * float(my_ts.scoring_move_count - opp_ts.scoring_move_count)
-            + 0.1 * float(my_ts.legal_stick_move_count - opp_ts.legal_stick_move_count)
-            - 0.5 * w_me * my_ts.best_reply_gain
-            + 0.5 * w_opp * opp_ts.best_reply_gain
-            - 0.1 * float(my_ts.bad_closure_count - opp_ts.bad_closure_count)
-        )
+            turn_me = game.current_player == player.number
+            (w_me, w_opp) = (1.0, 0.4) if turn_me else (0.4, 1.0)
+
+            v = (
+                1.2 * my_ts.blocking_power
+                + 0.7 * my_ts.stick_opportunities
+                + 1.3 * my_ts.potential_area
+                - 2.0 * opp_ts.potential_area
+                + 1.8 * (my_ts.rock_value - opp_ts.rock_value)
+                + 1.2 * (my_ts.max_immediate_gain - opp_ts.max_immediate_gain)
+                + 0.3 * (my_ts.top3_gain_sum - opp_ts.top3_gain_sum)
+                + 0.3 * float(my_ts.scoring_move_count - opp_ts.scoring_move_count)
+                + 0.1 * float(my_ts.legal_stick_move_count - opp_ts.legal_stick_move_count)
+                - 0.5 * w_me * my_ts.best_reply_gain
+                + 0.5 * w_opp * opp_ts.best_reply_gain
+                - 0.1 * float(my_ts.bad_closure_count - opp_ts.bad_closure_count)
+            )
 
         cls._eval_cache[cache_key] = v
         return v
@@ -251,12 +243,8 @@ class AIPlayer(Player):
         gains: list[float] = []
 
         cap = min(eval_cap, stick_moves_count)
-        if stick_moves_count <= cap:
-            stick_sample = sorted(all_moves, key=move_sort_key)
-        else:
-            stick_sample = heapq.nsmallest(cap, all_moves, key=move_sort_key)
+        stick_sample = sorted(all_moves, key=move_sort_key)[:cap] # heapq.smallest is slower for small N
 
-        # Precompute cycle-closure areas (without mutating `game`).
         closure_area_by_key: dict[MoveKey, int | None] = {}
         for mv in stick_sample:
             closure_area_by_key[move_sort_key(mv)] = cls._closure_area(game, state_key, mv)
@@ -327,7 +315,7 @@ class AIPlayer(Player):
         )
         cls._tactical_cache[cache_key] = out
         return out
-    
+
     @classmethod
     def _closure_area(cls, game: Game, state_key: StateKey, mv: Move) -> int | None:
         key = (state_key, move_sort_key(mv))
@@ -348,7 +336,7 @@ class AIPlayer(Player):
 
         cls._closure_area_cache[key] = area
         return area
-    
+  
     @classmethod
     def _estimate_rock_opportunity_value(cls, game: Game, player: Player, state_key: StateKey | None = None, rock_eval_cap: int = 24) -> float:
         """Value remaining rocks by how impactful the *best* available rock is."""
@@ -519,14 +507,12 @@ class AIPlayer(Player):
         rock_coords = {r.c for r in game.rocks}
         x, y = c
         adjacent_rocks = 0
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                if dx == 0 and dy == 0:
-                    continue
-                if (x + dx, y + dy) in rock_coords:
-                    adjacent_rocks += 1
-                    if adjacent_rocks >= 2:
-                        return True
+        for d in D:
+            dx, dy = d.delta
+            if (x + dx, y + dy) in rock_coords:
+                adjacent_rocks += 1
+                if adjacent_rocks >= 2:
+                    return True
         return False
 
 class AlphaBetaPlayer(AIPlayer):
@@ -681,13 +667,23 @@ class MCTSPlayer(AIPlayer):
     def allows_forced_loss_next_round(self, my_move: Move, working_game: Game, player: Player) -> bool:
         """True if opponent has a reply such that every response loses (2-ply)."""
 
-        def top_k_by_heuristic(p: Player) -> list[Move]:
-            moves = list(self.search_moves_all(working_game, p))
-            k = self.tactical_branch_limit
-            if k <= 0 or len(moves) <= k:
-                return sorted(moves, key=move_sort_key)
+        # Cache move orderings per (state, player) to avoid recomputing scores
+        # while this routine mutates and rolls back `working_game`.
+        move_order_cache: dict[tuple[StateKey, int], list[tuple[float, MoveKey, Move]]] = {}
 
-            scored: list[tuple[float, MoveKey, Move]] = [(self.score_after(working_game, p, mv), move_sort_key(mv), mv) for mv in moves]
+        def top_k_by_heuristic(p: Player) -> list[Move]:
+            state_key = _game_key(working_game)
+            cache_key = (state_key, p.number)
+
+            scored = move_order_cache.get(cache_key)
+            if scored is None:
+                moves = list(self.search_moves_all(working_game, p))
+                scored = [(self.score_after(working_game, p, mv), move_sort_key(mv), mv) for mv in moves]
+                move_order_cache[cache_key] = scored
+
+            k = self.tactical_branch_limit
+            if k <= 0 or len(scored) <= k:
+                return [mv for (_s, _k, mv) in sorted(scored, key=lambda t: t[1])]
 
             top = heapq.nlargest(k, scored, key=lambda t: (t[0], t[1]))
             top.sort(key=lambda t: (-t[0], t[1]))
@@ -759,21 +755,23 @@ class MCTSPlayer(AIPlayer):
 
         # Prefer moves that do NOT allow a forced loss next round.
         allowed_root_moves = safe_root_moves
+        start_time = time.perf_counter()
+        deadline = start_time + self.time_limit if self.time_limit is not None else None
         if safe_root_moves:
             to_check = safe_root_moves[: self.tactical_root_limit]
-            non_forced_loss = [m for m in to_check if not self.allows_forced_loss_next_round(m, working_game, player)]
+            if deadline is not None and time.perf_counter() >= deadline:
+                non_forced_loss = []
+            else:
+                non_forced_loss = [m for m in to_check if not self.allows_forced_loss_next_round(m, working_game, player)]
             if non_forced_loss:
                 allowed_root_moves = non_forced_loss
-
-        start_time = time.perf_counter()
         rollouts_done = 0
         while True:
             if rollouts_done >= self.n_rollouts:
                 break
-            if self.time_limit is not None and time.perf_counter() - start_time >= self.time_limit:
-                if rollouts_done > 0:
-                    break
-                # Ensure at least one rollout even with a very low time limit.
+            now = time.perf_counter()
+            if deadline is not None and now >= deadline:
+                break
             self.do_rollout(root_key, working_game)
             rollouts_done += 1
 
@@ -791,6 +789,8 @@ class MCTSPlayer(AIPlayer):
 
         safety_limit = min(len(ranked_moves), max(self.tactical_root_limit, 40))
         for m in ranked_moves[:safety_limit]:
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
             with applied_move(working_game, player, m):
                 if working_game.winner == self.number:
                     return m
