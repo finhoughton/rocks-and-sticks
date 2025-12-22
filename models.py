@@ -11,9 +11,10 @@ if TYPE_CHECKING:
 
 class DirectionMeta(EnumMeta):
     def __iter__(cls) -> Iterator[Direction]:
-        if not hasattr(cls, "_filtered_members"):
-            cls._filtered_members = tuple(m for m in super().__iter__() if m.value[0] != -1) # type: ignore
-        return iter(cls._filtered_members) # type: ignore
+        v = getattr(cls, "_filtered_members", None)
+        if v is None:
+            cls._filtered_members = v = tuple(m for m in super().__iter__() if m.value[0] != -1) # type: ignore
+        return iter(v) # type: ignore
 
 
 class Direction(Enum, metaclass=DirectionMeta):
@@ -86,11 +87,21 @@ PASS = Move(0, 0, "P")
 
 MoveKey = tuple[str, int, int]
 
-def move_sort_key(m: Move) -> tuple[str, int, int]:
+def move_sort_key(m: Move) -> MoveKey:
     return (m.t, m.c[0], m.c[1])
 
 
 class Node:
+    __slots__ = (
+        "x",
+        "y",
+        "c",
+        "rocked_by",
+        "neighbours",
+        "empty_directions",
+        "neighbour_count",
+    )
+
     def __init__(self, x: int, y: int):
         self.x = x
         self.y = y
@@ -167,14 +178,23 @@ def calculate_area(ps: Iterable[Node]) -> int:
 
 
 class Stick:
+    __slots__ = ("start", "d", "end", "_ordered_cache")
+
     def __init__(self, start: Node, end: Node, d: D):
         self.start = start
         self.d = d
         self.end = end
+        self._ordered_cache: tuple[tuple[int, int], tuple[int, int]] | None = None
 
-    @cached_property
+    @property
     def ordered(self) -> tuple[tuple[int, int], tuple[int, int]]:
-        return tuple(sorted((self.start.c, self.end.c)))  # type: ignore
+        cached = self._ordered_cache
+        if cached is not None:
+            return cached
+        a, b = self.start.c, self.end.c
+        ordered = (a, b) if a < b else (b, a)
+        self._ordered_cache = ordered
+        return ordered
 
     def __eq__(self, value: object) -> bool:
         if not isinstance(value, Stick):
