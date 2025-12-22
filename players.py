@@ -56,9 +56,7 @@ class Player(ABC):
         return self.number == value.number
 
     def __deepcopy__(self, memo: dict[int, object]) -> Player:
-        # Players are effectively immutable identifiers.
-        # Crucially, this prevents deepcopy(Game) from cloning MCTSPlayer's
-        # internal search dictionaries, which can be huge.
+        # Players are effectively immutable identifiers
         return self
 
 
@@ -104,9 +102,7 @@ class RandomPlayer(Player):
         self._rng = random.Random(seed)
 
     def get_move(self, game: Game) -> Move:
-        moves = list(game.get_possible_moves(self))
-        # Keep behavior deterministic under a fixed seed.
-        moves.sort(key=move_sort_key)
+        moves = sorted(game.get_possible_moves(self), key=move_sort_key)
         return self._rng.choice(moves)
 
 
@@ -128,13 +124,17 @@ class TacticalStats:
 class AIPlayer(Player):
     # Per-`get_move` caches (cleared at the start of each search).
     # Cache heuristic evaluations per (state, perspective player).
-    _eval_cache: dict[tuple[StateKey, int], float] = {}
+    _eval_cache: dict[tuple[StateKey, int, bool], float] = {}
     # Tactical caches: (state_key, player_idx, include_reply) -> TacticalStats
     _tactical_cache: dict[tuple[StateKey, int, bool], TacticalStats] = {}
     _pot_cache: dict[tuple[StateKey, int], float] = {}
     _sticks_opp_cache: dict[tuple[StateKey, int], float] = {}
     _rock_value_cache: dict[tuple[StateKey, int], float] = {}
     _closure_area_cache: dict[tuple[StateKey, MoveKey], int | None] = {}
+    # Toggle between handcrafted heuristic and GNN-based evaluation.
+    use_gnn_eval: bool = False
+    # If True, fail fast instead of silently falling back when GNN eval is requested.
+    require_gnn_eval: bool = False
 
     def _clear_search_caches(self) -> None:
         self._eval_cache.clear()
@@ -147,10 +147,54 @@ class AIPlayer(Player):
     @classmethod
     def _evaluate_position_heuristic(cls, game: Game, player: Player) -> float:
         state_key = _game_key(game)
-        cache_key = (state_key, player.number)
+        cache_key = (state_key, player.number, cls.use_gnn_eval)
         cached = cls._eval_cache.get(cache_key)
         if cached is not None:
             return cached
+
+        v: float | None = None
+
+        if cls.use_gnn_eval:
+            v = cls._evaluate_with_gnn(game, player)
+
+        if v is None:
+            if cls.require_gnn_eval:
+                raise RuntimeError("GNN evaluation failed; require_gnn_eval is True")
+            v = cls._evaluate_position_handcrafted(game, player, state_key)
+
+        cls._eval_cache[cache_key] = v
+        return v
+
+    @classmethod
+    def _evaluate_with_gnn(cls, game: Game, player: Player) -> float | None:
+        # Lazy import so torch/pyg stays optional at runtime.
+        try:
+            from gnn_eval import evaluate_game
+        except Exception:
+            return None
+
+        try:
+            prob = float(evaluate_game(game))
+        except Exception:
+            return None
+
+        if player.number != game.current_player:
+            prob = 1.0 - prob
+        prob = min(max(prob, 1e-4), 1.0 - 1e-4)
+
+        # Soften overconfident outputs: apply temperature to logits before mapping to heuristic.
+        temp = 2.0
+        logit = math.log(prob / (1.0 - prob))
+        logit /= temp
+        prob = 1.0 / (1.0 + math.exp(-logit))
+
+        return 6.0 * math.atanh((prob - 0.5) * 2.0)
+
+    @classmethod
+    def _evaluate_position_handcrafted(cls, game: Game, player: Player, state_key: StateKey | None = None) -> float:
+        if state_key is None:
+            state_key = _game_key(game)
+        cache_key = (state_key, player.number, cls.use_gnn_eval)
 
         opp_idx = 1 - player.number
 
@@ -216,8 +260,8 @@ class AIPlayer(Player):
         stick_opportunities = cls._count_stick_opportunities(game, player, state_key)
         rock_value = cls._estimate_rock_opportunity_value(game, player, state_key)
         blocking_power = cls._calculate_blocking_opponent(game, player)
-        all_moves = list(cls.search_moves_sticks(game, player))
-        stick_moves_count = len(all_moves)
+        all_stick_moves = list(cls.search_moves_sticks(game, player))
+        stick_moves_count = len(all_stick_moves)
         if stick_moves_count == 0:
             out = TacticalStats(
                 max_immediate_gain=0.0,
@@ -243,7 +287,7 @@ class AIPlayer(Player):
         gains: list[float] = []
 
         cap = min(eval_cap, stick_moves_count)
-        stick_sample = sorted(all_moves, key=move_sort_key)[:cap] # heapq.smallest is slower for small N
+        stick_sample = sorted(all_stick_moves, key=move_sort_key)[:cap] # heapq.smallest is slower for small N
 
         closure_area_by_key: dict[MoveKey, int | None] = {}
         for mv in stick_sample:
@@ -516,6 +560,9 @@ class AIPlayer(Player):
         return False
 
 class AlphaBetaPlayer(AIPlayer):
+    # Mildly demote PASS so it's only chosen when it truly out-values other moves.
+    pass_penalty: float = 0.75
+
     def get_move(self, game: Game) -> Move:
         if game.num_players != 2:
             raise ValueError("Alpha-beta AI is only implemented for 2 players")
@@ -534,6 +581,8 @@ class AlphaBetaPlayer(AIPlayer):
             for move in self.search_moves_all(game, self):
                 with applied_move(game, self, move):
                     _, v2 = self.alpha_beta(game, depth - 1, a, b, False)
+                if move is PASS:
+                    v2 -= self.pass_penalty
                 if v2 > value:
                     value = v2
                     best_move = move
@@ -546,6 +595,8 @@ class AlphaBetaPlayer(AIPlayer):
         for move in self.search_moves_all(game, opp):
             with applied_move(game, opp, move):
                 _, v2 = self.alpha_beta(game, depth - 1, a, b, True)
+            if move is PASS:
+                v2 += self.pass_penalty
             if v2 < value:
                 value = v2
                 best_move = move
@@ -577,6 +628,7 @@ class MCTSPlayer(AIPlayer):
         rock_prior_bonus_disconnected: float = 0.06,
         rock_rollout_bonus_connected: float = 1.0,
         rock_rollout_bonus_disconnected: float = 0.02,
+        stick_between_opp_rocks_bonus: float = 0.4,
     ):
         # Transposition-table MCTS:
         # - Stats are stored per state key, and per (state, move) edge.
@@ -609,6 +661,7 @@ class MCTSPlayer(AIPlayer):
         self.rock_prior_bonus_disconnected = rock_prior_bonus_disconnected
         self.rock_rollout_bonus_connected = rock_rollout_bonus_connected
         self.rock_rollout_bonus_disconnected = rock_rollout_bonus_disconnected
+        self.stick_between_opp_rocks_bonus = stick_between_opp_rocks_bonus
         self.last_rollouts: int = 0
         super().__init__(player_number)
 
@@ -617,6 +670,21 @@ class MCTSPlayer(AIPlayer):
         if p is not None and p.connected:
             return connected_bonus
         return disconnected_bonus
+
+    def _stick_between_opp_rocks(self, game: Game, player: Player, mv: Move) -> bool:
+        if mv.t not in D._member_names_:
+            return False
+        start = game.points.get(mv.c)
+        if start is None or start.rocked_by is None:
+            return False
+        opp = game.players[1 - player.number]
+        if start.rocked_by is not opp:
+            return False
+        end_c = calculate_end(mv.c, D[mv.t])
+        end = game.points.get(end_c)
+        if end is None or end.rocked_by is not opp:
+            return False
+        return True
 
     def _heuristic_probability(self, game: Game, perspective_player: Player) -> float:
         """Return a soft win-probability estimate in [0, 1] for `perspective_player`."""
@@ -927,6 +995,8 @@ class MCTSPlayer(AIPlayer):
                 p = self._heuristic_probability(game, player)
             if m.t == "R":
                 p = min(0.999, p + self._rock_bonus_for_cell(game, m.c, self.rock_prior_bonus_connected, self.rock_prior_bonus_disconnected))
+            elif self._stick_between_opp_rocks(game, player, m):
+                p = min(0.999, p + self.stick_between_opp_rocks_bonus)
             priors.append((m, float(p)))
 
         # For non-evaluated moves, assign a small prior so they still become
@@ -938,6 +1008,8 @@ class MCTSPlayer(AIPlayer):
                 p = floor_p
                 if m.t == "R":
                     p = min(0.999, p + self._rock_bonus_for_cell(game, m.c, self.rock_prior_bonus_connected, self.rock_prior_bonus_disconnected))
+                elif self._stick_between_opp_rocks(game, player, m):
+                    p = min(0.999, p + self.stick_between_opp_rocks_bonus)
                 priors.append((m, p))
 
         # PASS is always legal but is rarely correct; give it a very small

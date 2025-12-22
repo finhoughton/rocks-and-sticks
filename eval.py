@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Dict
 
 from game import Game
-from players import AlphaBetaPlayer, MCTSPlayer, RandomPlayer
+from players import AIPlayer, AlphaBetaPlayer, MCTSPlayer, RandomPlayer
 
 
 @dataclass(frozen=True)
@@ -23,10 +23,29 @@ class EvalConfig:
     random_seed: int | None = 1
     show: bool = False
     pause_s: float = 0.0
-    mode: str = "mcts-vs-random"  # or "mcts-vs-mcts" / "mcts-vs-alphabeta" / "alphabeta-vs-mcts"
+    mode: str = "mcts-vs-random"  # or "mcts-vs-mcts" / "mcts-vs-alphabeta" / "alphabeta-vs-mcts" / "alphabeta-vs-alphabeta"
     profile: bool = False
     profile_top: int = 40
     profile_out: str | None = None
+    gnn_model: str | None = None
+    device: str = "cpu"
+
+
+def _maybe_load_gnn(model_path: str, device: str) -> None:
+    """Load GNN weights once and enable GNN eval for AI players."""
+
+    try:
+        from gnn_eval import encode_game_to_graph, load_model
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(f"GNN modules not available: {exc}")
+
+    temp_game = Game()  # Default players are fine for encoding dimensions.
+    enc = encode_game_to_graph(temp_game)  # type: ignore[arg-type]
+    node_dim = enc.data.x.size(1)
+    global_dim = enc.data.global_feats.size(1)
+    load_model(model_path, node_dim, global_dim, device=device)
+    AIPlayer.use_gnn_eval = True
+    AIPlayer.require_gnn_eval = True
 
 
 def play_one_game(cfg: EvalConfig, game_index: int) -> int | None:
@@ -63,6 +82,9 @@ def play_one_game(cfg: EvalConfig, game_index: int) -> int | None:
             max_sim_depth=cfg.mcts_sim_depth,
             time_limit=cfg.mcts_time_limit,
         )
+        p1 = AlphaBetaPlayer(1)
+    elif cfg.mode == "alphabeta-vs-alphabeta":
+        p0 = AlphaBetaPlayer(0)
         p1 = AlphaBetaPlayer(1)
     else:
         p0 = RandomPlayer(
@@ -127,6 +149,7 @@ def main() -> None:
             "mcts-vs-mcts",
             "mcts-vs-alphabeta",
             "alphabeta-vs-mcts",
+            "alphabeta-vs-alphabeta",
         ],
         default="mcts-vs-random",
         help="Which matchup to run",
@@ -158,6 +181,8 @@ def main() -> None:
         default=None,
         help="Optional path to write a .prof file",
     )
+    parser.add_argument("--gnn-model", type=str, default=None, help="Path to GNN weights to enable NN eval")
+    parser.add_argument("--device", type=str, default="cpu", help="Device for GNN (cpu/cuda)")
     args = parser.parse_args()
 
     cfg = EvalConfig(
@@ -175,8 +200,14 @@ def main() -> None:
         profile=args.profile,
         profile_top=args.profile_top,
         profile_out=args.profile_out,
+        gnn_model=args.gnn_model,
+        device=args.device,
     )
     wins: Dict[int | None, int] = {0: 0, 1: 0, None: 0}
+
+    if cfg.gnn_model:
+        _maybe_load_gnn(cfg.gnn_model, cfg.device)
+        print(f"Using GNN evaluator from {cfg.gnn_model} on device {cfg.device}.")
 
     def run_eval() -> None:
         for i in range(cfg.games):
@@ -245,6 +276,9 @@ def main() -> None:
     elif cfg.mode == "alphabeta-vs-mcts":
         print(f"MCTS (player 1) wins: {wins[0]} ({wins[0] / total_played:.1%})")
         print(f"AlphaBeta (player 2) wins: {wins[1]} ({wins[1] / total_played:.1%})")
+    elif cfg.mode == "alphabeta-vs-alphabeta":
+        print(f"AlphaBeta P1 (player 1) wins: {wins[0]} ({wins[0] / total_played:.1%})")
+        print(f"AlphaBeta P2 (player 2) wins: {wins[1]} ({wins[1] / total_played:.1%})")
     else:
         print(f"Random (player 1) wins: {wins[0]} ({wins[0] / total_played:.1%})")
         print(f"MCTS (player 2) wins: {wins[1]} ({wins[1] / total_played:.1%})")
