@@ -34,7 +34,8 @@ def _node_feature(node: Node, num_players: int) -> list[float]:
     owner_idx = (node.rocked_by.number + 1) if node.rocked_by is not None else 0
     owner_one_hot[owner_idx] = 1.0
     deg = float(node.neighbour_count) / 8.0  # max degree is 8 (including diagonals)
-    return [*owner_one_hot, deg, float(node.x), float(node.y)]
+    is_leaf = float(node.neighbour_count == 1)
+    return [*owner_one_hot, deg, is_leaf, float(node.x), float(node.y)]
 
 
 def _edge_index_from_points(points: Iterable[Node]) -> torch.Tensor:
@@ -57,24 +58,23 @@ def _edge_index_from_points(points: Iterable[Node]) -> torch.Tensor:
     return torch.tensor([src, dst], dtype=torch.long)
 
 
-def encode_game_to_graph(game: "Game") -> EncodedGraph:
+def encode_game_to_graph(game: Game) -> EncodedGraph:
     """Encode the visible board graph and global features for the current player."""
     # Limit to connected points plus rock locations to keep the graph compact.
     point_set = set(game.connected_points)
     point_set.update(game.rocks)
-    if not point_set:
-        point_set.add(game.points[(0, 0)])
 
-    nodes = sorted(point_set, key=lambda n: (n.x, n.y))
+    nodes = sorted(point_set, key=lambda n: n.c)
     x = torch.tensor([_node_feature(n, game.num_players) for n in nodes], dtype=torch.float32)
     edge_index = _edge_index_from_points(nodes)
 
-    # Global features: turn, current_player one-hot, scores, rocks remaining.
+    # Global features: turn, current_player one-hot, scores, rocks remaining, total rocks placed.
     turn = float(game.turn_number)
     cur_one_hot = [1.0 if i == game.current_player else 0.0 for i in range(game.num_players)]
     scores = [float(s) for s in game.players_scores]
     rocks_left = [float(r) for r in game.num_rocks]
-    global_feats = torch.tensor([turn, *cur_one_hot, *scores, *rocks_left], dtype=torch.float32).unsqueeze(0)
+    rocks_placed = [float(sum(1 for p in game.rocks if p.rocked_by == game.players[i])) for i in range(game.num_players)]
+    global_feats = torch.tensor([turn, *cur_one_hot, *scores, *rocks_left, *rocks_placed], dtype=torch.float32).unsqueeze(0)
 
     data = Data(
         x=x,
@@ -92,7 +92,7 @@ class GNNEval(nn.Module):
         global_feat_dim: int,
         hidden: int = 256,
         num_layers: int = 4,
-        dropout: float = 0.2,
+        dropout: float = 0.1,
     ) -> None:
         super().__init__() # type: ignore
         self.dropout_p = dropout
@@ -160,7 +160,7 @@ def load_model(path: str, node_feat_dim: int, global_feat_dim: int, device: str 
     _model = model
 
 
-def evaluate_game(game: "Game") -> float:
+def evaluate_game(game: Game) -> float:
     """Return a heuristic score: probability current player eventually wins."""
     if _model is None:
         raise RuntimeError("Model not loaded. Call load_model(...) first.")

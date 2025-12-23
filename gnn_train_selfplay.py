@@ -5,6 +5,7 @@ import json
 import os
 import random
 import time
+from glob import glob
 from typing import Callable, Iterable
 
 import torch
@@ -13,14 +14,14 @@ from torch_geometric.loader import DataLoader  # type: ignore
 
 from game import Game
 from gnn_eval import EncodedGraph, GNNEval, encode_game_to_graph
-from models import D, Move, move_sort_key
+from models import D, Move
 from players import (
-    AIPlayer,
     AlphaBetaPlayer,
     MCTSPlayer,
+    OnePlyGreedyPlayer,
     Player,
     RandomPlayer,
-    applied_move,
+    RockBiasedRandomPlayer,
 )
 
 """Self-play training loop for the GNN evaluator.
@@ -58,24 +59,22 @@ def play_self_play_game(
 def _randomize_start(
     game: Game,
     max_sticks: int = 6,
-    max_rocks: int = 1,
+    max_rocks: int = 2,
     rollout_moves: int = 6,
     move_log: list[Move] | None = None,
 ) -> None:
     """Create a shallow, non-winning random start to diversify training."""
-    rng = random.Random()
     player = game.players[game.current_player]
 
     # Place a few non-scoring sticks.
-    target_sticks = rng.randint(1, max_sticks)
+    target_sticks = random.randint(1, max_sticks)
     attempts = 0
     while target_sticks > 0 and attempts < 60:
         attempts += 1
         moves = [m for m in game.get_possible_moves(player) if m.t in D.__members__]
         if not moves:
             break
-        rng.shuffle(moves)
-        mv = moves[0]
+        mv = random.choice(moves)
         before = game.players_scores[player.number]
         game.do_move(player, mv)
         gained = game.players_scores[player.number] - before
@@ -86,11 +85,11 @@ def _randomize_start(
             continue
         game.undo_move()
 
-    # Optionally place a rock.
-    if max_rocks > 0:
+    # rocks
+    for _ in range(random.randint(0, max_rocks)):
         rock_moves = [m for m in game.get_possible_moves(player) if m.t == "R"]
-        if rock_moves and rng.random() < 0.4:
-            mv = rng.choice(rock_moves)
+        if rock_moves and random.random() < 0.7:
+            mv = random.choice(rock_moves)
             game.do_move(player, mv)
             if game.winner is not None:
                 game.undo_move()
@@ -104,7 +103,7 @@ def _randomize_start(
         moves = list(game.get_possible_moves(mover))
         if not moves:
             break
-        rng.shuffle(moves)
+        random.shuffle(moves)
         mv = moves[0]
         game.do_move(mover, mv)
         undo_needed = False
@@ -159,50 +158,43 @@ def _augment_symmetries(enc: EncodedGraph) -> list[Data]:
     return out
 
 
-class BiasedRandomPlayer(RandomPlayer):
-    """Random player with a slight bias toward rock moves to diversify play."""
+def _load_saved_game_samples(save_games_dir: str, augment_sym: bool = True) -> list[Data]:
+    """Load previously saved games and convert them into training samples."""
 
-    def get_move(self, game: Game) -> Move:
-        moves = sorted(game.get_possible_moves(self), key=move_sort_key)
-        rock_moves = [m for m in moves if m.t == "R"]
-        if rock_moves and self._rng.random() < 0.7:
-            return self._rng.choice(rock_moves)
-        return self._rng.choice(moves)
+    samples: list[Data] = []
+    paths = sorted(glob(os.path.join(save_games_dir, "game_*.json")))
+    if not paths:
+        return samples
 
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
 
-class GreedyHeuristicPlayer(AIPlayer):
-    """1-ply greedy using the handcrafted heuristic for speed."""
+        moves_raw = payload.get("moves", [])
+        winner = payload.get("winner", None)
 
-    def get_move(self, game: Game) -> Move:
-        self._clear_search_caches()
-        moves = sorted(game.get_possible_moves(self), key=move_sort_key)
-        best = moves[0]
-        best_v = float("-inf")
-        for mv in moves:
-            with applied_move(game, self, mv):
-                v = self._evaluate_position_handcrafted(game, self)
-            if v > best_v:
-                best_v = v
-                best = mv
-        return best
+        players: list[Player] = [RandomPlayer(0), RandomPlayer(1)]
+        game = Game(players)
+        trajectory: list[EncodedGraph] = []
 
+        for mv_dict in moves_raw:
+            trajectory.append(encode_game_to_graph(game))
+            mover = game.players[game.current_player]
+            mv = Move(int(mv_dict["x"]), int(mv_dict["y"]), str(mv_dict["t"]))
+            game.do_move(mover, mv)
+            if game.winner is not None:
+                break
 
-class DepthLimitedAlphaBetaPlayer(AlphaBetaPlayer):
-    """Alpha-beta player with a configurable depth (for data generation)."""
+        for enc in trajectory:
+            label = 0.5 if winner is None else float(winner == enc.perspective)
+            datas = _augment_symmetries(enc) if augment_sym else [enc.data]
+            for data in datas:
+                data.y = torch.tensor([label], dtype=torch.float32)
+                samples.append(data)
 
-    def __init__(self, player_number: int, depth: int = 2):
-        super().__init__(player_number)
-        self.depth = depth
+    return samples
 
-    def get_move(self, game: Game) -> Move:
-        if game.num_players != 2:
-            raise ValueError("Alpha-beta AI is only implemented for 2 players")
-        self._clear_search_caches()
-        move, _ = self.alpha_beta(game, self.depth, float("-inf"), float("inf"), True)
-        return move
-
-
-def build_dataset(
+def get_make_dataset(
     num_games: int,
     player_factories: Iterable[Callable[[int], Player]],
     max_moves: int = 256,
@@ -212,15 +204,29 @@ def build_dataset(
 ) -> list[Data]:
     samples: list[Data] = []
     pf = list(player_factories)
+
+    start_index = 0
     if save_games_dir:
         os.makedirs(save_games_dir, exist_ok=True)
+        # Include already-saved games in the dataset and continue numbering.
+        samples.extend(_load_saved_game_samples(save_games_dir, augment_sym=augment_sym))
+        existing = [p for p in glob(os.path.join(save_games_dir, "game_*.json"))]
+        if existing:
+            def _idx(p: str) -> int:
+                stem = os.path.basename(p)
+                try:
+                    return int(stem.split("_")[1].split(".")[0])
+                except Exception:
+                    return -1
+            start_index = max(map(_idx, existing)) + 1
+
     for i in range(num_games):
         print(f"Generating game {i+1}/{num_games}...")
         this_pf = pf if (not swap_roles or (i % 2 == 0)) else list(reversed(pf))
         traj, moves, winner = play_self_play_game(this_pf, max_moves=max_moves)
 
         if save_games_dir:
-            game_path = os.path.join(save_games_dir, f"game_{i:05d}.json")
+            game_path = os.path.join(save_games_dir, f"game_{start_index + i:05d}.json")
             payload: dict[str, object] = {
                 "winner": winner,
                 "moves": [
@@ -342,20 +348,20 @@ def main() -> None:
         r = random.random()
         if args.use_mcts and idx % 2 == 0:
             return MCTSPlayer(idx, time_limit=0.10, n_rollouts=120, max_sim_depth=30, seed=seed)
-        if args.greedy_frac > 0.0 and r < args.greedy_frac:
-            return GreedyHeuristicPlayer(idx)
-        if args.use_biased_random and (idx % 2 == 1 or random.random() < 0.5):
-            return BiasedRandomPlayer(idx, seed=seed)
+        if r < args.greedy_frac:
+            return OnePlyGreedyPlayer(idx)
+        if args.use_biased_random and random.random() < 0.4:
+            return RockBiasedRandomPlayer(idx, seed=seed)
         return RandomPlayer(idx, seed=seed)
 
     if args.ab_vs_random:
         def ab_factory(idx: int):
-            return DepthLimitedAlphaBetaPlayer(idx, depth=args.ab_depth)
+            return AlphaBetaPlayer(idx, depth=args.ab_depth)
         player_factories: list[Callable[[int], Player]] = [ab_factory, randomish_factory]
     else:
         player_factories = [randomish_factory, randomish_factory]
 
-    dataset = build_dataset(
+    dataset = get_make_dataset(
         args.games,
         player_factories,
         max_moves=args.max_moves,

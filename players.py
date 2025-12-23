@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, DefaultDict, Iterator, List, cast
 
 from constants import ALPHABETA_DEPTH, HALF_AREA_COUNTS
+from game import Game
 from models import PASS, D, Move, MoveKey, calculate_area, calculate_end, move_sort_key
 
 if TYPE_CHECKING:
@@ -34,6 +35,19 @@ def _game_key(game: Game) -> StateKey:
         sticks,
     )
 
+@contextmanager
+def applied_move(game: Game, player: Player, move: Move):
+    game.do_move(player, move)
+    yield
+    game.undo_move()
+
+
+@contextmanager
+def rollback_to(game: Game):
+    start_len = len(game.moves)
+    yield
+    while len(game.moves) > start_len:
+        game.undo_move()
 
 class Player(ABC):
     def __init__(self, player_number: int):
@@ -59,22 +73,6 @@ class Player(ABC):
         # Players are effectively immutable identifiers
         return self
 
-
-@contextmanager
-def applied_move(game: Game, player: Player, move: Move):
-    game.do_move(player, move)
-    yield
-    game.undo_move()
-
-
-@contextmanager
-def rollback_to(game: Game):
-    start_len = len(game.moves)
-    yield
-    while len(game.moves) > start_len:
-        game.undo_move()
-
-
 class HumanPlayer(Player):
     def get_move(self, game: Game) -> Move:
         inp = game.wait_for_move_input(f"Player {self.number + 1}, enter move: ")
@@ -95,7 +93,6 @@ class HumanPlayer(Player):
             return self.get_move(game)
         return m
 
-
 class RandomPlayer(Player):
     def __init__(self, player_number: int, seed: int | None = None):
         super().__init__(player_number)
@@ -105,6 +102,15 @@ class RandomPlayer(Player):
         moves = sorted(game.get_possible_moves(self), key=move_sort_key)
         return self._rng.choice(moves)
 
+class RockBiasedRandomPlayer(RandomPlayer):
+    # Random player with a bias toward rock moves to diversify play
+
+    def get_move(self, game: Game) -> Move:
+        moves = sorted(game.get_possible_moves(self), key=move_sort_key)
+        rock_moves = [m for m in moves if m.t == "R"]
+        if rock_moves and self._rng.random() < 0.7:
+            return self._rng.choice(rock_moves)
+        return self._rng.choice(moves)
 
 @dataclass(frozen=True)
 class TacticalStats:
@@ -120,7 +126,6 @@ class TacticalStats:
     rock_value: float
     blocking_power: float
 
-
 class AIPlayer(Player):
     # Per-`get_move` caches (cleared at the start of each search).
     # Cache heuristic evaluations per (state, perspective player).
@@ -131,10 +136,12 @@ class AIPlayer(Player):
     _sticks_opp_cache: dict[tuple[StateKey, int], float] = {}
     _rock_value_cache: dict[tuple[StateKey, int], float] = {}
     _closure_area_cache: dict[tuple[StateKey, MoveKey], int | None] = {}
-    # Toggle between handcrafted heuristic and GNN-based evaluation.
+
     use_gnn_eval: bool = False
-    # If True, fail fast instead of silently falling back when GNN eval is requested.
-    require_gnn_eval: bool = False
+
+    @abstractmethod
+    def get_move(self, game: Game) -> Move:
+        raise NotImplementedError("AIPlayer is an abstract base class")
 
     def _clear_search_caches(self) -> None:
         self._eval_cache.clear()
@@ -145,6 +152,13 @@ class AIPlayer(Player):
         self._closure_area_cache.clear()
 
     @classmethod
+    def _eval_game_probability(cls, game: Game, perspective_player: Player) -> float:
+        value = cls._evaluate_position(game, perspective_player)
+        if math.isinf(value):
+            return 1.0 if value > 0 else 0.0
+        return 0.5 + 0.5 * math.tanh(value / 6.0)
+
+    @classmethod
     def _evaluate_position(cls, game: Game, player: Player) -> float:
         state_key = _game_key(game)
         cache_key = (state_key, player.number, cls.use_gnn_eval)
@@ -152,40 +166,24 @@ class AIPlayer(Player):
         if cached is not None:
             return cached
 
-        v: float | None = None
-
         if cls.use_gnn_eval:
             v = cls._evaluate_with_gnn(game, player)
-
-        if v is None:
-            if cls.require_gnn_eval:
-                raise RuntimeError("GNN evaluation failed; require_gnn_eval is True")
+        else:
             v = cls._evaluate_position_handcrafted(game, player, state_key)
 
         cls._eval_cache[cache_key] = v
         return v
 
     @classmethod
-    def _evaluate_with_gnn(cls, game: Game, player: Player) -> float | None:
-        # Lazy import so torch/pyg stays optional at runtime.
-        try:
-            from gnn_eval import evaluate_game
-        except Exception:
-            return None
-
-        try:
-            prob = float(evaluate_game(game))
-        except Exception:
-            return None
-
+    def _evaluate_with_gnn(cls, game: Game, player: Player) -> float:
+        from gnn_eval import evaluate_game
+        prob = float(evaluate_game(game))
         if player.number != game.current_player:
             prob = 1.0 - prob
-        prob = min(max(prob, 1e-4), 1.0 - 1e-4)
 
-        # Soften overconfident outputs: apply temperature to logits before mapping to heuristic.
-        temp = 2.0
+        prob = min(max(prob, 1e-4), 1.0 - 1e-4)
         logit = math.log(prob / (1.0 - prob))
-        logit /= temp
+        logit /= 2.0
         prob = 1.0 / (1.0 + math.exp(-logit))
 
         return 6.0 * math.atanh((prob - 0.5) * 2.0)
@@ -559,15 +557,32 @@ class AIPlayer(Player):
                     return True
         return False
 
+class OnePlyGreedyPlayer(AIPlayer):
+    def get_move(self, game: Game) -> Move:
+        self._clear_search_caches()
+        moves = sorted(game.get_possible_moves(self), key=move_sort_key)
+        best = moves[0]
+        best_v = float("-inf")
+        for mv in moves:
+            with applied_move(game, self, mv):
+                v = self._eval_game_probability(game, self) + random.uniform(-0.04, 0.04)
+            if v > best_v:
+                best_v = v
+                best = mv
+        return best
+
 class AlphaBetaPlayer(AIPlayer):
-    # Mildly demote PASS so it's only chosen when it truly out-values other moves.
-    pass_penalty: float = 0.75
+    def __init__(self, player_number: int, depth: int = ALPHABETA_DEPTH, use_gnn: bool = False, pass_penalty: float = 0.75):
+        super().__init__(player_number)
+        self.depth = depth
+        self.use_gnn_eval = use_gnn
+        self.pass_penalty = pass_penalty
 
     def get_move(self, game: Game) -> Move:
         if game.num_players != 2:
             raise ValueError("Alpha-beta AI is only implemented for 2 players")
         self._clear_search_caches()
-        move, _ = self.alpha_beta(game, ALPHABETA_DEPTH, float("-inf"), float("inf"), True)
+        move, _ = self.alpha_beta(game, self.depth, float("-inf"), float("inf"), True)
         return move
 
     def alpha_beta(self, game: Game, depth: int, a: float, b: float, maximising: bool) -> tuple[Move, float]:
@@ -582,6 +597,7 @@ class AlphaBetaPlayer(AIPlayer):
                 with applied_move(game, self, move):
                     _, v2 = self.alpha_beta(game, depth - 1, a, b, False)
                 if move is PASS:
+                    # Mildly demote PASS so it's only chosen when it truly out-values other moves.
                     v2 -= self.pass_penalty
                 if v2 > value:
                     value = v2
@@ -605,14 +621,14 @@ class AlphaBetaPlayer(AIPlayer):
             b = min(b, value)
         return (best_move, value)
 
-
-# https://gist.github.com/qpwo/c538c6f73727e254fdc7fab81024f6e1
+# based on https://gist.github.com/qpwo/c538c6f73727e254fdc7fab81024f6e1
 class MCTSPlayer(AIPlayer):
     "Monte Carlo tree searcher. First rollout the tree then choose a move."
 
     def __init__(
         self,
         player_number: int,
+        use_gnn: bool = False,
         exploration_weight: float = 1.0,
         seed: int | None = None,
         n_rollouts: int = 1000,
@@ -630,6 +646,8 @@ class MCTSPlayer(AIPlayer):
         rock_rollout_bonus_disconnected: float = 0.02,
         stick_between_opp_rocks_bonus: float = 0.4,
     ):
+        super().__init__(player_number)
+        self.use_gnn_eval = use_gnn
         # Transposition-table MCTS:
         # - Stats are stored per state key, and per (state, move) edge.
         # - This merges equivalent positions reached via different paths.
@@ -663,7 +681,6 @@ class MCTSPlayer(AIPlayer):
         self.rock_rollout_bonus_disconnected = rock_rollout_bonus_disconnected
         self.stick_between_opp_rocks_bonus = stick_between_opp_rocks_bonus
         self.last_rollouts: int = 0
-        super().__init__(player_number)
 
     def _rock_bonus_for_cell(self, game: Game, c: tuple[int, int], connected_bonus: float, disconnected_bonus: float,) -> float:
         p = game.points.get(c)
@@ -685,18 +702,10 @@ class MCTSPlayer(AIPlayer):
         if end is None or end.rocked_by is not opp:
             return False
         return True
-
-    def _heuristic_probability(self, game: Game, perspective_player: Player) -> float:
-        """Return a soft win-probability estimate in [0, 1] for `perspective_player`."""
-
-        value = self._evaluate_position(game, perspective_player)
-        if math.isinf(value):
-            return 1.0 if value > 0 else 0.0
-        return 0.5 + 0.5 * math.tanh(value / 6.0)
     
     def score_after(self, working_game: Game, p: Player, mv: Move) -> float:
         with applied_move(working_game, p, mv):
-            return self._heuristic_probability(working_game, p)
+            return self._eval_game_probability(working_game, p)
 
     def _rollout_pick_move(self, game: Game) -> Move:
         """Pick a rollout move: mostly greedy by heuristic, occasionally random."""
@@ -992,7 +1001,7 @@ class MCTSPlayer(AIPlayer):
 
         for m in eval_moves:
             with applied_move(game, player, m):
-                p = self._heuristic_probability(game, player)
+                p = self._eval_game_probability(game, player)
             if m.t == "R":
                 p = min(0.999, p + self._rock_bonus_for_cell(game, m.c, self.rock_prior_bonus_connected, self.rock_prior_bonus_disconnected))
             elif self._stick_between_opp_rocks(game, player, m):
@@ -1115,7 +1124,7 @@ class MCTSPlayer(AIPlayer):
 
         # Depth limit reached: use a heuristic evaluation as a soft reward.
         # This prevents MCTS from behaving weirdly when cut off.
-        reward = self._heuristic_probability(game, game.players[sim_start_player])
+        reward = self._eval_game_probability(game, game.players[sim_start_player])
         return reward, n_applied, sim_moves, sim_start_player
 
     def _backpropagate(self, path_edges: List[tuple[StateKey, Move]], reward: float) -> None:
