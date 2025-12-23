@@ -35,6 +35,8 @@ Usage example:
 python gnn_train_selfplay.py --games 100 --epochs 5 --batch-size 64 --lr 1e-3 --max-moves 180 --use-biased-random --augment-sym
 """
 
+Sample = tuple[EncodedGraph, float]
+
 def play_self_play_game(
     player_factories: Iterable[Callable[[int], Player]],
     max_moves: int = 256,
@@ -158,10 +160,10 @@ def _augment_symmetries(enc: EncodedGraph) -> list[Data]:
     return out
 
 
-def _load_saved_game_samples(save_games_dir: str, augment_sym: bool = True) -> list[Data]:
-    """Load previously saved games and convert them into training samples."""
+def _load_saved_game_samples(save_games_dir: str) -> list[Sample]:
+    """Load previously saved games and return base samples (pre-augmentation)."""
 
-    samples: list[Data] = []
+    samples: list[Sample] = []
     paths = sorted(glob(os.path.join(save_games_dir, "game_*.json")))
     if not paths:
         return samples
@@ -180,20 +182,14 @@ def _load_saved_game_samples(save_games_dir: str, augment_sym: bool = True) -> l
         for mv_dict in moves_raw:
             trajectory.append(encode_game_to_graph(game))
             mover = game.players[game.current_player]
-            if mv_dict["t"] != "P":
-                mv = Move(int(mv_dict["x"]), int(mv_dict["y"]), str(mv_dict["t"]))
-            else:
-                mv = PASS
+            mv = Move(int(mv_dict["x"]), int(mv_dict["y"]), str(mv_dict["t"])) if mv_dict["t"] != "P" else PASS
             game.do_move(mover, mv)
             if game.winner is not None:
                 break
 
         for enc in trajectory:
             label = 0.5 if winner is None else float(winner == enc.perspective)
-            datas = _augment_symmetries(enc) if augment_sym else [enc.data]
-            for data in datas:
-                data.y = torch.tensor([label], dtype=torch.float32)
-                samples.append(data)
+            samples.append((enc, label))
 
     return samples
 
@@ -201,18 +197,18 @@ def get_make_dataset(
     num_games: int,
     player_factories: Iterable[Callable[[int], Player]],
     max_moves: int = 256,
-    augment_sym: bool = True,
     swap_roles: bool = False,
     save_games_dir: str | None = None,
-) -> list[Data]:
-    samples: list[Data] = []
+) -> list[Sample]:
+
+    samples: list[Sample] = []
     pf = list(player_factories)
 
     start_index = 0
     if save_games_dir:
         os.makedirs(save_games_dir, exist_ok=True)
         # Include already-saved games in the dataset and continue numbering.
-        samples.extend(_load_saved_game_samples(save_games_dir, augment_sym=augment_sym))
+        samples.extend(_load_saved_game_samples(save_games_dir))
         existing = [p for p in glob(os.path.join(save_games_dir, "game_*.json"))]
         if existing:
             def _idx(p: str) -> int:
@@ -243,11 +239,20 @@ def get_make_dataset(
 
         for enc in traj:
             label = 0.5 if winner is None else float(winner == enc.perspective)
-            datas = _augment_symmetries(enc) if augment_sym else [enc.data]
-            for data in datas:
-                data.y = torch.tensor([label], dtype=torch.float32)
-                samples.append(data)
+            samples.append((enc, label))
     return samples
+
+
+def _samples_to_data(samples: list[Sample], augment_sym: bool) -> list[Data]:
+    """Convert base samples to torch_geometric.Data, applying symmetries optionally."""
+
+    out: list[Data] = []
+    for enc, label in samples:
+        datas = _augment_symmetries(enc) if augment_sym else [enc.data]
+        for data in datas:
+            data.y = torch.tensor([label], dtype=torch.float32)
+            out.append(data)
+    return out
 
 
 def train(
@@ -394,23 +399,25 @@ def main() -> None:
     else:
         player_factories = [randomish_factory, randomish_factory]
 
-    dataset = get_make_dataset(
+    samples = get_make_dataset(
         args.games,
         player_factories,
         max_moves=args.max_moves,
-        augment_sym=args.augment_sym,
         swap_roles=args.swap_roles,
         save_games_dir=args.save_games_dir,
     )
     if args.val_frac > 0.0:
-        idx = list(range(len(dataset)))
+        idx = list(range(len(samples)))
         random.shuffle(idx)
         split = max(1, int(len(idx) * args.val_frac))
-        train_dataset = [dataset[i] for i in idx[split:]]
-        val_dataset = [dataset[i] for i in idx[:split]]
+        train_samples = [samples[i] for i in idx[split:]]
+        val_samples = [samples[i] for i in idx[:split]]
     else:
-        train_dataset = dataset
-        val_dataset = []
+        train_samples = samples
+        val_samples = []
+
+    train_dataset = _samples_to_data(train_samples, augment_sym=args.augment_sym)
+    val_dataset = _samples_to_data(val_samples, augment_sym=args.augment_sym) if val_samples else []
 
     print(f"Training: {len(train_dataset)}; validation: {len(val_dataset)}")
 
