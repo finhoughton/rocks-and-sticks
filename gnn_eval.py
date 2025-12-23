@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data  # type: ignore
-from torch_geometric.nn import GINConv, global_mean_pool  # type: ignore
+from torch_geometric.nn import GINEConv, global_mean_pool  # type: ignore
 
 if TYPE_CHECKING:
     from game import Game
@@ -41,8 +41,9 @@ def _node_feature(node: Node, num_players: int) -> list[float]:
     return [*owner_one_hot, deg, is_leaf, x, y, r2]
 
 
-def _edge_index_from_points(points: Iterable[Node]) -> torch.Tensor:
-    edges: set[tuple[int, int]] = set()
+def _edge_index_and_attr_from_points(points: Iterable[Node]) -> tuple[torch.Tensor, torch.Tensor]:
+    edges: list[tuple[int, int]] = []
+    attrs: list[list[float]] = []
     nodes = list(points)
     idx_map = {p: i for i, p in enumerate(nodes)}
     for p in nodes:
@@ -53,12 +54,20 @@ def _edge_index_from_points(points: Iterable[Node]) -> torch.Tensor:
             b = idx_map.get(nbr)
             if b is None:
                 continue
-            edges.add((a, b))
-            edges.add((b, a))
+            dx = float(nbr.x - p.x)
+            dy = float(nbr.y - p.y)
+            is_diag = 1.0 if abs(dx) == 1.0 and abs(dy) == 1.0 else 0.0
+            orth = 1.0 - is_diag
+            edges.append((a, b))
+            attrs.append([orth, is_diag])
+            edges.append((b, a))
+            attrs.append([orth, is_diag])
     if not edges:
-        return torch.empty((2, 0), dtype=torch.long)
-    src, dst = zip(*sorted(edges))
-    return torch.tensor([src, dst], dtype=torch.long)
+        return torch.empty((2, 0), dtype=torch.long), torch.empty((0, 2), dtype=torch.float32)
+    src, dst = zip(*edges)
+    edge_index = torch.tensor([src, dst], dtype=torch.long)
+    edge_attr = torch.tensor(attrs, dtype=torch.float32)
+    return edge_index, edge_attr
 
 
 def encode_game_to_graph(game: Game) -> EncodedGraph:
@@ -70,7 +79,7 @@ def encode_game_to_graph(game: Game) -> EncodedGraph:
     nodes = sorted(point_set, key=lambda n: n.c)
     node_feats = [_node_feature(n, game.num_players) for n in nodes]
     x = torch.tensor(node_feats, dtype=torch.float32)
-    edge_index = _edge_index_from_points(nodes)
+    edge_index, edge_attr = _edge_index_and_attr_from_points(nodes)
 
     turn = float(game.turn_number)
     cur_one_hot = [1.0 if i == game.current_player else 0.0 for i in range(game.num_players)]
@@ -83,6 +92,7 @@ def encode_game_to_graph(game: Game) -> EncodedGraph:
     data = Data(
         x=x,
         edge_index=edge_index,
+        edge_attr=edge_attr,
         batch=torch.zeros(len(nodes), dtype=torch.long),
         global_feats=global_feats,
     )
@@ -105,7 +115,9 @@ class GNNEval(nn.Module):
             return nn.Sequential(nn.Linear(in_dim, out_dim), nn.ReLU(), nn.Linear(out_dim, out_dim))
 
         dims = [node_feat_dim] + [hidden] * num_layers
-        self.convs = nn.ModuleList([GINConv(mlp(dims[i], dims[i + 1]), train_eps=True) for i in range(num_layers)])
+        edge_dim = 2  # [orth, diag]
+        self.convs = nn.ModuleList([GINEConv(mlp(dims[i], dims[i + 1]), edge_dim=edge_dim) for i in range(num_layers)])
+        self.norms = nn.ModuleList([nn.BatchNorm1d(dims[i + 1]) for i in range(num_layers)])
 
         self.head = nn.Sequential(
             nn.Linear(hidden + global_feat_dim, hidden),
@@ -117,11 +129,12 @@ class GNNEval(nn.Module):
         _init_parameters(self)
 
     def forward(self, data: Data) -> torch.Tensor:
-        x, edge_index, batch, g = data.x, data.edge_index, data.batch, data.global_feats
+        x, edge_index, edge_attr, batch, g = data.x, data.edge_index, data.edge_attr, data.batch, data.global_feats
         h: torch.Tensor = x # type: ignore
-        for conv in self.convs:
+        for i, conv in enumerate(self.convs):
             h_in = h
-            h = conv(h, edge_index)
+            h = conv(h, edge_index, edge_attr)
+            h = self.norms[i](h)
             h = F.relu(h)
             h = F.dropout(h, p=self.dropout_p, training=self.training)
             if h.shape == h_in.shape:

@@ -6,7 +6,7 @@ import os
 import random
 import time
 from glob import glob
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable, cast
 
 import torch
 from torch_geometric.data import Data  # type: ignore
@@ -153,6 +153,7 @@ def _augment_symmetries(enc: EncodedGraph) -> list[Data]:
             Data(
                 x=x_tf,
                 edge_index=data.edge_index,
+                edge_attr=data.edge_attr,
                 batch=data.batch,
                 global_feats=data.global_feats,
             )
@@ -255,6 +256,28 @@ def _samples_to_data(samples: list[Sample], augment_sym: bool) -> list[Data]:
     return out
 
 
+def _plot_losses(train_losses: list[float], val_losses: list[float], out_path: str) -> None:
+    """Plot train/val loss curves if matplotlib is available."""
+
+    import matplotlib.pyplot as plt
+    plt = cast(Any, plt)
+
+    epochs = list(range(1, len(train_losses) + 1))
+    plt.figure(figsize=(6, 4))
+    plt.plot(epochs, train_losses, label="train")
+    # Only plot val when it is finite for at least one epoch.
+    if any(torch.isfinite(torch.tensor(val_losses))):
+        plt.plot(epochs, val_losses, label="val")
+    plt.xlabel("epoch")
+    plt.ylabel("BCE loss")
+    plt.title("GNN eval loss")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+    print(f"saved loss plot to {out_path}")
+
+
 def train(
     train_dataset: list[Data],
     val_dataset: list[Data],
@@ -262,7 +285,7 @@ def train(
     batch_size: int = 16,
     lr: float = 1e-3,
     device: str = "cpu",
-) -> GNNEval:
+) -> tuple[GNNEval, list[float], list[float]]:
     if not train_dataset:
         raise ValueError("Dataset is empty; generate samples first.")
     device_t = torch.device(device)
@@ -274,6 +297,9 @@ def train(
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = torch.nn.BCEWithLogitsLoss()
+
+    train_losses: list[float] = []
+    val_losses: list[float] = []
 
     for epoch in range(epochs):
         model.train()
@@ -300,13 +326,16 @@ def train(
                     v_total += float(loss.item())
             val_loss = v_total / max(1, len(val_loader))
 
+        train_losses.append(avg_loss)
+        val_losses.append(val_loss if val_loss is not None else float("nan"))
+
         if val_loss is None:
             print(f"epoch {epoch+1}/{epochs} train loss={avg_loss:.4f}")
         else:
             print(f"epoch {epoch+1}/{epochs} train loss={avg_loss:.4f} test loss={val_loss:.4f}")
 
     model.eval()
-    return model
+    return model, train_losses, val_losses
 
 
 def main() -> None:
@@ -373,6 +402,17 @@ def main() -> None:
         default=0.15,
         help="fraction of samples to hold out for validation loss reporting",
     )
+    parser.add_argument(
+        "--plot-loss",
+        action="store_true",
+        help="save a PNG of train/val loss curves",
+    )
+    parser.add_argument(
+        "--loss-plot-out",
+        type=str,
+        default="loss_curve.png",
+        help="path to save the loss plot when --plot-loss is set",
+    )
     args = parser.parse_args()
 
     seed_base = args.seed_base
@@ -421,7 +461,7 @@ def main() -> None:
 
     print(f"Training: {len(train_dataset)}; validation: {len(val_dataset)}")
 
-    model = train(
+    model, train_losses, val_losses = train(
         train_dataset,
         val_dataset,
         epochs=args.epochs,
@@ -431,6 +471,9 @@ def main() -> None:
     )
     torch.save(model.state_dict(), args.out)
     print(f"saved weights to {args.out}")
+
+    if args.plot_loss:
+        _plot_losses(train_losses, val_losses, args.loss_plot_out)
 
 
 if __name__ == "__main__":
