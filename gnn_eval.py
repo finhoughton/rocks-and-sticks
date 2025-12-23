@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 
 INIT_MEAN = 0.0
-INIT_STD = 0.02
+INIT_STD = 0.1
 
 def _init_parameters(module: nn.Module, mean: float = INIT_MEAN, std: float = INIT_STD) -> None:
     for p in module.parameters():
@@ -114,7 +114,7 @@ class GNNEval(nn.Module):
 
     def forward(self, data: Data) -> torch.Tensor:
         x, edge_index, batch, g = data.x, data.edge_index, data.batch, data.global_feats
-        h = x
+        h: torch.Tensor = x # type: ignore
         for conv in self.convs:
             h_in = h
             h = conv(h, edge_index)

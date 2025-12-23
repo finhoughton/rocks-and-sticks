@@ -3,3 +3,5 @@ __pycache__
 .DS_Store
 test.txt
 *.prof
+*.pt
+saved_games_ab2/

@@ -5,12 +5,12 @@ import sys
 
 from game import Game
 from gnn_eval import encode_game_to_graph, evaluate_game, load_model
-from players import HumanPlayer, RandomPlayer
+from players import HumanPlayer, Player, RandomPlayer
 
 
 def _infer_dims(game: Game) -> tuple[int, int]:
     enc = encode_game_to_graph(game)
-    return enc.data.x.size(1), enc.data.global_feats.size(1)
+    return enc.data.x.size(1), enc.data.global_feats.size(1) # type: ignore
 
 
 def main() -> None:
@@ -25,7 +25,7 @@ def main() -> None:
     parser.add_argument("--rand-seed", type=int, default=1, help="seed for random opponent")
     args = parser.parse_args()
 
-    players = [HumanPlayer(0), RandomPlayer(1, seed=1)]
+    players: list[Player] = [HumanPlayer(0), RandomPlayer(1, seed=1)]
     players[1] = RandomPlayer(1, seed=args.rand_seed)
     game = Game(players)
 
@@ -66,9 +66,7 @@ def main() -> None:
         game.do_move(p, mv)
         print_prob()
 
-    if game.winner is None:
-        print("Game ended in a draw.")
-    elif game.winner == 0:
+    if game.winner == 0:
         print("You win!")
     else:
         print("Random player wins.")

@@ -40,8 +40,8 @@ def _maybe_load_gnn(model_path: str, device: str) -> None:
         raise RuntimeError(f"GNN modules not available: {exc}")
 
     temp_game = Game()  # Default players are fine for encoding dimensions.
-    enc = encode_game_to_graph(temp_game)  # type: ignore[arg-type]
-    node_dim = enc.data.x.size(1)
+    enc = encode_game_to_graph(temp_game)  # type: ignore
+    node_dim = enc.data.x.size(1) # type: ignore
     global_dim = enc.data.global_feats.size(1)
     load_model(model_path, node_dim, global_dim, device=device)
     AIPlayer.use_gnn_eval = True

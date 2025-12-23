@@ -145,7 +145,7 @@ class AIPlayer(Player):
         self._closure_area_cache.clear()
 
     @classmethod
-    def _evaluate_position_heuristic(cls, game: Game, player: Player) -> float:
+    def _evaluate_position(cls, game: Game, player: Player) -> float:
         state_key = _game_key(game)
         cache_key = (state_key, player.number, cls.use_gnn_eval)
         cached = cls._eval_cache.get(cache_key)
@@ -572,7 +572,7 @@ class AlphaBetaPlayer(AIPlayer):
 
     def alpha_beta(self, game: Game, depth: int, a: float, b: float, maximising: bool) -> tuple[Move, float]:
         if depth == 0 or game.winner is not None:
-            return (PASS, self._evaluate_position_heuristic(game, self))
+            return (PASS, self._evaluate_position(game, self))
 
         best_move = PASS
 
@@ -689,7 +689,7 @@ class MCTSPlayer(AIPlayer):
     def _heuristic_probability(self, game: Game, perspective_player: Player) -> float:
         """Return a soft win-probability estimate in [0, 1] for `perspective_player`."""
 
-        value = self._evaluate_position_heuristic(game, perspective_player)
+        value = self._evaluate_position(game, perspective_player)
         if math.isinf(value):
             return 1.0 if value > 0 else 0.0
         return 0.5 + 0.5 * math.tanh(value / 6.0)
