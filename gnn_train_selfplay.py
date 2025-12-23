@@ -14,7 +14,7 @@ from torch_geometric.loader import DataLoader  # type: ignore
 
 from game import Game
 from gnn_eval import EncodedGraph, GNNEval, encode_game_to_graph
-from models import D, Move
+from models import PASS, D, Move
 from players import (
     AlphaBetaPlayer,
     MCTSPlayer,
@@ -180,7 +180,10 @@ def _load_saved_game_samples(save_games_dir: str, augment_sym: bool = True) -> l
         for mv_dict in moves_raw:
             trajectory.append(encode_game_to_graph(game))
             mover = game.players[game.current_player]
-            mv = Move(int(mv_dict["x"]), int(mv_dict["y"]), str(mv_dict["t"]))
+            if mv_dict["t"] != "P":
+                mv = Move(int(mv_dict["x"]), int(mv_dict["y"]), str(mv_dict["t"]))
+            else:
+                mv = PASS
             game.do_move(mover, mv)
             if game.winner is not None:
                 break
@@ -247,22 +250,30 @@ def get_make_dataset(
     return samples
 
 
-def train(dataset: list[Data], epochs: int = 5, batch_size: int = 16, lr: float = 1e-3, device: str = "cpu") -> GNNEval:
-    if not dataset:
+def train(
+    train_dataset: list[Data],
+    val_dataset: list[Data],
+    epochs: int = 5,
+    batch_size: int = 16,
+    lr: float = 1e-3,
+    device: str = "cpu",
+) -> GNNEval:
+    if not train_dataset:
         raise ValueError("Dataset is empty; generate samples first.")
     device_t = torch.device(device)
-    sample = dataset[0]
+    sample = train_dataset[0]
     node_feat_dim = sample.x.size(1) # type: ignore
     global_feat_dim = sample.global_feats.size(1)
     model = GNNEval(node_feat_dim=node_feat_dim, global_feat_dim=global_feat_dim).to(device_t)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = torch.nn.BCEWithLogitsLoss()
 
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
-        for batch in loader:
+        for batch in train_loader:
             batch = batch.to(device_t)
             logits = model(batch)
             loss = criterion(logits, batch.y.view_as(logits))
@@ -270,8 +281,24 @@ def train(dataset: list[Data], epochs: int = 5, batch_size: int = 16, lr: float 
             loss.backward()
             opt.step() # type: ignore
             total_loss += float(loss.item())
-        avg_loss = total_loss / max(1, len(loader))
-        print(f"epoch {epoch+1}/{epochs} loss={avg_loss:.4f}")
+        avg_loss = total_loss / max(1, len(train_loader))
+
+        val_loss = None
+        if val_loader is not None:
+            model.eval()
+            v_total = 0.0
+            with torch.no_grad():
+                for batch in val_loader:
+                    batch = batch.to(device_t)
+                    logits = model(batch)
+                    loss = criterion(logits, batch.y.view_as(logits))
+                    v_total += float(loss.item())
+            val_loss = v_total / max(1, len(val_loader))
+
+        if val_loss is None:
+            print(f"epoch {epoch+1}/{epochs} train loss={avg_loss:.4f}")
+        else:
+            print(f"epoch {epoch+1}/{epochs} train loss={avg_loss:.4f} test loss={val_loss:.4f}")
 
     model.eval()
     return model
@@ -335,6 +362,12 @@ def main() -> None:
         default=None,
         help="optional directory to dump generated games as JSON",
     )
+    parser.add_argument(
+        "--val-frac",
+        type=float,
+        default=0.15,
+        help="fraction of samples to hold out for validation loss reporting",
+    )
     args = parser.parse_args()
 
     seed_base = args.seed_base
@@ -369,7 +402,26 @@ def main() -> None:
         swap_roles=args.swap_roles,
         save_games_dir=args.save_games_dir,
     )
-    model = train(dataset, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device)
+    if args.val_frac > 0.0:
+        idx = list(range(len(dataset)))
+        random.shuffle(idx)
+        split = max(1, int(len(idx) * args.val_frac))
+        train_dataset = [dataset[i] for i in idx[split:]]
+        val_dataset = [dataset[i] for i in idx[:split]]
+    else:
+        train_dataset = dataset
+        val_dataset = []
+
+    print(f"Training: {len(train_dataset)}; validation: {len(val_dataset)}")
+
+    model = train(
+        train_dataset,
+        val_dataset,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        device=args.device,
+    )
     torch.save(model.state_dict(), args.out)
     print(f"saved weights to {args.out}")
 

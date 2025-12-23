@@ -346,7 +346,7 @@ class Game:
                 self.players_scores[player.number] += v
         else:
             self._history.pop()
-            raise ValueError("Invalid move")
+            raise ValueError(f"Invalid move {m}")
 
         self.current_player += 1
         if self.current_player == self.num_players:

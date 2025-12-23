@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import heapq
 import math
 import random
 import time
@@ -12,7 +11,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, DefaultDict, Iterator, List, cast
 
 from constants import ALPHABETA_DEPTH, HALF_AREA_COUNTS
-from game import Game
 from models import PASS, D, Move, MoveKey, calculate_area, calculate_end, move_sort_key
 
 if TYPE_CHECKING:
@@ -632,10 +630,10 @@ class MCTSPlayer(AIPlayer):
         exploration_weight: float = 1.0,
         seed: int | None = None,
         n_rollouts: int = 1000,
-        max_sim_depth: int = 60,
+        max_sim_depth: int = 20,
         time_limit: float | None = None,
         tactical_root_limit: int = 20,
-        tactical_branch_limit: int = 15,
+        tactical_branch_limit: int = 8,
         progressive_widening_c: float = 1.6,
         progressive_widening_alpha: float = 0.55,
         prior_eval_cap: int = 48,
@@ -762,8 +760,7 @@ class MCTSPlayer(AIPlayer):
             if k <= 0 or len(scored) <= k:
                 return [mv for (_s, _k, mv) in sorted(scored, key=lambda t: t[1])]
 
-            top = heapq.nlargest(k, scored, key=lambda t: (t[0], t[1]))
-            top.sort(key=lambda t: (-t[0], t[1]))
+            top = sorted(scored, reverse=True)[:k]
             return [mv for (_s, _k, mv) in top]
 
         with applied_move(working_game, player, my_move):
@@ -836,10 +833,7 @@ class MCTSPlayer(AIPlayer):
         deadline = start_time + self.time_limit if self.time_limit is not None else None
         if safe_root_moves:
             to_check = safe_root_moves[: self.tactical_root_limit]
-            if deadline is not None and time.perf_counter() >= deadline:
-                non_forced_loss = []
-            else:
-                non_forced_loss = [m for m in to_check if not self.allows_forced_loss_next_round(m, working_game, player)]
+            non_forced_loss = [m for m in to_check if not self.allows_forced_loss_next_round(m, working_game, player)]
             if non_forced_loss:
                 allowed_root_moves = non_forced_loss
         rollouts_done = 0
@@ -856,7 +850,7 @@ class MCTSPlayer(AIPlayer):
 
         best_move = self.choose(root_key, working_game, allowed_root_moves=allowed_root_moves)
 
-        # Final tactical safety pass: avoid "one-move blunders" where our move
+        # Final tactical safety pass: avoid one-move blunders where our move
         # immediately hands the opponent the win at end-of-round, or where the
         # opponent has a forcing line next round.
         def visits(m: Move) -> int:

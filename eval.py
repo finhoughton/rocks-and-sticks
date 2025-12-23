@@ -45,7 +45,6 @@ def _maybe_load_gnn(model_path: str, device: str) -> None:
     global_dim = enc.data.global_feats.size(1)
     load_model(model_path, node_dim, global_dim, device=device)
     AIPlayer.use_gnn_eval = True
-    AIPlayer.require_gnn_eval = True
 
 
 def play_one_game(cfg: EvalConfig, game_index: int) -> int | None:
