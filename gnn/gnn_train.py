@@ -134,7 +134,9 @@ def _augment_symmetries(enc: EncodedGraph) -> list[Data]:
         )
     return out
 
+
 def _load_saved_game_samples(save_games_dir: str) -> list[Sample]:
+    # Retain for backward compatibility, loads all from one dir
     samples: list[Sample] = []
     paths = sorted(glob(os.path.join(save_games_dir, "game_*.json")))
     if not paths:
@@ -158,6 +160,42 @@ def _load_saved_game_samples(save_games_dir: str) -> list[Sample]:
             label = 0.5 if winner is None else float(winner == enc.perspective)
             samples.append((enc, label))
     return samples
+
+# New function for balanced loading from all three folders
+def _load_balanced_saved_game_samples(ab_dir: str, mcts_dir: str, human_dir: str) -> list[Sample]:
+    def load_samples_from_dir(d: str) -> list[Sample]:
+        samples: list[Sample] = []
+        paths = sorted(glob(os.path.join(d, "game_*.json")))
+        for path in paths:
+            with open(path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            moves_raw = payload.get("moves", [])
+            winner = payload.get("winner", None)
+            players: list[Player] = [RandomPlayer(0), RandomPlayer(1)]
+            game = Game(players)
+            trajectory: list[EncodedGraph] = []
+            for mv_dict in moves_raw:
+                trajectory.append(encode_game_to_graph(game))
+                mover = game.players[game.current_player]
+                mv = Move(int(mv_dict["x"]), int(mv_dict["y"]), str(mv_dict["t"])) if mv_dict["t"] != "P" else PASS
+                game.do_move(mover, mv)
+                if game.winner is not None:
+                    break
+            for enc in trajectory:
+                label = 0.5 if winner is None else float(winner == enc.perspective)
+                samples.append((enc, label))
+        return samples
+
+    ab_samples = load_samples_from_dir(ab_dir)
+    mcts_samples = load_samples_from_dir(mcts_dir)
+    human_samples = load_samples_from_dir(human_dir)
+
+    n = min(len(ab_samples), len(mcts_samples))
+    # Duplicate human samples to weight them higher (e.g., 3x)
+    human_weight = 3
+    combined = ab_samples[:n] + mcts_samples[:n] + human_samples * human_weight
+    random.shuffle(combined)
+    return combined
 
 def get_make_dataset(
     num_games: int,
@@ -386,7 +424,7 @@ def main() -> None:
         n_rollouts = args.mcts_rollouts
         if (time_limit is not None) and (n_rollouts is not None):
             raise ValueError("Specify only one of --mcts-time-limit or --mcts-rollouts")
-        return MCTSPlayer(idx, time_limit=time_limit, n_rollouts=n_rollouts if n_rollouts is not None else 1000, max_sim_depth=30, seed=seed)
+        return MCTSPlayer(idx, time_limit=time_limit, n_rollouts=n_rollouts if n_rollouts is not None else 1000, max_sim_depth=30, seed=seed, use_gnn=True)
     def greedy_factory(idx: int) -> Player:
         return OnePlyGreedyPlayer(idx)
     def ab_factory(idx: int) -> Player:
@@ -427,8 +465,20 @@ def main() -> None:
         train_dataset = _samples_to_data(train_samples, augment_sym=args.augment_sym)
         val_dataset = _samples_to_data(val_samples, augment_sym=args.augment_sym) if val_samples else []
     else:
-        train_dataset = []
-        val_dataset = []
+        # Only training, not generating new games
+        print("Loading balanced dataset from saved_games_ab2, saved_games_mcts, saved_games_human...")
+        samples = _load_balanced_saved_game_samples("saved_games_ab2", "saved_games_mcts", "saved_games_human")
+        if args.val_frac > 0.0:
+            idx = list(range(len(samples)))
+            random.shuffle(idx)
+            split = max(1, int(len(idx) * args.val_frac))
+            train_samples = [samples[i] for i in idx[split:]]
+            val_samples = [samples[i] for i in idx[:split]]
+        else:
+            train_samples = samples
+            val_samples = []
+        train_dataset = _samples_to_data(train_samples, augment_sym=args.augment_sym)
+        val_dataset = _samples_to_data(val_samples, augment_sym=args.augment_sym) if val_samples else []
     if args.epochs > 0:
         if not train_dataset:
             raise ValueError("No training data: either specify --games or provide a dataset to train on.")
@@ -452,3 +502,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+"""
+examples usage:
+
+rocks and sicks> python3 -m gnn.gnn_train --games 50 --game-type mcts-vs-random --mcts-rollouts 100 --save-games-dir saved_games_mcts
+rocks and sicks> python3 -m gnn.gnn_train --epochs 10 --lr 1e-3 --batch-size 16 --device cpu
+
+"""
