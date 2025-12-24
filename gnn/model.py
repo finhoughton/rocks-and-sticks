@@ -7,7 +7,7 @@ from torch_geometric.data import Data  # type: ignore
 from torch_geometric.nn import GINEConv, global_mean_pool  # type: ignore
 
 from game import Game
-from gnn.gnn_encode import encode_game_to_graph
+from gnn.encode import encode_game_to_graph
 
 INIT_MEAN = 0.0
 INIT_STD = 0.1
@@ -16,6 +16,7 @@ def _init_parameters(module: nn.Module, mean: float = INIT_MEAN, std: float = IN
     for p in module.parameters():
         if p.requires_grad:
             torch.nn.init.normal_(p, mean=mean, std=std)
+
 
 
 class GNNEval(nn.Module):

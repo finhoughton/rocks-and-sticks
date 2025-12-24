@@ -35,8 +35,8 @@ def _maybe_load_gnn(model_path: str, device: str) -> None:
     """Load GNN weights once and enable GNN eval for AI players."""
 
     try:
-        from gnn.gnn_encode import encode_game_to_graph
-        from gnn.gnn_model import load_model
+        from gnn.encode import encode_game_to_graph
+        from gnn.model import load_model
     except Exception as exc:  # pragma: no cover
         raise RuntimeError(f"GNN modules not available: {exc}")
 

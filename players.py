@@ -174,7 +174,7 @@ class AIPlayer(Player):
 
     @classmethod
     def _evaluate_with_gnn(cls, game: Game, player: Player) -> float:
-        from gnn.gnn_model import evaluate_game
+        from gnn.model import evaluate_game
         prob = float(evaluate_game(game))
         if player.number != game.current_player:
             prob = 1.0 - prob

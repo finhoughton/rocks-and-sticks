@@ -38,8 +38,8 @@ def _save_game(game: Game, opponent: Player, save_dir: str = "saved_games_human"
     print(f"Saved game to {path}")
 
 def _load_gnn(game: Game, model_path: str, device: str) -> None:
-    from gnn.gnn_encode import encode_game_to_graph
-    from gnn.gnn_model import load_model
+    from gnn.encode import encode_game_to_graph
+    from gnn.model import load_model
 
     enc = encode_game_to_graph(game)
 
