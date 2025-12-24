@@ -1,11 +1,45 @@
 import argparse
+import glob
+import json
+import os
 
 from game import Game
 from players import AlphaBetaPlayer, HumanPlayer, MCTSPlayer, Player
 
 
+def _next_save_path(save_dir: str) -> str:
+    os.makedirs(save_dir, exist_ok=True)
+    existing = [p for p in glob.glob(os.path.join(save_dir, "game_*.json"))]
+    start_idx = 0
+    if existing:
+        def _idx(p: str) -> int:
+            stem = os.path.basename(p)
+            try:
+                return int(stem.split("_")[1].split(".")[0])
+            except Exception:
+                return -1
+        start_idx = max(map(_idx, existing)) + 1
+    return os.path.join(save_dir, f"game_{start_idx:05d}.json")
+
+def _save_game(game: Game, opponent: Player, save_dir: str = "saved_games_human") -> None:
+    path = _next_save_path(save_dir)
+    payload: dict[str, object] = {
+        "winner": game.winner,
+        "moves": [{"x": m.c[0], "y": m.c[1], "t": m.t} for m in game.moves],
+        "max_moves_reached": False,
+        "meta": {
+            "mode": "human-vs-bot",
+            "bot": opponent.__class__.__name__,
+            "time_limit": getattr(opponent, "time_limit", None),
+        },
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+    print(f"Saved game to {path}")
+
 def _load_gnn(game: Game, model_path: str, device: str) -> None:
-    from gnn_eval import encode_game_to_graph, load_model
+    from gnn.gnn_encode import encode_game_to_graph
+    from gnn.gnn_model import load_model
 
     enc = encode_game_to_graph(game)
 
@@ -29,3 +63,4 @@ if __name__ == "__main__":
         _load_gnn(game, args.gnn_model, args.device)
 
     game.run(display=True)
+    _save_game(game, opponent, save_dir="saved_games_human")

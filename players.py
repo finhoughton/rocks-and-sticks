@@ -106,7 +106,7 @@ class RockBiasedRandomPlayer(RandomPlayer):
     def get_move(self, game: Game) -> Move:
         moves = sorted(game.get_possible_moves(self), key=move_sort_key)
         rock_moves = [m for m in moves if m.t == "R"]
-        if rock_moves and self._rng.random() < 0.7:
+        if rock_moves and self._rng.random() < 0.6:
             return self._rng.choice(rock_moves)
         return self._rng.choice(moves)
 
@@ -174,7 +174,7 @@ class AIPlayer(Player):
 
     @classmethod
     def _evaluate_with_gnn(cls, game: Game, player: Player) -> float:
-        from gnn_eval import evaluate_game
+        from gnn.gnn_model import evaluate_game
         prob = float(evaluate_game(game))
         if player.number != game.current_player:
             prob = 1.0 - prob
@@ -752,7 +752,7 @@ class MCTSPlayer(AIPlayer):
 
             scored = move_order_cache.get(cache_key)
             if scored is None:
-                moves = list(self.search_moves_all(working_game, p))
+                moves = list(self.search_moves_sticks(working_game, p))
                 scored = [(self.score_after(working_game, p, mv), move_sort_key(mv), mv) for mv in moves]
                 move_order_cache[cache_key] = scored
 
@@ -781,14 +781,10 @@ class MCTSPlayer(AIPlayer):
                     defended = False
                     for response in responses:
                         with applied_move(working_game, me, response):
-                            # After our response (end-of-round), if opponent
-                            # is NOT winner, then we have a defense.
                             if working_game.winner != opp.number:
                                 defended = True
                                 break
 
-                    # If we cannot find any defense against this opponent reply,
-                    # then `my_move` allows a forced loss next round.
                     if not defended:
                         return True
 
@@ -848,6 +844,8 @@ class MCTSPlayer(AIPlayer):
 
         self.last_rollouts = rollouts_done
 
+        print(f"rollouts = {rollouts_done} for player {self.number}. time taken: {time.perf_counter() - start_time:.2f}s")
+
         best_move = self.choose(root_key, working_game, allowed_root_moves=allowed_root_moves)
 
         # Final tactical safety pass: avoid one-move blunders where our move
@@ -871,6 +869,7 @@ class MCTSPlayer(AIPlayer):
             if self.allows_forced_loss_next_round(m, working_game, player):
                 continue
             return m
+        
 
         return best_move
 
@@ -885,7 +884,7 @@ class MCTSPlayer(AIPlayer):
             return PASS
 
         candidates = legal
-        if allowed_root_moves is not None and allowed_root_moves:
+        if allowed_root_moves:
             allowed = {(m.t, m.c) for m in allowed_root_moves}
             filtered = [m for m in candidates if (m.t, m.c) in allowed]
             if filtered:

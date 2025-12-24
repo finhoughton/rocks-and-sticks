@@ -4,5 +4,6 @@ __pycache__
 test.txt
 *.prof
 *.pt
-saved_games_ab2/
+**/
+!gnn
 *.png
