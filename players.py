@@ -97,14 +97,14 @@ class RandomPlayer(Player):
         self._rng = random.Random(seed)
 
     def get_move(self, game: Game) -> Move:
-        moves = sorted(game.get_possible_moves(self), key=move_sort_key)
+        moves = sorted((m for m in game.get_possible_moves(self) if m is not PASS), key=move_sort_key)
         return self._rng.choice(moves)
 
 class RockBiasedRandomPlayer(RandomPlayer):
     # Random player with a bias toward rock moves to diversify play
 
     def get_move(self, game: Game) -> Move:
-        moves = sorted(game.get_possible_moves(self), key=move_sort_key)
+        moves = sorted((m for m in game.get_possible_moves(self) if m is not PASS), key=move_sort_key)
         rock_moves = [m for m in moves if m.t == "R"]
         if rock_moves and self._rng.random() < 0.6:
             return self._rng.choice(rock_moves)
