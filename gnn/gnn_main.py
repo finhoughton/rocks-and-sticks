@@ -6,15 +6,13 @@ import time
 from typing import Callable
 
 import torch
-from torch_geometric.data import Data  # type: ignore
-from torch_geometric.loader import DataLoader
 
 from gnn.augment import samples_to_data
 from gnn.dataset import load_balanced_saved_game_samples
 from gnn.encode import EncodedGraph
 from gnn.game_generation import generate_self_play_games
-from gnn.model import GNNEval
 from gnn.plotting import plot_losses
+from gnn.train import train
 from players import (
     AlphaBetaPlayer,
     MCTSPlayer,
@@ -25,67 +23,6 @@ from players import (
 )
 
 Sample = tuple[EncodedGraph, float, float]
-
-def train(
-    train_dataset: list[Data],
-    val_dataset: list[Data],
-    epochs: int = 5,
-    batch_size: int = 16,
-    lr: float = 1e-3,
-    device: str = "cpu",
-) -> tuple[GNNEval, list[float], list[float]]:
-
-    if not train_dataset:
-        raise ValueError("Dataset is empty; generate samples first.")
-
-    device_t = torch.device(device)
-    sample = train_dataset[0]
-    node_feat_dim = sample.x.size(1) # type: ignore
-    global_feat_dim = sample.global_feats.size(1)
-    model = GNNEval(node_feat_dim=node_feat_dim, global_feat_dim=global_feat_dim).to(device_t)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    criterion = torch.nn.BCEWithLogitsLoss()
-
-    train_losses: list[float] = []
-    val_losses: list[float] = []
-
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0.0
-
-        for batch in train_loader:
-            batch = batch.to(device_t)
-            logits = model(batch)
-            loss = criterion(logits, batch.y.view_as(logits))
-            loss = (loss * batch.weight.view_as(loss)).mean()
-            opt.zero_grad()
-            loss.backward()
-            opt.step() # type: ignore
-            total_loss += float(loss.item())
-
-        avg_loss = total_loss / max(1, len(train_loader))
-        val_loss = None
-        if val_loader is not None:
-            model.eval()
-            v_total = 0.0
-            with torch.no_grad():
-                for batch in val_loader:
-                    batch = batch.to(device_t)
-                    logits = model(batch)
-                    loss = criterion(logits, batch.y.view_as(logits))
-                    v_total += float(loss.item())
-            val_loss = v_total / max(1, len(val_loader))
-        train_losses.append(avg_loss)
-        val_losses.append(val_loss if val_loss is not None else float("nan"))
-        if val_loss is None:
-            print(f"epoch {epoch+1}/{epochs} train loss={avg_loss:.4f}")
-        else:
-            print(f"epoch {epoch+1}/{epochs} train loss={avg_loss:.4f} test loss={val_loss:.4f}")
-    model.eval()
-
-    return model, train_losses, val_losses
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate games and/or train GNN eval")
@@ -174,11 +111,13 @@ def main() -> None:
         default="loss_curve.png",
         help="path to save the loss plot when --plot-loss is set",
     )
+
     args = parser.parse_args()
     seed_base = args.seed_base
     if seed_base is None:
         seed_base = random.Random().randrange(1_000_000_000) ^ int(time.time() * 1e6)
     seeds = [seed_base + i for i in range(2)]
+
     def randomish_factory(idx: int) -> Player:
         seed = seeds[idx % len(seeds)]
         if random.random() < 0.2:
@@ -186,6 +125,7 @@ def main() -> None:
         if random.random() < 0.4:
             return RockBiasedRandomPlayer(idx, seed=seed)
         return RandomPlayer(idx, seed=seed)
+
     def mcts_factory(idx: int) -> Player:
         seed = seeds[idx % len(seeds)]
         time_limit = args.mcts_time_limit
@@ -193,8 +133,10 @@ def main() -> None:
         if (time_limit is not None) and (n_rollouts is not None):
             raise ValueError("Specify only one of --mcts-time-limit or --mcts-rollouts")
         return MCTSPlayer(idx, time_limit=time_limit, n_rollouts=n_rollouts if n_rollouts is not None else 1000, max_sim_depth=30, seed=seed, use_gnn=True)
+
     def greedy_factory(idx: int) -> Player:
         return OnePlyGreedyPlayer(idx)
+
     def ab_factory(idx: int) -> Player:
         x = random.random()
         if x < 0.6:
@@ -202,6 +144,7 @@ def main() -> None:
         elif x < 0.8:
             return AlphaBetaPlayer(idx, depth=max(1, args.ab_depth - 1))
         return RockBiasedRandomPlayer(idx)
+
     if args.game_type == "ab-vs-random":
         player_factories: list[Callable[[int], Player]] = [ab_factory, randomish_factory]
     elif args.game_type == "mcts-vs-random":
@@ -212,6 +155,7 @@ def main() -> None:
         player_factories = [greedy_factory, greedy_factory]
     else:
         player_factories = [randomish_factory, randomish_factory]
+
     if args.games is not None:
         generate_self_play_games(
             args.games,
@@ -220,24 +164,21 @@ def main() -> None:
             swap_roles=args.swap_roles,
             save_games_dir=args.save_games_dir,
         )
-        print(f"Generated {args.games} games (no training; --epochs is 0)")
+        print(f"Generated {args.games} games")
         train_dataset = []
         val_dataset = []
     else:
         # Only training, not generating new games
         print("Loading balanced dataset from saved_games_ab2, saved_games_mcts, saved_games_human...")
         samples = load_balanced_saved_game_samples("saved_games_ab2", "saved_games_mcts", "saved_games_human")
-        if args.val_frac > 0.0:
-            idx = list(range(len(samples)))
-            random.shuffle(idx)
-            split = max(1, int(len(idx) * args.val_frac))
-            train_samples = [samples[i] for i in idx[split:]]
-            val_samples = [samples[i] for i in idx[:split]]
-        else:
-            train_samples = samples
-            val_samples = []
+        idx = list(range(len(samples)))
+        random.shuffle(idx)
+        split = max(1, int(len(idx) * args.val_frac))
+        train_samples = [samples[i] for i in idx[split:]]
+        val_samples = [samples[i] for i in idx[:split]]
         train_dataset = samples_to_data(train_samples, augment_sym=args.augment_sym)
         val_dataset = samples_to_data(val_samples, augment_sym=args.augment_sym) if val_samples else []
+
     if args.epochs > 0:
         if not train_dataset:
             raise ValueError("No training data: either specify --games or provide a dataset to train on.")
@@ -265,7 +206,7 @@ if __name__ == "__main__":
 """
 examples usage:
 
-rocks and sicks> python3 -m gnn.gnn_train --games 50 --game-type mcts-vs-random --mcts-rollouts 100 --save-games-dir saved_games_mcts
-rocks and sicks> python3 -m gnn.gnn_train --epochs 10 --lr 1e-3 --batch-size 16 --device cpu
+rocks and sicks> python3 -m gnn.gnn_main --games 50 --game-type mcts-vs-random --mcts-rollouts 100 --save-games-dir saved_games_mcts
+rocks and sicks> python3 -m gnn.gnn_main --epochs 10 --lr 1e-3 --batch-size 16 --device cpu
 
 """

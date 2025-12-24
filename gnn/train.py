@@ -36,7 +36,7 @@ def train(
             batch = batch.to(device_t)
             logits = model(batch)
             loss = criterion(logits, batch.y.view_as(logits))
-            loss = (loss * batch.weight.view_as(loss)).mean()
+            loss = (loss * batch.weight.flatten()).mean()
             opt.zero_grad()
             loss.backward()
             opt.step() # type: ignore
