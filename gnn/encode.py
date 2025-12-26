@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable
 
 import torch
-from torch_geometric.data import Data  # type: ignore
+from torch_geometric.data import Data
+
+from game import Game
+from players import RandomPlayer  # type: ignore
 
 if TYPE_CHECKING:
-    from game import Game
     from models import Node
 
 @dataclass
@@ -57,7 +59,7 @@ def _edge_index_and_attr_from_points(points: Iterable['Node']) -> tuple[torch.Te
     return edge_index, edge_attr
 
 
-def encode_game_to_graph(game: 'Game') -> EncodedGraph:
+def encode_game_to_graph(game: Game) -> EncodedGraph:
     """Encode the visible board graph and global features for the current player."""
     point_set = set(game.connected_points)
     point_set.update(game.rocks)
@@ -80,3 +82,7 @@ def encode_game_to_graph(game: 'Game') -> EncodedGraph:
         global_feats=global_feats,
     )
     return EncodedGraph(data=data, perspective=game.current_player)
+
+g = Game([RandomPlayer(0), RandomPlayer(1)])
+SAMPLE_ENC = encode_game_to_graph(g)
+del g

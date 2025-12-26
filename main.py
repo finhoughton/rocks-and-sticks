@@ -3,8 +3,13 @@ import glob
 import json
 import os
 
+import torch
+
 from game import Game
+from gnn.encode import SAMPLE_ENC, encode_game_to_graph
+from gnn.model import load_model
 from players import AlphaBetaPlayer, HumanPlayer, MCTSPlayer, Player
+from rl.main import PPOGNNPolicy, PPOPlayer
 
 
 def _next_save_path(save_dir: str) -> str:
@@ -38,9 +43,6 @@ def _save_game(game: Game, opponent: Player, save_dir: str = "saved_games_human"
     print(f"Saved game to {path}")
 
 def _load_gnn(game: Game, model_path: str, device: str) -> None:
-    from gnn.encode import encode_game_to_graph
-    from gnn.model import load_model
-
     enc = encode_game_to_graph(game)
 
     node_dim, global_dim = enc.data.x.size(1), enc.data.global_feats.size(1) # type: ignore
@@ -48,19 +50,35 @@ def _load_gnn(game: Game, model_path: str, device: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Play Rocks and Sticks")
-    parser.add_argument("--ai", choices=["mcts", "alphabeta"], default="mcts")
+    parser.add_argument("--ai", choices=["mcts", "alphabeta", "ppo"], default="mcts")
     parser.add_argument("--time-limit", type=float, default=2.0, help="MCTS time limit (seconds)")
-    parser.add_argument("--gnn-model", type=str, default=None, help="path to GNN weights to enable NN eval")
+    parser.add_argument("--model", type=str, default=None, help="path to GNN weights to enable NN eval or PPO model for --ai ppo")
     parser.add_argument("--device", type=str, default="cpu", help="device for GNN (cpu/cuda)")
     args = parser.parse_args()
 
-    opponent = MCTSPlayer(1, time_limit=args.time_limit, use_gnn=bool(args.gnn_model)) if args.ai == "mcts" else AlphaBetaPlayer(1, use_gnn=bool(args.gnn_model))
+    if args.ai == "ppo":
+        if not args.model:
+            raise ValueError("--model (path to PPO model) is required for --ai ppo")
+        # Load PPOGNNPolicy with correct dimensions
+        node_feat_dim = SAMPLE_ENC.data.x.size(1) # type: ignore
+        global_feat_dim = SAMPLE_ENC.data.global_feats.size(1)
+        model = PPOGNNPolicy(node_feat_dim=node_feat_dim, global_feat_dim=global_feat_dim, max_action_dim=64)
+        state = torch.load(args.model, map_location=args.device)
+        model.load_state_dict(state)
+        model.eval()
+        opponent = PPOPlayer(1, model, device=args.device)
+        print(f"Loaded PPO agent from {args.model} on device {args.device}.")
+    elif args.ai == "mcts":
+        opponent = MCTSPlayer(1, time_limit=args.time_limit, use_gnn=bool(args.model))
+    else:
+        opponent = AlphaBetaPlayer(1, use_gnn=bool(args.model))
+
     players: list[Player] = [HumanPlayer(0), opponent]
     game = Game(players=players)
 
-    if args.gnn_model:
-        print(f"Using GNN evaluator from {args.gnn_model} on device {args.device}.")
-        _load_gnn(game, args.gnn_model, args.device)
+    if args.model and args.ai != "ppo":
+        print(f"Using GNN evaluator from {args.model} on device {args.device}.")
+        _load_gnn(game, args.model, args.device)
 
     game.run(display=True)
     _save_game(game, opponent, save_dir="saved_games_human")

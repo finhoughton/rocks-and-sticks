@@ -138,12 +138,13 @@ def main() -> None:
         return OnePlyGreedyPlayer(idx)
 
     def ab_factory(idx: int) -> Player:
+        seed = seeds[idx % len(seeds)]
         x = random.random()
         if x < 0.6:
             return AlphaBetaPlayer(idx, depth=args.ab_depth)
         elif x < 0.8:
             return AlphaBetaPlayer(idx, depth=max(1, args.ab_depth - 1))
-        return RockBiasedRandomPlayer(idx)
+        return RockBiasedRandomPlayer(idx, seed=seed)
 
     if args.game_type == "ab-vs-random":
         player_factories: list[Callable[[int], Player]] = [ab_factory, randomish_factory]
@@ -195,10 +196,6 @@ def main() -> None:
         print(f"saved weights to {args.out}")
         if args.plot_loss:
             plot_losses(train_losses, val_losses, args.loss_plot_out)
-    elif args.games is not None:
-        print(f"Generated {len(samples)} base samples (no training; --epochs is 0)") # type: ignore
-    else:
-        print("Nothing to do: specify --games to generate or --epochs to train.")
 
 if __name__ == "__main__":
     main()
@@ -207,6 +204,6 @@ if __name__ == "__main__":
 examples usage:
 
 rocks and sicks> python3 -m gnn.gnn_main --games 50 --game-type mcts-vs-random --mcts-rollouts 100 --save-games-dir saved_games_mcts
-rocks and sicks> python3 -m gnn.gnn_main --epochs 10 --lr 1e-3 --batch-size 16 --device cpu
+rocks and sicks> python3 -m gnn.gnn_main --epochs 10 --lr 1e-3 --batch-size 8 --device cpu
 
 """

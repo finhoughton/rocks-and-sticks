@@ -6,4 +6,6 @@ test.txt
 *.pt
 **/
 !gnn
+!rl
 *.png
+*.log

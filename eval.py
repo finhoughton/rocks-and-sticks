@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Dict
 
 from game import Game
+from gnn.encode import SAMPLE_ENC
 from players import AIPlayer, AlphaBetaPlayer, MCTSPlayer, RandomPlayer
 
 
@@ -31,19 +32,12 @@ class EvalConfig:
     device: str = "cpu"
 
 
-def _maybe_load_gnn(model_path: str, device: str) -> None:
+def _load_gnn(model_path: str, device: str) -> None:
     """Load GNN weights once and enable GNN eval for AI players."""
+    from gnn.model import load_model
 
-    try:
-        from gnn.encode import encode_game_to_graph
-        from gnn.model import load_model
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError(f"GNN modules not available: {exc}")
-
-    temp_game = Game()  # Default players are fine for encoding dimensions.
-    enc = encode_game_to_graph(temp_game)  # type: ignore
-    node_dim = enc.data.x.size(1) # type: ignore
-    global_dim = enc.data.global_feats.size(1)
+    node_dim = SAMPLE_ENC.data.x.size(1) # type: ignore
+    global_dim = SAMPLE_ENC.data.global_feats.size(1)
     load_model(model_path, node_dim, global_dim, device=device)
     AIPlayer.use_gnn_eval = True
 
@@ -206,7 +200,7 @@ def main() -> None:
     wins: Dict[int | None, int] = {0: 0, 1: 0, None: 0}
 
     if cfg.gnn_model:
-        _maybe_load_gnn(cfg.gnn_model, cfg.device)
+        _load_gnn(cfg.gnn_model, cfg.device)
         print(f"Using GNN evaluator from {cfg.gnn_model} on device {cfg.device}.")
 
     def run_eval() -> None:

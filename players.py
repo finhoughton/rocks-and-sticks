@@ -570,7 +570,7 @@ class OnePlyGreedyPlayer(AIPlayer):
         return best
 
 class AlphaBetaPlayer(AIPlayer):
-    def __init__(self, player_number: int, depth: int = ALPHABETA_DEPTH, use_gnn: bool = False, pass_penalty: float = 0.75):
+    def __init__(self, player_number: int, depth: int = ALPHABETA_DEPTH, use_gnn: bool = False, pass_penalty: float = 1.2):
         super().__init__(player_number)
         self.depth = depth
         self.use_gnn_eval = use_gnn
