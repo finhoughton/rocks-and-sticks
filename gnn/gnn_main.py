@@ -30,7 +30,7 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=0, help="training epochs (0 = generate games only, no training)")
     parser.add_argument("--batch-size", type=int, default=16, help="batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="learning rate")
-    parser.add_argument("--out", type=str, default="gnn_eval.pt", help="output path for weights")
+    parser.add_argument("--out", type=str, default="checkpoints/gnn_eval.pt", help="output path for weights")
     parser.add_argument("--device", type=str, default="cpu", help="cpu or cuda")
     parser.add_argument("--max-moves", type=int, default=256, help="move cap per game")
     parser.add_argument(

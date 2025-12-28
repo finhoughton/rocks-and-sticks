@@ -5,11 +5,15 @@ import cProfile
 import pstats
 import time
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
+
+import torch
+import torch.nn as nn
 
 from game import Game
 from gnn.encode import SAMPLE_ENC
-from players import AIPlayer, AlphaBetaPlayer, MCTSPlayer, RandomPlayer
+from players import AIPlayer, AlphaBetaPlayer, MCTSPlayer, Player, RandomPlayer
+from rl.main import PPOGNNPolicy, PPOPlayer
 
 
 @dataclass(frozen=True)
@@ -24,12 +28,14 @@ class EvalConfig:
     random_seed: int | None = 1
     show: bool = False
     pause_s: float = 0.0
-    mode: str = "mcts-vs-random"  # or "mcts-vs-mcts" / "mcts-vs-alphabeta" / "alphabeta-vs-mcts" / "alphabeta-vs-alphabeta"
+    mode: str = "mcts-vs-random"  # left-vs-right token, swapping alternates sides between games
     profile: bool = False
     profile_top: int = 40
     profile_out: str | None = None
     gnn_model: str | None = None
     device: str = "cpu"
+    policy_checkpoint: str | None = None
+    policy_device: str = "cpu"
 
 
 def _load_gnn(model_path: str, device: str) -> None:
@@ -42,55 +48,63 @@ def _load_gnn(model_path: str, device: str) -> None:
     AIPlayer.use_gnn_eval = True
 
 
-def play_one_game(cfg: EvalConfig, game_index: int) -> int | None:
+def _load_policy(checkpoint: str, device: str) -> PPOGNNPolicy:
+    node_dim = SAMPLE_ENC.data.x.size(1)  # type: ignore
+    global_dim = SAMPLE_ENC.data.global_feats.size(1)
+    policy = PPOGNNPolicy(node_feat_dim=node_dim, global_feat_dim=global_dim, max_action_dim=64)
+    policy.to(device)
+    sd = torch.load(checkpoint, map_location=device)
+    try:
+        policy.load_state_dict(sd)
+    except Exception:
+        model_keys = set(policy.state_dict().keys())
+        filtered = {k: v for k, v in sd.items() if k in model_keys}
+        policy.load_state_dict(filtered, strict=False)
+    policy.eval()
+    return policy
+
+
+def play_one_game(cfg: EvalConfig, game_index: int, policy_model: Optional[nn.Module] = None, swap: bool = False) -> Optional[int]:
     # Keep seeds deterministic but varied per game.
-    if cfg.mode == "mcts-vs-mcts":
-        p0 = MCTSPlayer(
-            0,
-            seed=None if cfg.mcts0_seed is None else cfg.mcts0_seed + game_index,
-            n_rollouts=cfg.mcts_rollouts,
-            max_sim_depth=cfg.mcts_sim_depth,
-            time_limit=cfg.mcts_time_limit,
-        )
-        p1 = MCTSPlayer(
-            1,
-            seed=None if cfg.mcts1_seed is None else cfg.mcts1_seed + game_index,
-            n_rollouts=cfg.mcts_rollouts,
-            max_sim_depth=cfg.mcts_sim_depth,
-            time_limit=cfg.mcts_time_limit,
-        )
-    elif cfg.mode == "mcts-vs-alphabeta":
-        p0 = AlphaBetaPlayer(0)
-        p1 = MCTSPlayer(
-            1,
-            seed=None if cfg.mcts1_seed is None else cfg.mcts1_seed + game_index,
-            n_rollouts=cfg.mcts_rollouts,
-            max_sim_depth=cfg.mcts_sim_depth,
-            time_limit=cfg.mcts_time_limit,
-        )
-    elif cfg.mode == "alphabeta-vs-mcts":
-        p0 = MCTSPlayer(
-            0,
-            seed=None if cfg.mcts0_seed is None else cfg.mcts0_seed + game_index,
-            n_rollouts=cfg.mcts_rollouts,
-            max_sim_depth=cfg.mcts_sim_depth,
-            time_limit=cfg.mcts_time_limit,
-        )
-        p1 = AlphaBetaPlayer(1)
-    elif cfg.mode == "alphabeta-vs-alphabeta":
-        p0 = AlphaBetaPlayer(0)
-        p1 = AlphaBetaPlayer(1)
+
+    # Parse left/right tokens from mode
+    try:
+        left_tok, right_tok = cfg.mode.split("-vs-")
+    except Exception:
+        raise ValueError(f"Unrecognized mode format: {cfg.mode}")
+
+    def make_player(token: str, slot_index: int) -> Player:
+        # slot_index is the numeric player id in the game (0 or 1)
+        if token == "mcts":
+            base_seed: Optional[int] = cfg.mcts0_seed if slot_index == 0 else cfg.mcts1_seed
+            seed = None if base_seed is None else base_seed + game_index
+            return MCTSPlayer(
+                slot_index,
+                seed=seed,
+                n_rollouts=cfg.mcts_rollouts,
+                max_sim_depth=cfg.mcts_sim_depth,
+                time_limit=cfg.mcts_time_limit,
+            )
+        if token == "random":
+            return RandomPlayer(slot_index, seed=None if cfg.random_seed is None else cfg.random_seed + game_index)
+        if token == "alphabeta":
+            return AlphaBetaPlayer(slot_index)
+        if token == "policy":
+            if policy_model is None:
+                raise ValueError("Policy player requested but no policy checkpoint was provided.")
+            return PPOPlayer(slot_index, policy_model, cfg.device)
+        raise ValueError(f"Unknown player token: {token}")
+
+    left_player: Player = make_player(left_tok, 0)
+    right_player: Player = make_player(right_tok, 1)
+
+    # If swap requested, assign players to slots reversed (but use slot indices 0 and 1)
+    if swap:
+        p0 = make_player(right_tok, 0)
+        p1 = make_player(left_tok, 1)
     else:
-        p0 = RandomPlayer(
-            0, seed=None if cfg.random_seed is None else cfg.random_seed + game_index
-        )
-        p1 = MCTSPlayer(
-            1,
-            seed=None if cfg.mcts1_seed is None else cfg.mcts1_seed + game_index,
-            n_rollouts=cfg.mcts_rollouts,
-            max_sim_depth=cfg.mcts_sim_depth,
-            time_limit=cfg.mcts_time_limit,
-        )
+        p0 = left_player
+        p1 = right_player
 
     g = Game(players=[p0, p1])
 
@@ -134,7 +148,7 @@ def play_one_game(cfg: EvalConfig, game_index: int) -> int | None:
     return g.winner
 
 
-def main() -> None:
+def build_config_from_args() -> EvalConfig:
     parser = argparse.ArgumentParser(description="Evaluate MCTS vs Random")
     parser.add_argument(
         "--mode",
@@ -142,11 +156,12 @@ def main() -> None:
             "mcts-vs-random",
             "mcts-vs-mcts",
             "mcts-vs-alphabeta",
-            "alphabeta-vs-mcts",
             "alphabeta-vs-alphabeta",
+            "policy-vs-alphabeta",
+            "policy-vs-mcts",
         ],
         default="mcts-vs-random",
-        help="Which matchup to run",
+        help="Which matchup to run (left-vs-right). The script alternates sides between games.",
     )
     parser.add_argument("--games", type=int, default=50)
     parser.add_argument("--max-turns", type=int, default=200)
@@ -157,26 +172,14 @@ def main() -> None:
     parser.add_argument("--mcts1-seed", type=int, default=1)
     parser.add_argument("--random-seed", type=int, default=1)
     parser.add_argument("--show", action="store_true", help="Render games as they play")
-    parser.add_argument(
-        "--pause", type=float, default=0.0, help="Extra pause between moves (seconds)"
-    )
-    parser.add_argument(
-        "--profile", action="store_true", help="Run under cProfile and print hotspots"
-    )
-    parser.add_argument(
-        "--profile-top",
-        type=int,
-        default=40,
-        help="How many lines of profile output to print",
-    )
-    parser.add_argument(
-        "--profile-out",
-        type=str,
-        default=None,
-        help="Optional path to write a .prof file",
-    )
+    parser.add_argument("--pause", type=float, default=0.0, help="Extra pause between moves (seconds)")
+    parser.add_argument("--profile", action="store_true", help="Run under cProfile and print hotspots")
+    parser.add_argument("--profile-top", type=int, default=40, help="How many lines of profile output to print")
+    parser.add_argument("--profile-out", type=str, default=None, help="Optional path to write a .prof file")
     parser.add_argument("--gnn-model", type=str, default=None, help="Path to GNN weights to enable NN eval")
     parser.add_argument("--device", type=str, default="cpu", help="Device for GNN (cpu/cuda)")
+    parser.add_argument("--policy-checkpoint", type=str, default=None, help="Path to PPO policy checkpoint to evaluate")
+    parser.add_argument("--policy-device", type=str, default="cpu", help="Device for loaded policy")
     args = parser.parse_args()
 
     cfg = EvalConfig(
@@ -195,32 +198,58 @@ def main() -> None:
         profile_top=args.profile_top,
         profile_out=args.profile_out,
         gnn_model=args.gnn_model,
+        policy_checkpoint=args.policy_checkpoint,
+        policy_device=args.policy_device,
         device=args.device,
     )
-    wins: Dict[int | None, int] = {0: 0, 1: 0, None: 0}
+    return cfg
 
+
+def load_models(cfg: EvalConfig) -> Optional[nn.Module]:
     if cfg.gnn_model:
         _load_gnn(cfg.gnn_model, cfg.device)
         print(f"Using GNN evaluator from {cfg.gnn_model} on device {cfg.device}.")
+    policy_model: Optional[nn.Module] = None
+    if cfg.policy_checkpoint:
+        policy_model = _load_policy(cfg.policy_checkpoint, cfg.policy_device)
+        print(f"Loaded policy from {cfg.policy_checkpoint} onto device {cfg.policy_device}.")
+    return policy_model
 
-    def run_eval() -> None:
-        for i in range(cfg.games):
-            # When not rendering, print basic progress so long runs aren't silent.
+
+def evaluate(cfg: EvalConfig, policy_model: Optional[nn.Module]) -> Dict[str | None, int]:
+    wins_lr: Dict[str | None, int] = {"left": 0, "right": 0, None: 0}
+
+    for i in range(cfg.games):
+        swap = (i % 2) == 1
+        if not cfg.show:
+            side_note = "(swapped)" if swap else ""
+            print(f"Game {i + 1}/{cfg.games} {side_note} ({cfg.mode})...", flush=True)
+        try:
+            w = play_one_game(cfg, i, policy_model, swap=swap)
+        except KeyboardInterrupt:
             if not cfg.show:
-                print(f"Game {i + 1}/{cfg.games} ({cfg.mode})...", flush=True)
-            try:
-                w = play_one_game(cfg, i)
-            except KeyboardInterrupt:
-                if not cfg.show:
-                    print(f"Interrupted during game {i + 1}/{cfg.games}.")
-                raise
-            wins[w] += 1
-            if not cfg.show:
-                if w is None:
-                    w_s = "no winner"
-                else:
-                    w_s = f"player {w + 1}"
-                print(f"  Result: {w_s}", flush=True)
+                print(f"Interrupted during game {i + 1}/{cfg.games}.")
+            raise
+        if w is None:
+            wins_lr[None] += 1
+        else:
+            if not swap:
+                wins_lr["left" if w == 0 else "right"] += 1
+            else:
+                wins_lr["right" if w == 0 else "left"] += 1
+        if not cfg.show:
+            if w is None:
+                w_s = "no winner"
+            else:
+                w_s = f"player {w + 1}"
+            print(f"  Result: {w_s}", flush=True)
+    return wins_lr
+
+
+def main() -> None:
+    cfg = build_config_from_args()
+    wins_lr: Dict[str | None, int]
+    policy_model = load_models(cfg)
 
     pr: cProfile.Profile | None = None
     try:
@@ -228,7 +257,7 @@ def main() -> None:
             pr = cProfile.Profile()
             pr.enable()
             try:
-                run_eval()
+                wins_lr = evaluate(cfg, policy_model)
             finally:
                 pr.disable()
 
@@ -241,7 +270,7 @@ def main() -> None:
             print("\n=== cProfile (top cumulative) ===")
             stats.print_stats(max(1, cfg.profile_top))
         else:
-            run_eval()
+            wins_lr = evaluate(cfg, policy_model)
     except KeyboardInterrupt:
         print("\nInterrupted by user; printing partial results...")
         if cfg.profile and pr is not None:
@@ -254,29 +283,32 @@ def main() -> None:
                 print("\n=== cProfile (top cumulative, partial run) ===")
                 stats.print_stats(max(1, cfg.profile_top))
             except Exception:
-                # Best-effort: still show the partial win summary below.
                 pass
-
-    total_played = int(sum(wins.values()))
-    print(f"Games: {total_played}")
-    if total_played <= 0:
         return
-    if cfg.mode == "mcts-vs-mcts":
-        print(f"MCTS P1 (player 1) wins: {wins[0]} ({wins[0] / total_played:.1%})")
-        print(f"MCTS P2 (player 2) wins: {wins[1]} ({wins[1] / total_played:.1%})")
-    elif cfg.mode == "mcts-vs-alphabeta":
-        print(f"AlphaBeta (player 1) wins: {wins[0]} ({wins[0] / total_played:.1%})")
-        print(f"MCTS (player 2) wins: {wins[1]} ({wins[1] / total_played:.1%})")
-    elif cfg.mode == "alphabeta-vs-mcts":
-        print(f"MCTS (player 1) wins: {wins[0]} ({wins[0] / total_played:.1%})")
-        print(f"AlphaBeta (player 2) wins: {wins[1]} ({wins[1] / total_played:.1%})")
-    elif cfg.mode == "alphabeta-vs-alphabeta":
-        print(f"AlphaBeta P1 (player 1) wins: {wins[0]} ({wins[0] / total_played:.1%})")
-        print(f"AlphaBeta P2 (player 2) wins: {wins[1]} ({wins[1] / total_played:.1%})")
-    else:
-        print(f"Random (player 1) wins: {wins[0]} ({wins[0] / total_played:.1%})")
-        print(f"MCTS (player 2) wins: {wins[1]} ({wins[1] / total_played:.1%})")
-    print(f"No winner (max_turns reached): {wins[None]} ({wins[None] / total_played:.1%})")
+
+    total_played = int(sum(v for k, v in wins_lr.items() if k is not None))
+    print(f"Games (decisive): {total_played}")
+    if total_played <= 0:
+        print(f"No decisive games played. Draws: {wins_lr[None]}")
+        return
+    # Generic X-vs-Y summary (maps short tokens to display names)
+    try:
+        left_tok, right_tok = cfg.mode.split("-vs-")
+    except Exception:
+        left_tok, right_tok = "player1", "player2"
+    name_map = {
+        "mcts": "MCTS",
+        "random": "Random",
+        "alphabeta": "AlphaBeta",
+        "policy": "PPO",
+    }
+    left_name = name_map.get(left_tok, left_tok.capitalize())
+    right_name = name_map.get(right_tok, right_tok.capitalize())
+    left_wins = wins_lr["left"]
+    right_wins = wins_lr["right"]
+    print(f"{left_name} (left) wins: {left_wins} ({left_wins / total_played:.1%})")
+    print(f"{right_name} (right) wins: {right_wins} ({right_wins / total_played:.1%})")
+    print(f"No winner (max_turns reached / draws): {wins_lr[None]} ({wins_lr[None] / (total_played + wins_lr[None]):.1%})")
 
 
 if __name__ == "__main__":

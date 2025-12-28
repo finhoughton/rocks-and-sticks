@@ -7,5 +7,6 @@ test.txt
 **/
 !gnn
 !rl
+!scripts
 *.png
 *.log

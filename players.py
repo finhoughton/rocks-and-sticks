@@ -98,6 +98,8 @@ class RandomPlayer(Player):
 
     def get_move(self, game: Game) -> Move:
         moves = sorted((m for m in game.get_possible_moves(self) if m is not PASS), key=move_sort_key)
+        if not moves:
+            return PASS
         return self._rng.choice(moves)
 
 class RockBiasedRandomPlayer(RandomPlayer):
