@@ -99,6 +99,25 @@ def main() -> None:
         help="fraction of samples to hold out for validation loss reporting",
     )
     parser.add_argument(
+        "--balance-classes",
+        action="store_true",
+        default=False,
+        help="Balance positive/negative classes in the training dataset",
+    )
+    parser.add_argument(
+        "--balance-strategy",
+        type=str,
+        default="upsample",
+        choices=["upsample", "downsample"],
+        help="Strategy to balance classes: upsample minority or downsample majority",
+    )
+    parser.add_argument(
+        "--balance-seed",
+        type=int,
+        default=None,
+        help="Optional RNG seed for balancing resampling",
+    )
+    parser.add_argument(
         "--plot-loss",
         action="store_true",
         help="save a PNG of train/val loss curves",
@@ -169,7 +188,14 @@ def main() -> None:
     else:
         # Only training, not generating new games
         print("Loading balanced dataset from saved_games_ab2, saved_games_mcts, saved_games_human...")
-        samples = load_balanced_saved_game_samples("saved_games_ab2", "saved_games_mcts", "saved_games_human")
+        samples = load_balanced_saved_game_samples(
+            "saved_games_ab2",
+            "saved_games_mcts",
+            "saved_games_human",
+            balance_classes=args.balance_classes,
+            balance_strategy=args.balance_strategy,
+            balance_seed=args.balance_seed,
+        )
         idx = list(range(len(samples)))
         random.shuffle(idx)
         split = max(1, int(len(idx) * args.val_frac))
