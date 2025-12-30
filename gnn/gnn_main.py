@@ -5,8 +5,6 @@ import random
 import time
 from typing import Callable
 
-import torch
-
 from gnn.augment import samples_to_data
 from gnn.dataset import load_balanced_saved_game_samples
 from gnn.encode import EncodedGraph
@@ -184,16 +182,20 @@ def main() -> None:
         if not train_dataset:
             raise ValueError("No training data: either specify --games or provide a dataset to train on.")
         print(f"Training: {len(train_dataset)}; validation: {len(val_dataset)}")
-        model, train_losses, val_losses = train(
+        _, train_losses, val_losses = train(
             train_dataset,
             val_dataset,
             epochs=args.epochs,
             batch_size=args.batch_size,
             lr=args.lr,
             device=args.device,
+            best_model_out=args.out,
         )
-        torch.save(model.state_dict(), args.out)
-        print(f"saved weights to {args.out}")
+        # `train` will save the best checkpoint to args.out when validation improves.
+        if not args.out:
+            print("training finished; no output path provided for best model")
+        else:
+            print(f"training finished; best model (by val loss) saved to {args.out} if available")
         if args.plot_loss:
             plot_losses(train_losses, val_losses, args.loss_plot_out)
 

@@ -81,6 +81,9 @@ def encode_game_to_graph(game: Game) -> EncodedGraph:
         batch=torch.zeros(len(nodes), dtype=torch.long),
         global_feats=global_feats,
     )
+    # include node coordinates so downstream code can map moves -> node indices
+    coords = torch.tensor([n.c for n in nodes], dtype=torch.long)
+    data.node_coords = coords
     return EncodedGraph(data=data, perspective=game.current_player)
 
 g = Game([RandomPlayer(0), RandomPlayer(1)])

@@ -235,14 +235,6 @@ class AIPlayer(Player):
         reply_lines: int = 4,
         include_reply: bool = True,
     ) -> TacticalStats:
-        """Cheap tactical summary for `player_idx` (cached per state).
-
-        Includes:
-        - immediate threats (max gain, number of scoring moves)
-        - threat distribution (sum of top 3 gains)
-        - "bad" cycle closures (area==1 when HALF_AREA_COUNTS is False)
-        - shallow risk: opponent's best immediate scoring reply after our best few moves
-        """
 
         if state_key is None:
             state_key = _game_key(game)
