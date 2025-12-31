@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import copy
 import math
 import random
 import time
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,6 +14,7 @@ from models import PASS, D, Move, MoveKey, calculate_area, calculate_end, move_s
 
 if TYPE_CHECKING:
     from game import Game
+    from gnn.encode import EncodedGraph
     from models import Node
 
 StateKey = tuple[object, ...]
@@ -47,7 +47,7 @@ def rollback_to(game: Game):
     while len(game.moves) > start_len:
         game.undo_move()
 
-class Player(ABC):
+class Player:
     def __init__(self, player_number: int):
         self.number = player_number
 
@@ -136,6 +136,10 @@ class AIPlayer(Player):
     _sticks_opp_cache: dict[tuple[StateKey, int], float] = {}
     _rock_value_cache: dict[tuple[StateKey, int], float] = {}
     _closure_area_cache: dict[tuple[StateKey, MoveKey], int | None] = {}
+    # cache possible moves per (state_key, player_idx)
+    _moves_cache: dict[tuple[StateKey, int], list[Move]] = {}
+    # cache encoded graphs per state_key to avoid repeated encoding
+    _enc_cache: dict[StateKey, EncodedGraph] = {}
 
     use_gnn_eval: bool = False
 
@@ -143,13 +147,15 @@ class AIPlayer(Player):
     def get_move(self, game: Game) -> Move:
         raise NotImplementedError("AIPlayer is an abstract base class")
 
-    def _clear_search_caches(self) -> None:
+    def _clear_heuristic_caches(self) -> None:
         self._eval_cache.clear()
         self._pot_cache.clear()
         self._sticks_opp_cache.clear()
         self._rock_value_cache.clear()
         self._tactical_cache.clear()
         self._closure_area_cache.clear()
+        self._moves_cache.clear()
+        self._enc_cache.clear()
 
     @classmethod
     def _eval_game_probability(cls, game: Game, perspective_player: Player) -> float:
@@ -176,8 +182,9 @@ class AIPlayer(Player):
 
     @classmethod
     def _evaluate_with_gnn(cls, game: Game, player: Player) -> float:
-        from gnn.model import evaluate_game
-        prob = float(evaluate_game(game))
+        from gnn.model import evaluate_encoding
+        enc = cls._get_encoded_graph(game)
+        prob = evaluate_encoding(enc)
         if player.number != game.current_player:
             prob = 1.0 - prob
 
@@ -284,15 +291,15 @@ class AIPlayer(Player):
             closure_area_by_key[move_sort_key(mv)] = cls._closure_area(game, state_key, mv)
 
         for mv in stick_sample:
-            with applied_move(game, player, mv):
-                # If this move wins outright, it is the strongest possible threat.
-                if game.winner == player.number:
-                    max_gain = max(max_gain, 999.0)
-                    scoring_count += 1
-                    winning_count += 1
-                    gains.append(999.0)
-                    continue
-                gain = float(game.players_scores[player.number] - before)
+            game.do_move(player, mv)
+            if game.winner == player.number:
+                max_gain = max(max_gain, 999.0)
+                scoring_count += 1
+                winning_count += 1
+                gains.append(999.0)
+                continue
+            gain = float(game.players_scores[player.number] - before)
+            game.undo_move()
             if gain > 0:
                 scoring_count += 1
                 if gain > max_gain:
@@ -321,18 +328,19 @@ class AIPlayer(Player):
                 key=lambda mv: (-approx_gain(mv), move_sort_key(mv)),
             )
             for mv in ranked[:reply_lines]:
-                with applied_move(game, player, mv):
-                    if game.winner == player.number:
-                        continue
-                    opp_ts = cls._tactical_stats(
-                        game,
-                        game.players[opp_idx],
-                        state_key=_game_key(game),
-                        eval_cap=max(12, eval_cap // 2),
-                        reply_lines=0,
-                        include_reply=False,
-                    )
-                    best_reply_gain = max(best_reply_gain, opp_ts.max_immediate_gain)
+                game.do_move(player, mv)
+                if game.winner == player.number:
+                    continue
+                opp_ts = cls._tactical_stats(
+                    game,
+                    game.players[opp_idx],
+                    state_key=_game_key(game),
+                    eval_cap=max(12, eval_cap // 2),
+                    reply_lines=0,
+                    include_reply=False,
+                )
+                best_reply_gain = max(best_reply_gain, opp_ts.max_immediate_gain)
+                game.undo_move()
 
         out = TacticalStats(
             max_immediate_gain=float(max_gain),
@@ -349,6 +357,17 @@ class AIPlayer(Player):
         )
         cls._tactical_cache[cache_key] = out
         return out
+
+    @classmethod
+    def _get_encoded_graph(cls, game: Game):
+        key = _game_key(game)
+        enc = cls._enc_cache.get(key)
+        if enc is None:
+            from gnn.encode import encode_game_to_graph
+
+            enc = encode_game_to_graph(game)
+            cls._enc_cache[key] = enc
+        return enc
 
     @classmethod
     def _closure_area(cls, game: Game, state_key: StateKey, mv: Move) -> int | None:
@@ -498,7 +517,13 @@ class AIPlayer(Player):
     @classmethod
     def search_moves_all(cls, game: Game, player: Player) -> Iterator[Move]:
         """all valid move except rocks that are not search worthy"""
-        for m in game.get_possible_moves(player):
+        state_key = _game_key(game)
+        cache_key = (state_key, player.number)
+        moves = cls._moves_cache.get(cache_key)
+        if moves is None:
+            moves = list(game.get_possible_moves(player))
+            cls._moves_cache[cache_key] = moves
+        for m in moves:
             if m.t == "R" and not cls._rock_is_search_worthy(game, m.c):
                 continue
             yield m
@@ -506,17 +531,31 @@ class AIPlayer(Player):
     @staticmethod
     def search_moves_sticks(game: Game, player: Player) -> Iterator[Move]:
         """all valid stick moves"""
-        for point in game.connected_points:
-            if not player.can_place(point):
+        # Use cached possible moves for this state when available to avoid recomputing
+        state_key = _game_key(game)
+        cache_key = (state_key, player.number)
+        moves = AIPlayer._moves_cache.get(cache_key)
+        if moves is None:
+            # fallback to per-point generation
+            for point in game.connected_points:
+                if not player.can_place(point):
+                    continue
+                if game.coord_in_claimed_region(point.c):
+                    continue
+                for d in point.empty_directions:
+                    if not game.intersects_stick(point.c, d):
+                        end_c = calculate_end(point.c, d)
+                        if game.coord_in_claimed_region(end_c):
+                            continue
+                        yield Move(point.x, point.y, d.name)
+            return
+        # filter cached moves to stick-only
+        for m in moves:
+            if m is PASS:
                 continue
-            if game.coord_in_claimed_region(point.c):
+            if m.t == "R":
                 continue
-            for d in point.empty_directions:
-                if not game.intersects_stick(point.c, d):
-                    end_c = calculate_end(point.c, d)
-                    if game.coord_in_claimed_region(end_c):
-                        continue
-                    yield Move(point.x, point.y, d.name)
+            yield m
 
     @staticmethod
     def _scored_gain_from_area(area: int) -> float:
@@ -551,13 +590,14 @@ class AIPlayer(Player):
 
 class OnePlyGreedyPlayer(AIPlayer):
     def get_move(self, game: Game) -> Move:
-        self._clear_search_caches()
+        self._clear_heuristic_caches()
         moves = sorted(game.get_possible_moves(self), key=move_sort_key)
         best = moves[0]
         best_v = float("-inf")
         for mv in moves:
-            with applied_move(game, self, mv):
-                v = self._eval_game_probability(game, self) + random.uniform(-0.04, 0.04)
+            game.do_move(self, mv)
+            v = self._eval_game_probability(game, self) + random.uniform(-0.04, 0.04)
+            game.undo_move()
             if v > best_v:
                 best_v = v
                 best = mv
@@ -573,7 +613,7 @@ class AlphaBetaPlayer(AIPlayer):
     def get_move(self, game: Game) -> Move:
         if game.num_players != 2:
             raise ValueError("Alpha-beta AI is only implemented for 2 players")
-        self._clear_search_caches()
+        self._clear_heuristic_caches()
         move, _ = self.alpha_beta(game, self.depth, float("-inf"), float("inf"), True)
         return move
 
@@ -586,8 +626,9 @@ class AlphaBetaPlayer(AIPlayer):
         if maximising:
             value = float("-inf")
             for move in self.search_moves_all(game, self):
-                with applied_move(game, self, move):
-                    _, v2 = self.alpha_beta(game, depth - 1, a, b, False)
+                game.do_move(self, move)
+                _, v2 = self.alpha_beta(game, depth - 1, a, b, False)
+                game.undo_move()
                 if move is PASS:
                     # Mildly demote PASS so it's only chosen when it truly out-values other moves.
                     v2 -= self.pass_penalty
@@ -601,8 +642,9 @@ class AlphaBetaPlayer(AIPlayer):
         value = float("inf")
         opp = game.players[1 - self.number]
         for move in self.search_moves_all(game, opp):
-            with applied_move(game, opp, move):
-                _, v2 = self.alpha_beta(game, depth - 1, a, b, True)
+            game.do_move(opp, move)
+            _, v2 = self.alpha_beta(game, depth - 1, a, b, True)
+            game.undo_move()
             if move is PASS:
                 v2 += self.pass_penalty
             if v2 < value:
@@ -637,6 +679,7 @@ class MCTSPlayer(AIPlayer):
         rock_rollout_bonus_connected: float = 1.0,
         rock_rollout_bonus_disconnected: float = 0.02,
         stick_between_opp_rocks_bonus: float = 0.4,
+        check_forced_losses: bool = True,
     ):
         super().__init__(player_number)
         self.use_gnn_eval = use_gnn
@@ -659,6 +702,7 @@ class MCTSPlayer(AIPlayer):
         # Interpreting exploration_weight as the PUCT exploration constant.
         self.c_puct: float = exploration_weight
         self._rng = random.Random(seed)
+        self.check_forced_losses = check_forced_losses
         self.n_rollouts = n_rollouts
         self.max_sim_depth = max_sim_depth
         self.time_limit = time_limit
@@ -696,8 +740,10 @@ class MCTSPlayer(AIPlayer):
         return True
     
     def score_after(self, working_game: Game, p: Player, mv: Move) -> float:
-        with applied_move(working_game, p, mv):
-            return self._eval_game_probability(working_game, p)
+        working_game.do_move(p, mv)
+        score = self._eval_game_probability(working_game, p)
+        working_game.undo_move()
+        return score
 
     def _rollout_pick_move(self, game: Game) -> Move:
         """Pick a rollout move: mostly greedy by heuristic, occasionally random."""
@@ -784,20 +830,25 @@ class MCTSPlayer(AIPlayer):
 
             return False
 
-    def get_move(self, game: Game) -> Move:
-        self._clear_search_caches()
-        self.Ns.clear()
-        self.Nsa.clear()
-        self.Wsa.clear()
-        self.Psa.clear()
-        self._legal_moves.clear()
-        self._expanded_count.clear()
-        self.N_amaf.clear()
-        self.W_amaf.clear()
-        self._root_key = None
+    def get_move(self, game: Game, reuse_tree: bool = False) -> Move:
+        # Clear only the per-search game heuristics cache inherited from AIPlayer
+        self._clear_heuristic_caches()
+        if not reuse_tree:
+            # Fresh search: drop all accumulated tree statistics
+            self.Ns.clear()
+            self.Nsa.clear()
+            self.Wsa.clear()
+            self.Psa.clear()
+            self._legal_moves.clear()
+            self._expanded_count.clear()
+            self.N_amaf.clear()
+            self.W_amaf.clear()
+            self._root_key = None
 
-        working_game = copy.deepcopy(game)
+        working_game = game # could deepcopy, but this is faster
         root_key = _game_key(working_game)
+        # Set the active root for this search. If reusing, this will let the
+        # search use any previously collected statistics keyed by this state.
         self._root_key = root_key
 
         # Tactical fast-path:
@@ -810,22 +861,27 @@ class MCTSPlayer(AIPlayer):
 
         safe_root_moves: list[Move] = []
         for move in root_moves:
-            with applied_move(working_game, player, move):
-                if working_game.winner == self.number:
-                    return move
-                if working_game.winner is None:
-                    safe_root_moves.append(move)
+            working_game.do_move(player, move)
+            if working_game.winner == self.number:
+                working_game.undo_move()
+                return move
+            if working_game.winner is None:
+                safe_root_moves.append(move)
+            working_game.undo_move()
 
 
         # Prefer moves that do NOT allow a forced loss next round.
         allowed_root_moves = safe_root_moves
         start_time = time.perf_counter()
         deadline = start_time + self.time_limit if self.time_limit is not None else None
-        if safe_root_moves:
-            to_check = safe_root_moves[: self.tactical_root_limit]
-            non_forced_loss = [m for m in to_check if not self.allows_forced_loss_next_round(m, working_game, player)]
-            if non_forced_loss:
-                allowed_root_moves = non_forced_loss
+
+        if self.check_forced_losses:
+            if safe_root_moves:
+                to_check = safe_root_moves[: self.tactical_root_limit]
+                non_forced_loss = [m for m in to_check if not self.allows_forced_loss_next_round(m, working_game, player)]
+                if non_forced_loss:
+                    allowed_root_moves = non_forced_loss
+
         rollouts_done = 0
         while True:
             if rollouts_done >= self.n_rollouts:
@@ -867,6 +923,44 @@ class MCTSPlayer(AIPlayer):
 
         return best_move
 
+    def advance_root(self, move: Move, game: Game) -> None:
+        new_key = _game_key(game)
+        self._root_key = new_key
+
+    def prune_tables(self, max_states: int) -> None:
+        """Prune internal transposition tables approximately to `max_states` keys."""
+        if max_states <= 0:
+            return
+        cur = len(self.Ns)
+        if cur <= max_states:
+            return
+
+        # remove lowest-visited states
+        items = sorted(self.Ns.items(), key=lambda kv: kv[1])
+        remove_count = cur - max_states
+        to_remove = {state_key for (state_key, _ns) in items[:remove_count]}
+
+        for state_key in to_remove:
+            self.Ns.pop(state_key, None)
+            self._legal_moves.pop(state_key, None)
+            self._expanded_count.pop(state_key, None)
+
+        for e in list(self.Nsa.keys()):
+            if e[0] in to_remove:
+                self.Nsa.pop(e, None)
+        for e in list(self.Wsa.keys()):
+            if e[0] in to_remove:
+                self.Wsa.pop(e, None)
+        for e in list(self.Psa.keys()):
+            if e[0] in to_remove:
+                self.Psa.pop(e, None)
+        for e in list(self.N_amaf.keys()):
+            if e[0] in to_remove:
+                self.N_amaf.pop(e, None)
+        for e in list(self.W_amaf.keys()):
+            if e[0] in to_remove:
+                self.W_amaf.pop(e, None)
+
     def choose(self, root_key: StateKey, game: Game, allowed_root_moves: list[Move] | None = None) -> Move:
         "Choose the best move from the root using search statistics."
         if root_key[0] is not None:
@@ -887,9 +981,11 @@ class MCTSPlayer(AIPlayer):
         # Take an immediate win if available (even if never visited).
         player = game.players[game.current_player]
         for m in candidates:
-            with applied_move(game, player, m):
-                if game.winner == self.number:
-                    return m
+            game.do_move(player, m)
+            if game.winner == self.number:
+                game.undo_move()
+                return m
+            game.undo_move()
 
         # Robust choice: pick the most visited move (stable tie-break).
         def visits(m: Move) -> int:
@@ -986,14 +1082,37 @@ class MCTSPlayer(AIPlayer):
             if extra_rocks:
                 eval_moves = [*eval_moves, *extra_rocks]
 
+        from gnn.encode import encode_game_to_graph
+        from gnn.model import evaluate_encodings
+        eval_encodings: list = []
+        eval_moves_order: list[Move] = []
         for m in eval_moves:
-            with applied_move(game, player, m):
+            game.do_move(player, m)
+            eval_encodings.append(encode_game_to_graph(game))
+            game.undo_move()
+            eval_moves_order.append(m)
+
+        probs: list[float] = []
+        if eval_encodings:
+            probs = evaluate_encodings(eval_encodings)
+
+        if not eval_encodings or not probs:
+            for m in eval_moves:
+                game.do_move(player, m)
                 p = self._eval_game_probability(game, player)
-            if m.t == "R":
-                p = min(0.999, p + self._rock_bonus_for_cell(game, m.c, self.rock_prior_bonus_connected, self.rock_prior_bonus_disconnected))
-            elif self._stick_between_opp_rocks(game, player, m):
-                p = min(0.999, p + self.stick_between_opp_rocks_bonus)
-            priors.append((m, float(p)))
+                game.undo_move()
+                if m.t == "R":
+                    p = min(0.999, p + self._rock_bonus_for_cell(game, m.c, self.rock_prior_bonus_connected, self.rock_prior_bonus_disconnected))
+                elif self._stick_between_opp_rocks(game, player, m):
+                    p = min(0.999, p + self.stick_between_opp_rocks_bonus)
+                priors.append((m, float(p)))
+        else:
+            for m, p in zip(eval_moves_order, probs):
+                if m.t == "R":
+                    p = min(0.999, p + self._rock_bonus_for_cell(game, m.c, self.rock_prior_bonus_connected, self.rock_prior_bonus_disconnected))
+                elif self._stick_between_opp_rocks(game, player, m):
+                    p = min(0.999, p + self.stick_between_opp_rocks_bonus)
+                priors.append((m, float(p)))
 
         # For non-evaluated moves, assign a small prior so they still become
         # available via progressive widening.
