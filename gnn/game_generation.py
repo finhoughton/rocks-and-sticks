@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import random
 from glob import glob
@@ -12,61 +13,54 @@ from players import Move, Player
 
 def randomize_start(
     game: Game,
-    max_sticks: int = 6,
-    max_rocks: int = 2,
-    rollout_moves: int = 6,
+    max_sticks: int = 5,
+    max_rocks: int = 2, # per player
     move_log: list[Move] | None = None,
 ) -> None:
-    
-    player = game.players[game.current_player]
-    target_sticks = random.randint(1, max_sticks)
-    attempts = 0
+    # not true randomization; biased towards interesting / good for training positions
 
-    while target_sticks > 0 and attempts < 60:
+    player = game.players[game.current_player]
+    weights = [math.exp(-0.33 * ((k - 2.8)) ** 4) for k in range(1, max_sticks + 1)]
+    target_sticks = random.choices(range(1, max_sticks + 1), weights=weights, k=1)[0]
+
+    attempts = 0
+    while target_sticks > 0 and attempts < 20:
         attempts += 1
         moves = [m for m in game.get_possible_moves(player) if m.t in D.__members__]
         if not moves:
             break
         mv = random.choice(moves)
-        before = game.players_scores[player.number]
         game.do_move(player, mv)
-        gained = game.players_scores[player.number] - before
-        if gained == 0 and game.winner is None:
-            target_sticks -= 1
-            if move_log is not None:
-                move_log.append(mv)
-            continue
-        game.undo_move()
-    for _ in range(random.randint(0, max_rocks)):
-        rock_moves = [m for m in game.get_possible_moves(player) if m.t == "R"]
-        if rock_moves and random.random() < 0.7:
-            mv = random.choice(rock_moves)
-            game.do_move(player, mv)
-            if game.winner is not None:
+        failed = False
+        for move in game.get_possible_moves(game.players[game.current_player]):
+            if move.t in D.__members__:
+                game.do_move(game.players[game.current_player], move)
+                if max(game.players_scores) > 0:
+                    failed = True
+                    game.undo_move()
+                    break
                 game.undo_move()
-            else:
-                if move_log is not None:
-                    move_log.append(mv)
-    for _ in range(rollout_moves):
-        mover = game.players[game.current_player]
-        moves = list(game.get_possible_moves(mover))
-        if not moves:
-            break
-        random.shuffle(moves)
-        mv = moves[0]
-        game.do_move(mover, mv)
-        undo_needed = False
-        if game.winner is not None and game.winner != mover.number:
-            undo_needed = True
-        elif game.winner is not None:
-            undo_needed = True
-        if undo_needed:
+        if failed:
             game.undo_move()
-        else:
+            continue
+        target_sticks -= 1
+        if move_log is not None:
+            move_log.append(mv)
+
+    alpha = 0.7
+    r_weights = [math.exp(alpha * k) for k in range(0, max_rocks + 1)]
+    rocks_each = random.choices(range(0, max_rocks + 1), weights=r_weights, k=1)[0]
+    for p in game.players:
+        for _ in range(rocks_each):
+            rock_moves = [m for m in game.get_possible_moves(p) if m.t == "R"]
+            if not rock_moves:
+                break
+            weights = [12.0 if ((node := game.points.get(m.c)) is not None and node.connected) else 1.0 for m in rock_moves]
+            mv = random.choices(rock_moves, weights=weights, k=1)[0]
+            game.do_move(p, mv)
             if move_log is not None:
                 move_log.append(mv)
-        if undo_needed:
-            break
+
     game.current_player = 0
 
 def play_self_play_game(
