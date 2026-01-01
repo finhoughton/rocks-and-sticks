@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, DefaultDict, Iterator, List, cast
 
 from constants import ALPHABETA_DEPTH, HALF_AREA_COUNTS
-from models import PASS, D, Move, MoveKey, calculate_area, calculate_end, move_sort_key
+from models import PASS, D, Move, MoveKey, calculate_area, calculate_end, move_key
 
 if TYPE_CHECKING:
     from game import Game
@@ -49,6 +49,7 @@ def rollback_to(game: Game):
 
 class Player:
     def __init__(self, player_number: int):
+        self.use_gnn_eval = False
         self.number = player_number
 
     @abstractmethod
@@ -97,7 +98,7 @@ class RandomPlayer(Player):
         self._rng = random.Random(seed)
 
     def get_move(self, game: Game) -> Move:
-        moves = sorted((m for m in game.get_possible_moves(self) if m is not PASS), key=move_sort_key)
+        moves = sorted((m for m in game.get_possible_moves(self) if m is not PASS), key=move_key)
         if not moves:
             return PASS
         return self._rng.choice(moves)
@@ -106,7 +107,7 @@ class RockBiasedRandomPlayer(RandomPlayer):
     # Random player with a bias toward rock moves to diversify play
 
     def get_move(self, game: Game) -> Move:
-        moves = sorted((m for m in game.get_possible_moves(self) if m is not PASS), key=move_sort_key)
+        moves = sorted((m for m in game.get_possible_moves(self) if m is not PASS), key=move_key)
         rock_moves = [m for m in moves if m.t == "R"]
         if rock_moves and self._rng.random() < 0.6:
             return self._rng.choice(rock_moves)
@@ -141,7 +142,9 @@ class AIPlayer(Player):
     # cache encoded graphs per state_key to avoid repeated encoding
     _enc_cache: dict[StateKey, EncodedGraph] = {}
 
-    use_gnn_eval: bool = False
+    def __init__(self, player_number: int, use_gnn_eval: bool):
+        super().__init__(player_number)
+        self.use_gnn_eval: bool = use_gnn_eval
 
     @abstractmethod
     def get_move(self, game: Game) -> Move:
@@ -157,33 +160,31 @@ class AIPlayer(Player):
         self._moves_cache.clear()
         self._enc_cache.clear()
 
-    @classmethod
-    def _eval_game_probability(cls, game: Game, perspective_player: Player) -> float:
-        value = cls._evaluate_position(game, perspective_player)
+    def _eval_game_probability(self, game: Game, perspective_player: Player) -> float:
+        value = self._evaluate_position(game, perspective_player)
         if math.isinf(value):
             return 1.0 if value > 0 else 0.0
         return 0.5 + 0.5 * math.tanh(value / 6.0)
 
-    @classmethod
-    def _evaluate_position(cls, game: Game, player: Player) -> float:
+    def _evaluate_position(self, game: Game, player: Player) -> float:
         state_key = _game_key(game)
-        cache_key = (state_key, player.number, cls.use_gnn_eval)
-        cached = cls._eval_cache.get(cache_key)
+        cache_key = (state_key, player.number, self.use_gnn_eval)
+        cached = self._eval_cache.get(cache_key)
         if cached is not None:
             return cached
 
-        if cls.use_gnn_eval:
-            v = cls._evaluate_with_gnn(game, player)
+        if self.use_gnn_eval:
+            v = self._evaluate_with_gnn(game, player)
         else:
-            v = cls._evaluate_position_handcrafted(game, player, state_key)
+            v = self._evaluate_position_handcrafted(game, player, state_key)
 
-        cls._eval_cache[cache_key] = v
+        self._eval_cache[cache_key] = v
         return v
 
-    @classmethod
-    def _evaluate_with_gnn(cls, game: Game, player: Player) -> float:
+    def _evaluate_with_gnn(self, game: Game, player: Player) -> float:
+        assert self.use_gnn_eval
         from gnn.model import evaluate_encoding
-        enc = cls._get_encoded_graph(game)
+        enc = self._get_encoded_graph(game)
         prob = evaluate_encoding(enc)
         if player.number != game.current_player:
             prob = 1.0 - prob
@@ -195,11 +196,10 @@ class AIPlayer(Player):
 
         return 6.0 * math.atanh((prob - 0.5) * 2.0)
 
-    @classmethod
-    def _evaluate_position_handcrafted(cls, game: Game, player: Player, state_key: StateKey | None = None) -> float:
+    def _evaluate_position_handcrafted(self, game: Game, player: Player, state_key: StateKey | None = None) -> float:
         if state_key is None:
             state_key = _game_key(game)
-        cache_key = (state_key, player.number, cls.use_gnn_eval)
+        cache_key = (state_key, player.number, self.use_gnn_eval)
 
         opp_idx = 1 - player.number
 
@@ -208,8 +208,8 @@ class AIPlayer(Player):
         elif game.winner == opp_idx:
             v = float("-inf")
         else:
-            my_ts = cls._tactical_stats(game, player, state_key)
-            opp_ts = cls._tactical_stats(game, game.players[opp_idx], state_key)
+            my_ts = self._tactical_stats(game, player, state_key)
+            opp_ts = self._tactical_stats(game, game.players[opp_idx], state_key)
 
             turn_me = game.current_player == player.number
             (w_me, w_opp) = (1.0, 0.4) if turn_me else (0.4, 1.0)
@@ -229,12 +229,11 @@ class AIPlayer(Player):
                 - 0.1 * float(my_ts.bad_closure_count - opp_ts.bad_closure_count)
             )
 
-        cls._eval_cache[cache_key] = v
+        self._eval_cache[cache_key] = v
         return v
     
-    @classmethod
     def _tactical_stats(
-        cls,
+        self,
         game: Game,
         player: Player,
         state_key: StateKey | None = None,
@@ -247,17 +246,17 @@ class AIPlayer(Player):
             state_key = _game_key(game)
 
         cache_key = (state_key, player.number, include_reply)
-        cached = cls._tactical_cache.get(cache_key)
+        cached = self._tactical_cache.get(cache_key)
         if cached is not None:
             return cached
 
         player = game.players[player.number]
         # Position-level heuristics that do not depend on sampled stick moves.
-        potential_area = cls._calculate_potential_area(game, player, state_key)
-        stick_opportunities = cls._count_stick_opportunities(game, player, state_key)
-        rock_value = cls._estimate_rock_opportunity_value(game, player, state_key)
-        blocking_power = cls._calculate_blocking_opponent(game, player)
-        all_stick_moves = list(cls.search_moves_sticks(game, player))
+        potential_area = self._calculate_potential_area(game, player, state_key)
+        stick_opportunities = self._count_stick_opportunities(game, player, state_key)
+        rock_value = self._estimate_rock_opportunity_value(game, player, state_key)
+        blocking_power = self._calculate_blocking_opponent(game, player)
+        all_stick_moves = list(self.search_moves_sticks(game, player))
         stick_moves_count = len(all_stick_moves)
         if stick_moves_count == 0:
             out = TacticalStats(
@@ -273,7 +272,7 @@ class AIPlayer(Player):
                 rock_value=float(rock_value),
                 blocking_power=float(blocking_power),
             )
-            cls._tactical_cache[cache_key] = out
+            self._tactical_cache[cache_key] = out
             return out
 
         before = game.players_scores[player.number]
@@ -284,11 +283,11 @@ class AIPlayer(Player):
         gains: list[float] = []
 
         cap = min(eval_cap, stick_moves_count)
-        stick_sample = sorted(all_stick_moves, key=move_sort_key)[:cap] # heapq.smallest is slower for small N
+        stick_sample = sorted(all_stick_moves, key=move_key)[:cap] # heapq.smallest is slower for small N
 
         closure_area_by_key: dict[MoveKey, int | None] = {}
         for mv in stick_sample:
-            closure_area_by_key[move_sort_key(mv)] = cls._closure_area(game, state_key, mv)
+            closure_area_by_key[move_key(mv)] = self._closure_area(game, state_key, mv)
 
         for mv in stick_sample:
             game.do_move(player, mv)
@@ -297,6 +296,7 @@ class AIPlayer(Player):
                 scoring_count += 1
                 winning_count += 1
                 gains.append(999.0)
+                game.undo_move()
                 continue
             gain = float(game.players_scores[player.number] - before)
             game.undo_move()
@@ -306,7 +306,7 @@ class AIPlayer(Player):
                     max_gain = gain
                 gains.append(gain)
             else:
-                area = closure_area_by_key.get(move_sort_key(mv))
+                area = closure_area_by_key.get(move_key(mv))
                 if area == 1 and not HALF_AREA_COUNTS:
                     bad_closure_count += 1
 
@@ -318,20 +318,21 @@ class AIPlayer(Player):
             opp_idx = 1 - player.number
 
             def approx_gain(mv: Move) -> float:
-                area = closure_area_by_key.get(move_sort_key(mv))
+                area = closure_area_by_key.get(move_key(mv))
                 if area is None:
                     return 0.0
-                return cls._scored_gain_from_area(area)
+                return self._scored_gain_from_area(area)
 
             ranked = sorted(
                 stick_sample,
-                key=lambda mv: (-approx_gain(mv), move_sort_key(mv)),
+                key=lambda mv: (-approx_gain(mv), move_key(mv)),
             )
             for mv in ranked[:reply_lines]:
                 game.do_move(player, mv)
                 if game.winner == player.number:
+                    game.undo_move()
                     continue
-                opp_ts = cls._tactical_stats(
+                opp_ts = self._tactical_stats(
                     game,
                     game.players[opp_idx],
                     state_key=_game_key(game),
@@ -355,25 +356,23 @@ class AIPlayer(Player):
             rock_value=float(rock_value),
             blocking_power=float(blocking_power),
         )
-        cls._tactical_cache[cache_key] = out
+        self._tactical_cache[cache_key] = out
         return out
 
-    @classmethod
-    def _get_encoded_graph(cls, game: Game):
+    def _get_encoded_graph(self, game: Game):
         key = _game_key(game)
-        enc = cls._enc_cache.get(key)
+        enc = self._enc_cache.get(key)
         if enc is None:
             from gnn.encode import encode_game_to_graph
 
             enc = encode_game_to_graph(game)
-            cls._enc_cache[key] = enc
+            self._enc_cache[key] = enc
         return enc
 
-    @classmethod
-    def _closure_area(cls, game: Game, state_key: StateKey, mv: Move) -> int | None:
-        key = (state_key, move_sort_key(mv))
-        cached = cls._closure_area_cache.get(key)
-        if cached is not None or key in cls._closure_area_cache:
+    def _closure_area(self, game: Game, state_key: StateKey, mv: Move) -> int | None:
+        key = (state_key, move_key(mv))
+        cached = self._closure_area_cache.get(key)
+        if cached is not None or key in self._closure_area_cache:
             return cached
 
         start = game.points.get(mv.c)
@@ -387,23 +386,21 @@ class AIPlayer(Player):
         else:
             area = calculate_area(path)
 
-        cls._closure_area_cache[key] = area
+        self._closure_area_cache[key] = area
         return area
   
-    @classmethod
-    def _estimate_rock_opportunity_value(cls, game: Game, player: Player, state_key: StateKey | None = None, rock_eval_cap: int = 24) -> float:
-        """Value remaining rocks by how impactful the *best* available rock is."""
+    def _estimate_rock_opportunity_value(self, game: Game, player: Player, state_key: StateKey | None = None, rock_eval_cap: int = 24) -> float:
 
         if state_key is None:
             state_key = _game_key(game)
         k = (state_key, player_idx := player.number)
-        cached = cls._rock_value_cache.get(k)
+        cached = self._rock_value_cache.get(k)
         if cached is not None:
             return cached
 
         rocks_remaining = game.num_rocks[player_idx]
         if rocks_remaining <= 0:
-            cls._rock_value_cache[k] = 0.0
+            self._rock_value_cache[k] = 0.0
             return 0.0
 
         me = game.players[player_idx]
@@ -412,11 +409,11 @@ class AIPlayer(Player):
         rock_moves = sorted([
             m
             for m in game.get_possible_moves(me)
-            if m is not PASS and m.t == "R" and cls._rock_is_search_worthy(game, m.c)
-        ], key=move_sort_key)
+            if m is not PASS and m.t == "R" and self._rock_is_search_worthy(game, m.c)
+        ], key=move_key)
 
         if not rock_moves:
-            cls._rock_value_cache[k] = 0.0
+            self._rock_value_cache[k] = 0.0
             return 0.0
 
         def rock_impact(c: tuple[int, int]) -> float:
@@ -432,9 +429,9 @@ class AIPlayer(Player):
                 if game.intersects_stick(p.c, d):
                     continue
                 impact += 1.0
-                area = cls._closure_area(game, state_key, Move(p.x, p.y, d.name))
+                area = self._closure_area(game, state_key, Move(p.x, p.y, d.name))
                 if area is not None:
-                    impact += 0.30 * cls._scored_gain_from_area(area)
+                    impact += 0.30 * self._scored_gain_from_area(area)
             return impact
 
         best_impact = 0.0
@@ -443,15 +440,14 @@ class AIPlayer(Player):
 
         opportunity = min(3.0, best_impact / 4.0)
         value = float(rocks_remaining) * opportunity
-        cls._rock_value_cache[k] = value
+        self._rock_value_cache[k] = value
         return value
-    
-    @classmethod
-    def _calculate_potential_area(cls, game: Game, player: Player, state_key: StateKey | None = None) -> float:
+
+    def _calculate_potential_area(self, game: Game, player: Player, state_key: StateKey | None = None) -> float:
         if state_key is None:
             state_key = _game_key(game)
         k = (state_key, player.number)
-        v = cls._pot_cache.get(k)
+        v = self._pot_cache.get(k)
         if v is not None:
             return v
         potential_area = 0
@@ -465,37 +461,32 @@ class AIPlayer(Player):
                 end = points.get((x + dx, y + dy))
                 if end is not None and player.can_place(end):
                     potential_area += 1
-        cls._pot_cache[k] = float(potential_area)
+        self._pot_cache[k] = float(potential_area)
         return float(potential_area)
     
-    @classmethod
-    def _count_stick_opportunities(cls, game: Game, player: Player, state_key: StateKey | None = None) -> float:
+    def _count_stick_opportunities(self, game: Game, player: Player, state_key: StateKey | None = None) -> float:
         if state_key is None:
             state_key = _game_key(game)
 
         k = (state_key, player.number)
-        v = cls._sticks_opp_cache.get(k)
+        v = self._sticks_opp_cache.get(k)
 
         if v is not None:
             return v
 
-        return float(sum(1 for _ in cls.search_moves_sticks(game, player)))
+        return float(sum(1 for _ in self.search_moves_sticks(game, player)))
     
-    @classmethod
-    def _calculate_blocking_opponent(cls, game: Game, player: Player) -> float:
-        # Measure how many legal stick moves are denied due to `player`'s rocks.
+    def _calculate_blocking_opponent(self, game: Game, player: Player) -> float:
         intersects = game.intersects_stick
         blocked = 0.0
         state_key = _game_key(game)
 
-        # `game.rocks` is small (N_ROCKS), so iterating it is cheap.
         for rock in game.rocks:
             p = game.points.get(rock.c)
             if p is None:
                 continue
             if p.rocked_by is not player:
                 continue
-            # Only connected vertices can be used as stick starts.
             if not p.connected:
                 continue
             if game.coord_in_claimed_region(p.c):
@@ -506,35 +497,32 @@ class AIPlayer(Player):
                     if game.coord_in_claimed_region(end_c):
                         continue
                     blocked += 1.0
-                    area = cls._closure_area(
+                    area = self._closure_area(
                         game, state_key, Move(p.x, p.y, d.name)
                     )
                     if area is not None:
-                        blocked += 0.25 * cls._scored_gain_from_area(area)
+                        blocked += 0.25 * self._scored_gain_from_area(area)
 
         return float(blocked)
 
-    @classmethod
-    def search_moves_all(cls, game: Game, player: Player) -> Iterator[Move]:
-        """all valid move except rocks that are not search worthy"""
+    def search_moves_all(self, game: Game, player: Player) -> Iterator[Move]:
+        # all valid moves except rocks that are not search worthy
         state_key = _game_key(game)
         cache_key = (state_key, player.number)
-        moves = cls._moves_cache.get(cache_key)
+        moves = self._moves_cache.get(cache_key)
         if moves is None:
             moves = list(game.get_possible_moves(player))
-            cls._moves_cache[cache_key] = moves
+            self._moves_cache[cache_key] = moves
         for m in moves:
-            if m.t == "R" and not cls._rock_is_search_worthy(game, m.c):
+            if m.t == "R" and not self._rock_is_search_worthy(game, m.c):
                 continue
             yield m
 
-    @staticmethod
-    def search_moves_sticks(game: Game, player: Player) -> Iterator[Move]:
-        """all valid stick moves"""
+    def search_moves_sticks(self, game: Game, player: Player) -> Iterator[Move]:
         # Use cached possible moves for this state when available to avoid recomputing
         state_key = _game_key(game)
         cache_key = (state_key, player.number)
-        moves = AIPlayer._moves_cache.get(cache_key)
+        moves = self._moves_cache.get(cache_key)
         if moves is None:
             # fallback to per-point generation
             for point in game.connected_points:
@@ -591,7 +579,7 @@ class AIPlayer(Player):
 class OnePlyGreedyPlayer(AIPlayer):
     def get_move(self, game: Game) -> Move:
         self._clear_heuristic_caches()
-        moves = sorted(game.get_possible_moves(self), key=move_sort_key)
+        moves = sorted(game.get_possible_moves(self), key=move_key)
         best = moves[0]
         best_v = float("-inf")
         for mv in moves:
@@ -605,7 +593,7 @@ class OnePlyGreedyPlayer(AIPlayer):
 
 class AlphaBetaPlayer(AIPlayer):
     def __init__(self, player_number: int, depth: int = ALPHABETA_DEPTH, use_gnn: bool = False, pass_penalty: float = 1.2):
-        super().__init__(player_number)
+        super().__init__(player_number, use_gnn)
         self.depth = depth
         self.use_gnn_eval = use_gnn
         self.pass_penalty = pass_penalty
@@ -681,8 +669,7 @@ class MCTSPlayer(AIPlayer):
         stick_between_opp_rocks_bonus: float = 0.4,
         check_forced_losses: bool = True,
     ):
-        super().__init__(player_number)
-        self.use_gnn_eval = use_gnn
+        super().__init__(player_number, use_gnn)
         # Transposition-table MCTS:
         # - Stats are stored per state key, and per (state, move) edge.
         # - This merges equivalent positions reached via different paths.
@@ -761,7 +748,7 @@ class MCTSPlayer(AIPlayer):
             candidates = self._rng.sample(moves, 9)
         else:
             candidates = moves
-        candidates = sorted(candidates, key=move_sort_key)
+        candidates = sorted(candidates, key=move_key)
 
         best_move = candidates[0]
         best_score = float("-inf")
@@ -779,7 +766,7 @@ class MCTSPlayer(AIPlayer):
                 best_move = m
         return best_move
 
-    def allows_forced_loss_next_round(self, my_move: Move, working_game: Game, player: Player) -> bool:
+    def allows_forced_loss_next_round(self, my_move: Move, working_game: Game, player: Player, *, root_key=None) -> bool:
         """True if opponent has a reply such that every response loses (2-ply)."""
 
         # Cache move orderings per (state, player) to avoid recomputing scores
@@ -793,7 +780,7 @@ class MCTSPlayer(AIPlayer):
             scored = move_order_cache.get(cache_key)
             if scored is None:
                 moves = list(self.search_moves_sticks(working_game, p))
-                scored = [(self.score_after(working_game, p, mv), move_sort_key(mv), mv) for mv in moves]
+                scored = [(self.score_after(working_game, p, mv), move_key(mv), mv) for mv in moves]
                 move_order_cache[cache_key] = scored
 
             k = self.tactical_branch_limit
@@ -847,16 +834,11 @@ class MCTSPlayer(AIPlayer):
 
         working_game = game # could deepcopy, but this is faster
         root_key = _game_key(working_game)
-        # Set the active root for this search. If reusing, this will let the
-        # search use any previously collected statistics keyed by this state.
         self._root_key = root_key
 
-        # Tactical fast-path:
-        # - take any immediate winning move
-        # - never play a move that immediately makes the opponent the winner
         player = working_game.players[working_game.current_player]
         root_moves = sorted(
-            self.search_moves_all(working_game, player), key=move_sort_key
+            self.search_moves_all(working_game, player), key=move_key
         )
 
         safe_root_moves: list[Move] = []
@@ -868,7 +850,6 @@ class MCTSPlayer(AIPlayer):
             if working_game.winner is None:
                 safe_root_moves.append(move)
             working_game.undo_move()
-
 
         # Prefer moves that do NOT allow a forced loss next round.
         allowed_root_moves = safe_root_moves
@@ -898,29 +879,28 @@ class MCTSPlayer(AIPlayer):
 
         best_move = self.choose(root_key, working_game, allowed_root_moves=allowed_root_moves)
 
-        # Final tactical safety pass: avoid one-move blunders where our move
-        # immediately hands the opponent the win at end-of-round, or where the
-        # opponent has a forcing line next round.
         def visits(m: Move) -> int:
-            return self.Nsa[(root_key, move_sort_key(m))]
+            return self.Nsa[(root_key, move_key(m))]
 
-        ranked_moves = sorted(allowed_root_moves if allowed_root_moves else root_moves, key=lambda m: (-visits(m), move_sort_key(m)))
+        ranked_moves = sorted(allowed_root_moves if allowed_root_moves else root_moves, key=lambda m: (-visits(m), move_key(m)))
 
         safety_limit = min(len(ranked_moves), max(self.tactical_root_limit, 40))
         for m in ranked_moves[:safety_limit]:
             if deadline is not None and time.perf_counter() >= deadline:
                 break
-            with applied_move(working_game, player, m):
-                if working_game.winner == self.number:
-                    return m
-                if working_game.winner is not None and working_game.winner != self.number:
-                    continue
+            working_game.do_move(player, m)
+            if working_game.winner == self.number:
+                working_game.undo_move()
+                return m
+            if working_game.winner is not None and working_game.winner != self.number:
+                working_game.undo_move()
+                continue
+            working_game.undo_move()
 
-            if self.allows_forced_loss_next_round(m, working_game, player):
+            if self.allows_forced_loss_next_round(m, working_game, player, root_key=root_key):
                 continue
             return m
         
-
         return best_move
 
     def advance_root(self, move: Move, game: Game) -> None:
@@ -989,11 +969,11 @@ class MCTSPlayer(AIPlayer):
 
         # Robust choice: pick the most visited move (stable tie-break).
         def visits(m: Move) -> int:
-            return self.Nsa[(root_key, move_sort_key(m))]
+            return self.Nsa[(root_key, move_key(m))]
 
         max_visits = max((visits(m) for m in candidates), default=0)
         best = [m for m in candidates if visits(m) == max_visits]
-        return min(best, key=move_sort_key)
+        return min(best, key=move_key)
 
     def do_rollout(self, root_key: StateKey, game: Game) -> None:
         "Make the tree one layer better. (Train for one iteration.)"
@@ -1008,7 +988,7 @@ class MCTSPlayer(AIPlayer):
             for state_key, move in path_edges:
                 mover = cast(int, state_key[2])
                 if mover == root_player_idx:
-                    root_played.add(move_sort_key(move))
+                    root_played.add(move_key(move))
             for mover, mk in sim_moves:
                 if mover == root_player_idx:
                     root_played.add(mk)
@@ -1049,7 +1029,7 @@ class MCTSPlayer(AIPlayer):
             path_edges.append((state_key, move))
 
             # Stop after taking a previously-unvisited edge.
-            if self.Nsa[(state_key, move_sort_key(move))] == 0:
+            if self.Nsa[(state_key, move_key(move))] == 0:
                 return path_edges, n_applied
 
             state_key = _game_key(game)
@@ -1063,7 +1043,7 @@ class MCTSPlayer(AIPlayer):
             return
 
         player = game.players[game.current_player]
-        moves = sorted(self.search_moves_all(game, player), key=move_sort_key)
+        moves = sorted(self.search_moves_all(game, player), key=move_key)
 
         # Compute heuristic priors for a capped subset to keep expansion cheap.
         priors: list[tuple[Move, float]] = []
@@ -1114,8 +1094,6 @@ class MCTSPlayer(AIPlayer):
                     p = min(0.999, p + self.stick_between_opp_rocks_bonus)
                 priors.append((m, float(p)))
 
-        # For non-evaluated moves, assign a small prior so they still become
-        # available via progressive widening.
         if len(eval_moves) < len(moves):
             min_p = min((p for _, p in priors), default=0.01)
             floor_p = max(0.005, 0.25 * min_p)
@@ -1127,9 +1105,6 @@ class MCTSPlayer(AIPlayer):
                     p = min(0.999, p + self.stick_between_opp_rocks_bonus)
                 priors.append((m, p))
 
-        # PASS is always legal but is rarely correct; give it a very small
-        # prior so it won't dominate progressive widening/PUCT unless search
-        # evidence makes it clearly best.
         if len(moves) > 1:
             min_p = min((p for _, p in priors), default=0.01)
             pass_p = max(1e-6, 0.05 * min_p)
@@ -1141,11 +1116,9 @@ class MCTSPlayer(AIPlayer):
             priors = [(m, 1.0) for (m, _) in priors]
 
         for m, p in priors:
-            self.Psa[(state_key, move_sort_key(m))] = p / total
+            self.Psa[(state_key, move_key(m))] = p / total
 
-        # Store legal moves in descending prior order (stable tie-break), but
-        # keep PASS last when there are other moves.
-        priors.sort(key=lambda mp: (-mp[1], move_sort_key(mp[0])))
+        priors.sort(key=lambda mp: (-mp[1], move_key(mp[0])))
         if len(priors) > 1:
             non_pass = [mp for mp in priors if mp[0] is not PASS]
             only_pass = [mp for mp in priors if mp[0] is PASS]
@@ -1154,14 +1127,11 @@ class MCTSPlayer(AIPlayer):
         self._expanded_count[state_key] = 0
 
     def _ensure_progressive_widening(self, state_key: StateKey) -> None:
-        # Decide how many moves to consider from this state.
         legal = self._legal_moves.get(state_key)
         if not legal:
             return
         ns = self.Ns[state_key]
         target = int(self.progressive_widening_c * ((ns + 1) ** self.progressive_widening_alpha))
-        # Ensure the root considers multiple moves before it ever seriously
-        # considers passing.
 
         if self._root_key is not None and state_key == self._root_key and len(legal) > 1:
             min_k = 6
@@ -1186,7 +1156,7 @@ class MCTSPlayer(AIPlayer):
         sqrt_ns = math.sqrt(ns + 1e-9)
 
         def score(m: Move) -> float:
-            edge = (state_key, move_sort_key(m))
+            edge = (state_key, move_key(m))
             nsa = self.Nsa[edge]
             if nsa > 0:
                 q_ucb = self.Wsa[edge] / nsa
@@ -1206,7 +1176,7 @@ class MCTSPlayer(AIPlayer):
 
         best_score = max((score(m) for m in expanded), default=float("-inf"))
         best_moves = [m for m in expanded if score(m) == best_score]
-        return min(best_moves, key=move_sort_key)
+        return min(best_moves, key=move_key)
 
     def _simulate(self, game: Game) -> tuple[float, int, list[tuple[int, MoveKey]], int]:
         "Returns (reward, moves_applied, sim_moves, sim_start_player) from current `game` state."
@@ -1225,7 +1195,7 @@ class MCTSPlayer(AIPlayer):
             player = game.players[mover_idx]
             move = self._rollout_pick_move(game)
             game.do_move(player, move)
-            sim_moves.append((mover_idx, move_sort_key(move)))
+            sim_moves.append((mover_idx, move_key(move)))
             n_applied += 1
 
         # Depth limit reached: use a heuristic evaluation as a soft reward.
@@ -1237,7 +1207,7 @@ class MCTSPlayer(AIPlayer):
         "Backpropagate along edges; values are from the current-player perspective at each state."
         for state_key, move in reversed(path_edges):
             self.Ns[state_key] += 1
-            edge = (state_key, move_sort_key(move))
+            edge = (state_key, move_key(move))
             self.Nsa[edge] += 1
             self.Wsa[edge] += reward
             reward = 1.0 - reward
