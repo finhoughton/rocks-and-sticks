@@ -9,7 +9,7 @@ from game import Game
 from gnn.encode import SAMPLE_ENC, encode_game_to_graph
 from gnn.model import load_model
 from players import AlphaBetaPlayer, HumanPlayer, MCTSPlayer, Player
-from rl.main import PPOGNNPolicy, PPOPlayer
+from rl.PPO import PPOGNNPolicy, PPOPlayer
 
 
 def _next_save_path(save_dir: str) -> str:
@@ -50,7 +50,7 @@ def _load_gnn(game: Game, model_path: str, device: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Play Rocks and Sticks")
-    parser.add_argument("--ai", choices=["mcts", "alphabeta", "ppo"], default="mcts")
+    parser.add_argument("--ai", choices=["mcts", "alphabeta", "ppo", "none"], default="none")
     parser.add_argument("--time-limit", type=float, default=2.0, help="MCTS time limit (seconds)")
     parser.add_argument("--model", type=str, default=None, help="path to GNN weights to enable NN eval or PPO model for --ai ppo")
     parser.add_argument("--device", type=str, default="cpu", help="device for GNN (cpu/cuda)")
@@ -62,16 +62,18 @@ if __name__ == "__main__":
         # Load PPOGNNPolicy with correct dimensions
         node_feat_dim = SAMPLE_ENC.data.x.size(1) # type: ignore
         global_feat_dim = SAMPLE_ENC.data.global_feats.size(1)
-        model = PPOGNNPolicy(node_feat_dim=node_feat_dim, global_feat_dim=global_feat_dim, max_action_dim=64)
+        model = PPOGNNPolicy(node_feat_dim=node_feat_dim, global_feat_dim=global_feat_dim)
         state = torch.load(args.model, map_location=args.device)
         model.load_state_dict(state)
         model.eval()
         opponent = PPOPlayer(1, model, device=args.device)
         print(f"Loaded PPO agent from {args.model} on device {args.device}.")
     elif args.ai == "mcts":
-        opponent = MCTSPlayer(1, time_limit=args.time_limit, use_gnn=bool(args.model))
-    else:
+        opponent = MCTSPlayer(1, time_limit=args.time_limit, use_gnn=bool(args.model), check_forced_losses=not bool(args.model))
+    elif args.ai == "alphabeta":
         opponent = AlphaBetaPlayer(1, use_gnn=bool(args.model))
+    else:
+        opponent = HumanPlayer(1)
 
     players: list[Player] = [HumanPlayer(0), opponent]
     game = Game(players=players)

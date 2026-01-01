@@ -87,7 +87,7 @@ PASS = Move(0, 0, "P")
 
 MoveKey = tuple[str, int, int]
 
-def move_sort_key(m: Move) -> MoveKey:
+def move_key(m: Move) -> MoveKey:
     return (m.t, m.c[0], m.c[1])
 
 

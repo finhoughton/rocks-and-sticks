@@ -3,11 +3,11 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.data import Data  # type: ignore
+import torch_geometric.data as Data
 from torch_geometric.nn import GINEConv, global_mean_pool  # type: ignore
 
 from game import Game
-from gnn.encode import encode_game_to_graph
+from gnn.encode import EncodedGraph, encode_game_to_graph
 
 INIT_MEAN = 0.0
 INIT_STD = 0.1
@@ -48,7 +48,7 @@ class GNNEval(nn.Module):
 
         _init_parameters(self)
 
-    def forward(self, data: Data) -> torch.Tensor:
+    def forward(self, data: Data.Data) -> torch.Tensor:
         x, edge_index, edge_attr, batch, g = data.x, data.edge_index, data.edge_attr, data.batch, data.global_feats
         h: torch.Tensor = x # type: ignore
         for i, conv in enumerate(self.convs):
@@ -98,13 +98,25 @@ def load_model(path: str, node_feat_dim: int, global_feat_dim: int, device: str 
 
 
 def evaluate_game(game: Game) -> float:
-    """Return a heuristic score: probability current player eventually wins."""
+    return evaluate_encoding(encode_game_to_graph(game))
+
+def evaluate_encoding(enc: EncodedGraph) -> float:
     if _model is None:
         raise RuntimeError("Model not loaded. Call load_model(...) first.")
-
-    encoded = encode_game_to_graph(game)
-    data = encoded.data.to(_device)
+    data = enc.data.to(_device)
     with torch.no_grad():
         logit = _model(data)
         prob = torch.sigmoid(logit).item()
     return prob
+
+def evaluate_encodings(encs: list[EncodedGraph]) -> list[float]:
+    if _model is None:
+        raise RuntimeError("Model not loaded. Call load_model(...) first.")
+    datas = [e.data for e in encs]
+    if not datas:
+        return []
+    batch = Data.Batch.from_data_list(datas).to(_device) # type: ignore
+    with torch.no_grad():
+        logits = _model(batch)
+        probs = torch.sigmoid(logits).cpu().tolist()
+    return probs

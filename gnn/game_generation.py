@@ -14,13 +14,13 @@ from players import Move, Player
 def randomize_start(
     game: Game,
     max_sticks: int = 5,
-    max_rocks: int = 2, # per player
+    max_rocks: int = 3, # per player
     move_log: list[Move] | None = None,
 ) -> None:
     # not true randomization; biased towards interesting / good for training positions
 
     player = game.players[game.current_player]
-    weights = [math.exp(-0.33 * ((k - 2.8)) ** 4) for k in range(1, max_sticks + 1)]
+    weights = [math.exp(-0.33 * ((k - (max_sticks + 0.5) / 2)) ** 4) for k in range(1, max_sticks + 1)]
     target_sticks = random.choices(range(1, max_sticks + 1), weights=weights, k=1)[0]
 
     attempts = 0
@@ -48,10 +48,10 @@ def randomize_start(
             move_log.append(mv)
 
     alpha = 0.7
-    r_weights = [math.exp(alpha * k) for k in range(0, max_rocks + 1)]
-    rocks_each = random.choices(range(0, max_rocks + 1), weights=r_weights, k=1)[0]
+    r_weights = [math.exp(alpha * k) for k in range(0, max_rocks)]
+    rocks_each = random.choices(range(0, max_rocks), weights=r_weights, k=1)[0]
     for p in game.players:
-        for _ in range(rocks_each):
+        for _ in range(rocks_each + (random.random() > 0.3)):
             rock_moves = [m for m in game.get_possible_moves(p) if m.t == "R"]
             if not rock_moves:
                 break

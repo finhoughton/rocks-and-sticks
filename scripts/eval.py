@@ -12,8 +12,8 @@ import torch.nn as nn
 
 from game import Game
 from gnn.encode import SAMPLE_ENC
-from players import AIPlayer, AlphaBetaPlayer, MCTSPlayer, Player, RandomPlayer
-from rl.main import PPOGNNPolicy, PPOPlayer
+from players import AlphaBetaPlayer, MCTSPlayer, Player, RandomPlayer
+from rl.PPO import PPOGNNPolicy, PPOPlayer
 
 
 @dataclass(frozen=True)
@@ -45,13 +45,12 @@ def _load_gnn(model_path: str, device: str) -> None:
     node_dim = SAMPLE_ENC.data.x.size(1) # type: ignore
     global_dim = SAMPLE_ENC.data.global_feats.size(1)
     load_model(model_path, node_dim, global_dim, device=device)
-    AIPlayer.use_gnn_eval = True
 
 
 def _load_policy(checkpoint: str, device: str) -> PPOGNNPolicy:
     node_dim = SAMPLE_ENC.data.x.size(1)  # type: ignore
     global_dim = SAMPLE_ENC.data.global_feats.size(1)
-    policy = PPOGNNPolicy(node_feat_dim=node_dim, global_feat_dim=global_dim, max_action_dim=64)
+    policy = PPOGNNPolicy(node_feat_dim=node_dim, global_feat_dim=global_dim)
     policy.to(device)
     sd = torch.load(checkpoint, map_location=device)
     try:

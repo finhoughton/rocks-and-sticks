@@ -1,10 +1,7 @@
 import argparse
-import collections
 import logging
 import os
 import random
-import sys
-import traceback
 from typing import Any, Callable, List, Optional, Tuple, cast
 
 import torch
@@ -699,70 +696,55 @@ def population_train(
 
     scores = [0.0 for _ in range(population_size)]
 
-    try:
-        for gen in range(n_generations):
-            # Unfreeze when requested
-            if gnn_frozen and gen == freeze_gnn_generations:
-                log(f"Unfreezing agents' GNNs at generation {gen}")
-                for a in agents:
-                    if a is None:
-                        continue
-                    for p in a.gnn.parameters():
-                        p.requires_grad = True
-                for idx, a in enumerate(agents):
-                    if a is None:
-                        optimizers[idx] = None
-                    else:
-                        optimizers[idx] = torch.optim.Adam(a.parameters(), lr=full_lr)
-                gnn_frozen = False
+    for gen in range(n_generations):
+        # Unfreeze when requested
+        if gnn_frozen and gen == freeze_gnn_generations:
+            log(f"Unfreezing agents' GNNs at generation {gen}")
+            for a in agents:
+                if a is None:
+                    continue
+                for p in a.gnn.parameters():
+                    p.requires_grad = True
+            for idx, a in enumerate(agents):
+                if a is None:
+                    optimizers[idx] = None
+                else:
+                    optimizers[idx] = torch.optim.Adam(a.parameters(), lr=full_lr)
+            gnn_frozen = False
 
-            log(f"=== Generation {gen+1}/{n_generations} ===")
-            losses: list[float] = []
-            for ep in range(episodes_per_generation):
-                idx_a, idx_b = random.sample(range(population_size), 2)
-                loss_a, returns_a = run_episode_and_update(
-                    agents[idx_a], optimizers[idx_a], "A", gen, ep, device, log, max_episode_length
-                    , ppo_epochs=ppo_epochs
-                )
-                losses.append(loss_a)
-                scores[idx_a] += float(returns_a[0].item()) if returns_a.shape[0] > 0 else 0.0
-                loss_b, returns_b = run_episode_and_update(
-                    agents[idx_b], optimizers[idx_b], "B", gen, ep, device, log, max_episode_length
-                    , ppo_epochs=ppo_epochs
-                )
-                losses.append(loss_b)
-                scores[idx_b] += float(returns_b[0].item()) if returns_b.shape[0] > 0 else 0.0
-            avg_loss = sum(losses) / len(losses) if losses else 0.0
-            log(f"[Loss] Average loss after generation {gen+1}: {avg_loss:.4f}")
-
-            if (gen + 1) % eval_interval == 0:
-                evaluate_agents(agents, device, eval_games, gen, log, max_episode_length)
-
-            replace_weakest_and_mutate(
-                agents,
-                optimizers,
-                scores,
-                population_size,
-                log,
-                gen,
-                mutation_noise=mutation_noise,
-                keep_exact_prob=mutation_keep_exact_prob,
+        log(f"=== Generation {gen+1}/{n_generations} ===")
+        losses: list[float] = []
+        for ep in range(episodes_per_generation):
+            idx_a, idx_b = random.sample(range(population_size), 2)
+            loss_a, returns_a = run_episode_and_update(
+                agents[idx_a], optimizers[idx_a], "A", gen, ep, device, log, max_episode_length
+                , ppo_epochs=ppo_epochs
             )
-            scores = [0.0 for _ in range(population_size)]
-    except KeyboardInterrupt:
-        tb_str = "".join(traceback.format_exception(*sys.exc_info()))
-        log(f"[Traceback]\n{tb_str}")
-        try:
-            import gc
+            losses.append(loss_a)
+            scores[idx_a] += float(returns_a[0].item()) if returns_a.shape[0] > 0 else 0.0
+            loss_b, returns_b = run_episode_and_update(
+                agents[idx_b], optimizers[idx_b], "B", gen, ep, device, log, max_episode_length
+                , ppo_epochs=ppo_epochs
+            )
+            losses.append(loss_b)
+            scores[idx_b] += float(returns_b[0].item()) if returns_b.shape[0] > 0 else 0.0
+        avg_loss = sum(losses) / len(losses) if losses else 0.0
+        log(f"[Loss] Average loss after generation {gen+1}: {avg_loss:.4f}")
 
-            counts = collections.Counter(type(o).__name__ for o in gc.get_objects())
-            top_types = counts.most_common(20)
-            log("[GC] Top object types by count:")
-            for name, cnt in top_types:
-                log(f"  {name}: {cnt}")
-        except Exception as e:
-            log(f"Failed to gather GC stats: {e}")
-        return
+        if (gen + 1) % eval_interval == 0:
+            evaluate_agents(agents, device, eval_games, gen, log, max_episode_length)
+
+        replace_weakest_and_mutate(
+            agents,
+            optimizers,
+            scores,
+            population_size,
+            log,
+            gen,
+            mutation_noise=mutation_noise,
+            keep_exact_prob=mutation_keep_exact_prob,
+        )
+        scores = [0.0 for _ in range(population_size)]
 
 
 if __name__ == "__main__":

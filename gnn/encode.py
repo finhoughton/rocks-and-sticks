@@ -61,7 +61,7 @@ def _edge_index_and_attr_from_points(points: Iterable['Node']) -> tuple[torch.Te
 
 def encode_game_to_graph(game: Game) -> EncodedGraph:
     """Encode the visible board graph and global features for the current player."""
-    point_set = set(game.connected_points)
+    point_set = game.connected_points.copy()
     point_set.update(game.rocks)
     nodes = sorted(point_set, key=lambda n: n.c)
     node_feats = [_node_feature(n, game.num_players) for n in nodes]
