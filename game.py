@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import copy
-from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator
 
-from constants import HALF_AREA_COUNTS, MCTS_SEED, N_ROCKS, STARTING_STICK, second
+from constants import HALF_AREA_COUNTS, N_ROCKS, STARTING_STICK, second
 from models import (
     PASS,
     D,
@@ -15,7 +14,7 @@ from models import (
     calculate_area,
     calculate_end,
 )
-from players import HumanPlayer, MCTSPlayer, Player  # type: ignore
+from players import Player  # type: ignore
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
@@ -90,15 +89,12 @@ def _point_in_polygon_strict(point: tuple[int, int], poly: tuple[tuple[int, int]
 
 
 class Game:
-    def __init__(self, players: list[Player] | None = None):
+    def __init__(self, players: list[Player] | None = None) -> None:
         self.turn_number = 0
 
         self.players: list[Player]
 
-        if players is None:
-            self.players = [HumanPlayer(0), MCTSPlayer(1, seed=MCTS_SEED, time_limit=30.0)]
-        else:
-            self.players = players
+        self.players = players if players is not None else [Player(0), Player(1)]
 
         self.players_scores: list[int] = [0 for _ in self.players]
         self.num_rocks: list[int] = [N_ROCKS for _ in self.players]
@@ -145,90 +141,59 @@ class Game:
             if _point_in_polygon_strict(c, r.vertices):
                 return True
         return False
-
-    def _shortest_paths(self, start: Node, end: Node, max_paths: int = 4) -> list[list[Node]]:
-        """Enumerate up to `max_paths` shortest paths from start to end in the current stick graph."""
+    
+    def _all_paths(self, start: Node, end: Node) -> list[list[Node]]:
         if start is end:
             return [[start]]
         if not (start.connected and end.connected):
             return []
 
-        # BFS from `end` to get shortest distances; stop expanding once `start` is reached.
-        dist: dict[Node, int] = {end: 0}
-        dist_start: int | None = None
-        q: deque[Node] = deque([end])
-        while q:
-            cur = q.popleft()
-            cur_dist = dist[cur]
-            if dist_start is not None and cur_dist >= dist_start:
-                break
-            next_dist = cur_dist + 1
-            for nbr in cur.neighbours:
-                if nbr is None or nbr in dist:
-                    continue
-                dist[nbr] = next_dist
-                if nbr is start:
-                    dist_start = next_dist
-                    continue
-                if dist_start is None or next_dist < dist_start:
-                    q.append(nbr)
-        if start not in dist:
-            return []
-
+        MAX_PATHS = 100
         paths: list[list[Node]] = []
         neighbours_cache: dict[Node, tuple[Node, ...]] = {}
-        stack: list[tuple[Node, list[Node], set[Node]]] = [(start, [start], {start})]
 
-        # DFS constrained to distance-descending neighbours to stay on shortest paths.
-        while stack and len(paths) < max_paths:
+        stack: list[tuple[Node, list[Node], set[Node]]] = [(start, [start], {start})]
+        while stack and len(paths) < MAX_PATHS:
             node, path, path_set = stack.pop()
-            node_dist = dist[node]
             ordered = neighbours_cache.get(node)
             if ordered is None:
+                # sort for deterministic ordering
                 ordered = tuple(sorted(node.neighbours_list, key=lambda n: n.c))
                 neighbours_cache[node] = ordered
             for nbr in ordered:
-                if nbr in path_set:
-                    continue
-                if dist.get(nbr) != node_dist - 1:
+                if nbr in path_set: # no repeated nodes in the path
                     continue
                 next_path = path + [nbr]
                 if nbr is end:
                     paths.append(next_path)
-                    if len(paths) >= max_paths:
-                        return paths
+                    if len(paths) >= MAX_PATHS:
+                        break
                 else:
                     stack.append((nbr, next_path, path_set | {nbr}))
-
         return paths
-
+    
     def _best_unclaimed_cycle(self, start: Node, end: Node) -> tuple[int, tuple[tuple[int, int], ...], frozenset[Edge]] | None:
-        """Pick the best (highest area) unclaimed cycle among shortest start->end paths."""
+        all_paths = self._all_paths(start, end)
+        best_area2 = None
+        best_vertices = None
+        best_edge_key = None
 
-        candidates = self._shortest_paths(start, end, max_paths=48)
-        if not candidates:
-            return None
-
-        claimed = self._claimed_edge_keys()
-        best: tuple[int, tuple[tuple[int, int], ...], frozenset[Edge]] | None = None
-
-        for path in candidates:
-            if len(path) < 3:
-                continue
-            vertices = tuple(n.c for n in path)
-            area2 = calculate_area(path)
-            if area2 <= 0:
-                continue
-            if not HALF_AREA_COUNTS and area2 == 1:
-                # This closure doesn't score under current rules; don't claim it.
-                continue
+        for path in all_paths:
+            vertices = tuple(p.c for p in path)
             edge_key = _region_edge_key(vertices)
-            if edge_key in claimed:
+            if edge_key in self._claimed_edge_keys():
                 continue
-            if best is None or area2 > best[0]:
-                best = (area2, vertices, edge_key)
+            area2 = calculate_area(path)
+            if area2 == 0 or (not HALF_AREA_COUNTS and area2 == 1):
+                continue
+            if best_area2 is None or area2 < best_area2:
+                best_area2 = area2
+                best_vertices = vertices
+                best_edge_key = edge_key
 
-        return best
+        if best_area2 is not None and best_vertices is not None and best_edge_key is not None:
+            return (best_area2, best_vertices, best_edge_key)
+        return None
 
     def __deepcopy__(self, memo: dict[int, object]) -> Game:
         # Deepcopy is used by MCTS to create a private working game.
@@ -272,7 +237,7 @@ class Game:
         self._flip_intersects_cache_for_stick(start.c, d)
 
         # If there is already a path between the endpoints, adding this stick closes a cycle.
-        # There can be multiple shortest paths; choose a cycle that is not already claimed.
+        # There can be multiple paths, we take the one with smallest area
         best_cycle = self._best_unclaimed_cycle(start, end)
 
         stick = Stick(start, end, d)
