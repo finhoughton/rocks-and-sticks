@@ -8,6 +8,9 @@ and added fields: move_feat (tensor), y (policy prob), value (scalar).
 from __future__ import annotations
 
 import argparse
+import math
+import os
+import platform
 import random
 from typing import List
 
@@ -74,6 +77,7 @@ def train(dataset_path: str, epochs: int, batch_size: int, lr: float, device: st
     split = max(1, int(len(samples) * 0.95))
     train_s = samples[:split]
     val_s = samples[split:]
+    del samples
 
     sample0 = train_s[0]
     node_feat_dim = sample0.x.size(1)
@@ -81,12 +85,47 @@ def train(dataset_path: str, epochs: int, batch_size: int, lr: float, device: st
     move_feat_dim = sample0.move_feat.view(-1).size(0)
 
     model = PolicyValueNet(node_feat_dim=node_feat_dim, global_feat_dim=global_feat_dim, move_feat_dim=move_feat_dim).to(device_t)
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    policy_crit = nn.BCEWithLogitsLoss()
+
+    # CPU tuning
+    n_cpus = max(1, (os.cpu_count() or 1))
+    torch.set_num_threads(n_cpus)
+    # On macOS the DataLoader multiprocess 'spawn' start method duplicates
+    # large in-memory datasets; force single-process workers there.
+    if platform.system() == "Darwin":
+        dl_num_workers = 0
+    else:
+        dl_num_workers = min(4, n_cpus)
+
+    # AdamW optimizer with decoupled weight decay; exclude biases and norm params
+    decay_params = []
+    no_decay_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        n = name.lower()
+        if n.endswith(".bias") or "norm" in n or "bn" in n:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+    optim_groups = [
+        {"params": decay_params, "weight_decay": 1e-4},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+    opt = torch.optim.AdamW(optim_groups, lr=lr)
     value_crit = nn.MSELoss()
 
-    train_loader = DataLoader(train_s, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_s, batch_size=batch_size, shuffle=False) if val_s else None
+    train_loader = DataLoader(train_s, batch_size=batch_size, shuffle=True, num_workers=dl_num_workers)
+    val_loader = DataLoader(val_s, batch_size=batch_size, shuffle=False, num_workers=dl_num_workers) if val_s else None
+
+    # LR scheduler: linear warmup (3% of steps) then cosine decay
+    total_steps = max(1, int(len(train_loader) * epochs))
+    warmup_steps = int(0.03 * total_steps)
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps and warmup_steps > 0:
+            return float(step) / float(max(1, warmup_steps))
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
     best_val = None
     for epoch in range(epochs):
@@ -95,14 +134,36 @@ def train(dataset_path: str, epochs: int, batch_size: int, lr: float, device: st
         for batch in train_loader:
             batch = batch.to(device_t)
             p_logit, v = model(batch)
-            p_target = batch.y.view(-1)
+            # policy: group by state_id and compute KL divergence between
+            # log-softmax(policy_logits) and target probability vectors
+            state_id = batch.state_id.view(-1)
+            p_targets = batch.y.view(-1)
+            unique_ids = torch.unique(state_id)
+            policy_loss_sum = 0.0
+            for uid in unique_ids:
+                mask = (state_id == uid)
+                logits_group = p_logit[mask]
+                tgt_group = p_targets[mask]
+                # normalize target probs to sum to 1
+                denom = tgt_group.sum()
+                if denom <= 0:
+                    tgt = torch.ones_like(tgt_group, device=device_t) / tgt_group.size(0)
+                else:
+                    tgt = tgt_group / denom
+                logp = F.log_softmax(logits_group, dim=0)
+                # KL divergence (sum over moves); accumulate
+                kl = F.kl_div(logp, tgt, reduction='sum')
+                policy_loss_sum += kl
+            loss_p = policy_loss_sum / max(1, unique_ids.numel())
+
             v_target = batch.value.view(-1)
-            loss_p = policy_crit(p_logit, p_target)
             loss_v = value_crit(torch.sigmoid(v), v_target)
             loss = loss_p + loss_v
             opt.zero_grad()
             loss.backward()
             opt.step()
+            # step LR scheduler per optimization step
+            scheduler.step()
             tot_loss += float(loss.item())
 
         avg_loss = tot_loss / max(1, len(train_loader))
@@ -114,10 +175,25 @@ def train(dataset_path: str, epochs: int, batch_size: int, lr: float, device: st
                 for batch in val_loader:
                     batch = batch.to(device_t)
                     p_logit, v = model(batch)
-                    p_target = batch.y.view(-1)
-                    v_target = batch.value.view(-1)
-                    loss_p = policy_crit(p_logit, p_target)
-                    loss_v = value_crit(torch.sigmoid(v), v_target)
+                    # validation: compute same grouped policy loss
+                    state_id = batch.state_id.view(-1)
+                    p_targets = batch.y.view(-1)
+                    unique_ids = torch.unique(state_id)
+                    policy_loss_sum = 0.0
+                    for uid in unique_ids:
+                        mask = (state_id == uid)
+                        logits_group = p_logit[mask]
+                        tgt_group = p_targets[mask]
+                        denom = tgt_group.sum()
+                        if denom <= 0:
+                            tgt = torch.ones_like(tgt_group, device=device_t) / tgt_group.size(0)
+                        else:
+                            tgt = tgt_group / denom
+                        logp = F.log_softmax(logits_group, dim=0)
+                        kl = F.kl_div(logp, tgt, reduction='sum')
+                        policy_loss_sum += kl
+                    loss_p = policy_loss_sum / max(1, unique_ids.numel())
+                    loss_v = value_crit(torch.sigmoid(v), batch.value.view(-1))
                     v_tot += float((loss_p + loss_v).item())
             val_loss = v_tot / max(1, len(val_loader))
 

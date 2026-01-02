@@ -7,8 +7,8 @@ from typing import Callable, Iterable
 
 from game import Game
 from gnn.encode import EncodedGraph, encode_game_to_graph
-from models import D
-from players import Move, Player
+from models import D, Move
+from players import Player
 
 
 def randomize_start(

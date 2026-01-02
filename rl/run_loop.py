@@ -54,6 +54,7 @@ def main():
     p.add_argument('--out-dir', default='checkpoints')
     p.add_argument('--saved-games-dir', default='rl_self_play/iter_{iter}')
     p.add_argument('--data-dir', default='data')
+    p.add_argument('--no-augment', action='store_true', help='Disable symmetric augmentation during conversion')
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -80,7 +81,7 @@ def main():
         )
 
         dataset_path = data_dir / f'alpha_dataset_iter_{i}.pt'
-        convert_games_to_dataset(str(saved_games_path), str(dataset_path))
+        convert_games_to_dataset(str(saved_games_path), str(dataset_path), augment=not args.no_augment)
 
         policy_ckpt = out_dir / f'gnn_az_iter_{i}.pt'
         train(str(dataset_path), args.epochs, args.batch_size, args.lr, args.device, str(policy_ckpt))

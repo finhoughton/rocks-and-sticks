@@ -65,7 +65,7 @@ def main() -> None:
         "--ab-depth",
         type=int,
         default=2,
-        help="search depth for AlphaBeta when game-type includes AB",
+        help="search depth forAlphaBeta when game-type includes AB",
     )
     mcts_group = parser.add_mutually_exclusive_group()
     mcts_group.add_argument(
@@ -138,7 +138,7 @@ def main() -> None:
     def randomish_factory(idx: int) -> Player:
         seed = seeds[idx % len(seeds)]
         if random.random() < 0.2:
-            return OnePlyGreedyPlayer(idx)
+            return OnePlyGreedyPlayer(idx, False)
         if random.random() < 0.4:
             return RockBiasedRandomPlayer(idx, seed=seed)
         return RandomPlayer(idx, seed=seed)
@@ -152,7 +152,7 @@ def main() -> None:
         return MCTSPlayer(idx, time_limit=time_limit, n_rollouts=n_rollouts if n_rollouts is not None else 1000, max_sim_depth=30, seed=seed, use_gnn=True)
 
     def greedy_factory(idx: int) -> Player:
-        return OnePlyGreedyPlayer(idx)
+        return OnePlyGreedyPlayer(idx, False)
 
     def ab_factory(idx: int) -> Player:
         seed = seeds[idx % len(seeds)]
