@@ -6,7 +6,7 @@ import os
 import torch
 
 from game import Game
-from gnn.encode import SAMPLE_ENC, encode_game_to_graph
+from gnn.encode import SAMPLE_ENC
 from gnn.model import load_model
 from players import AlphaBetaPlayer, HumanPlayer, MCTSPlayer, Player
 from rl.PPO import PPOGNNPolicy, PPOPlayer
@@ -42,16 +42,15 @@ def _save_game(game: Game, opponent: Player, save_dir: str = "saved_games_human"
         json.dump(payload, fh)
     print(f"Saved game to {path}")
 
-def _load_gnn(game: Game, model_path: str, device: str) -> None:
-    enc = encode_game_to_graph(game)
-
-    node_dim, global_dim = enc.data.x.size(1), enc.data.global_feats.size(1) # type: ignore
+def _load_gnn(model_path: str, device: str) -> None:
+    node_dim, global_dim = SAMPLE_ENC.data.x.size(1), SAMPLE_ENC.data.global_feats.size(1) # type: ignore
     load_model(model_path, node_dim, global_dim, device=device)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Play Rocks and Sticks")
     parser.add_argument("--ai", choices=["mcts", "alphabeta", "ppo", "none"], default="none")
-    parser.add_argument("--time-limit", type=float, default=2.0, help="MCTS time limit (seconds)")
+    parser.add_argument("--mcts-time-limit", type=float, default=None, help="time limit (seconds) for MCTS simulations")
+    parser.add_argument("--mcts-rollouts",type=int,default=None,help="number of rollouts for MCTS simulations")
     parser.add_argument("--model", type=str, default=None, help="path to GNN weights to enable NN eval or PPO model for --ai ppo")
     parser.add_argument("--device", type=str, default="cpu", help="device for GNN (cpu/cuda)")
     args = parser.parse_args()
@@ -59,7 +58,6 @@ if __name__ == "__main__":
     if args.ai == "ppo":
         if not args.model:
             raise ValueError("--model (path to PPO model) is required for --ai ppo")
-        # Load PPOGNNPolicy with correct dimensions
         node_feat_dim = SAMPLE_ENC.data.x.size(1) # type: ignore
         global_feat_dim = SAMPLE_ENC.data.global_feats.size(1)
         model = PPOGNNPolicy(node_feat_dim=node_feat_dim, global_feat_dim=global_feat_dim)
@@ -68,8 +66,11 @@ if __name__ == "__main__":
         model.eval()
         opponent = PPOPlayer(1, model, device=args.device)
         print(f"Loaded PPO agent from {args.model} on device {args.device}.")
-    elif args.ai == "mcts":
-        opponent = MCTSPlayer(1, time_limit=args.time_limit, use_gnn=bool(args.model), check_forced_losses=not bool(args.model))
+    elif args.model:
+        print(f"Using GNN evaluator from {args.model} on device {args.device}.")
+        _load_gnn(args.model, args.device)
+    if args.ai == "mcts":
+        opponent = MCTSPlayer(1, time_limit=args.mcts_time_limit, n_rollouts=args.mcts_rollouts, use_gnn=bool(args.model), check_forced_losses=not bool(args.model))
     elif args.ai == "alphabeta":
         opponent = AlphaBetaPlayer(1, use_gnn=bool(args.model))
     else:
@@ -77,10 +78,6 @@ if __name__ == "__main__":
 
     players: list[Player] = [HumanPlayer(0), opponent]
     game = Game(players=players)
-
-    if args.model and args.ai != "ppo":
-        print(f"Using GNN evaluator from {args.model} on device {args.device}.")
-        _load_gnn(game, args.model, args.device)
 
     game.run(display=True)
     _save_game(game, opponent, save_dir="saved_games_human")

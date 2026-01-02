@@ -98,8 +98,7 @@ class Node:
         "c",
         "rocked_by",
         "neighbours",
-        "empty_directions",
-        "neighbour_count",
+        "empty_directions"
     )
 
     def __init__(self, x: int, y: int):
@@ -109,7 +108,6 @@ class Node:
         self.rocked_by: Player | None = None
         self.neighbours: list[Node | None] = [None for _ in D]
         self.empty_directions: set[D] = set(D)
-        self.neighbour_count: int = 0
 
     @property
     def neighbours_list(self) -> Iterable[Node]:
@@ -118,16 +116,18 @@ class Node:
     @property
     def connected(self) -> bool:
         return self.neighbour_count != 0
+    
+    @property
+    def neighbour_count(self) -> int:
+        return 8 - len(self.empty_directions)
 
     def set_neighbour(self, d: D, neighbour: Node) -> None:
         self.neighbours[d.as_int] = neighbour
         self.empty_directions.discard(d)
-        self.neighbour_count += 1
 
     def clear_neighbour(self, d: D) -> None:
         self.neighbours[d.as_int] = None
         self.empty_directions.add(d)
-        self.neighbour_count -= 1
 
     def __hash__(self) -> int:
         return hash(self.c)

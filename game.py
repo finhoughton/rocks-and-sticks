@@ -172,7 +172,7 @@ class Game:
                     stack.append((nbr, next_path, path_set | {nbr}))
         return paths
     
-    def _best_unclaimed_cycle(self, start: Node, end: Node) -> tuple[int, tuple[tuple[int, int], ...], frozenset[Edge]] | None:
+    def _path_of_smallest_area(self, start: Node, end: Node) -> tuple[int, tuple[tuple[int, int], ...], frozenset[Edge]] | None:
         all_paths = self._all_paths(start, end)
         best_area2 = None
         best_vertices = None
@@ -184,7 +184,7 @@ class Game:
             if edge_key in self._claimed_edge_keys():
                 continue
             area2 = calculate_area(path)
-            if area2 == 0 or (not HALF_AREA_COUNTS and area2 == 1):
+            if area2 == 0:
                 continue
             if best_area2 is None or area2 < best_area2:
                 best_area2 = area2
@@ -236,10 +236,6 @@ class Game:
         # Invalidate only the cache entries that would have relied on this stick.
         self._flip_intersects_cache_for_stick(start.c, d)
 
-        # If there is already a path between the endpoints, adding this stick closes a cycle.
-        # There can be multiple paths, we take the one with smallest area
-        best_cycle = self._best_unclaimed_cycle(start, end)
-
         stick = Stick(start, end, d)
 
         stick.start.set_neighbour(d, end)
@@ -251,10 +247,13 @@ class Game:
         self.sticks.append(stick)
         self.stick_endpoints.add(stick.ordered)
 
+        best_cycle = self._path_of_smallest_area(start, end)
         if best_cycle is None:
             return 0
-
         area2, vertices, edge_key = best_cycle
+        if not HALF_AREA_COUNTS and area2 == 1:
+            return 0
+
         if owner is not None:
             xs = [x for (x, _y) in vertices]
             ys = [y for (_x, y) in vertices]

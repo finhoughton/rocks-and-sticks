@@ -7,6 +7,7 @@ test.txt
 **/
 !gnn
 !rl
+!players
 !scripts/eval.py
 !scripts/rewatch.py
 *.png
