@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator, Optional, Protocol
 
 from constants import HALF_AREA_COUNTS, N_ROCKS, STARTING_STICK, second
 from models import (
@@ -88,6 +88,36 @@ def _point_in_polygon_strict(point: tuple[int, int], poly: tuple[tuple[int, int]
     return inside
 
 
+# this is for typing, really, GameTotal is a valid game class used in python to c++ conversion but doesn't work with the type checker directly
+class GameProtocol(Protocol):
+    players: list[Player]
+    current_player: int
+    turn_number: int
+    winner: Optional[int]
+    players_scores: list[int]
+    num_rocks: list[int]
+    num_players: int
+    moves: list
+    sticks: list[Stick]
+    rocks: list[Node]
+    points: dict[tuple[int, int], Node]
+    connected_points: set[Node]
+
+    # all "public" methods (used by external code)
+    def do_move(self, player_number: int, m: Move) -> None: ...
+
+    def undo_move(self) -> None: ...
+
+    def get_possible_moves(self, player_number: int) -> Iterator[Move]: ...
+
+    def set_current_player0(self) -> None: ... # used by randomize_start
+
+    def valid_move(self, m: Move, player_number: int) -> bool: ...
+
+    def wait_for_move_input(self, prompt: str) -> str: ...
+
+    def render(self, block: bool = False, game_index: Optional[int] = None, total_games: Optional[int] = None) -> None: ...
+
 class Game:
     def __init__(self, players: list[Player] | None = None) -> None:
         self.turn_number = 0
@@ -126,6 +156,9 @@ class Game:
         self.add_node_and_neighbours((0, 0))
         if STARTING_STICK:
             self.add_stick(self.points[(0, 0)], D.N, owner=None)
+    
+    def set_current_player0(self) -> None:
+        self.current_player = 0
 
     def _claimed_edge_keys(self) -> set[frozenset[Edge]]:
         return {r.edge_key for r in self.claimed_regions}
@@ -282,7 +315,9 @@ class Game:
         self.stick_endpoints.discard(stick.ordered)
         return stick
 
-    def do_move(self, player: Player, m: Move) -> None:
+    def do_move(self, player_number: int, m: Move) -> None:
+        player_obj = self.players[player_number]
+
         self._history.append(
             (
                 self.turn_number,
@@ -293,21 +328,23 @@ class Game:
                 len(self.claimed_regions),
             )
         )
-
         if m is PASS:
-            self.num_rocks[player.number] = N_ROCKS
+            self.num_rocks[player_number] = N_ROCKS
 
         elif m.t == "R":
+            if not self.valid_move(m, player_number):
+                self._history.pop()
+                raise ValueError(f"Invalid move {m}")
             point = self.get_node(m.c)
-            point.rocked_by = player
+            point.rocked_by = player_obj
             self.rocks.append(point)
-            self.num_rocks[player.number] -= 1
+            self.num_rocks[player_number] -= 1
 
         elif m.t in D.__members__:
-            self.num_rocks[player.number] = N_ROCKS
-            v = self.add_stick(self.points[m.c], D[m.t], owner=player.number)
+            self.num_rocks[player_number] = N_ROCKS
+            v = self.add_stick(self.points[m.c], D[m.t], owner=player_number)
             if v > 0:
-                self.players_scores[player.number] += v
+                self.players_scores[player_number] += v
         else:
             self._history.pop()
             raise ValueError(f"Invalid move {m}")
@@ -390,10 +427,11 @@ class Game:
         else:
             self._intersects_cache.add(key)
 
-    def get_possible_moves(self, player: Player) -> Iterator[Move]:
+    def get_possible_moves(self, player_number: int) -> Iterator[Move]:
         coord_in_region = self.coord_in_claimed_region
         intersects_stick = self.intersects_stick
         end_fn = calculate_end
+        player = self.players[player_number]
 
         for p in list(self.connected_points):
             if not player.can_place(p):
@@ -412,18 +450,24 @@ class Game:
         can_rock = (self.turn_number != 0) and (self.num_rocks[player.number] > 0)
 
         if can_rock:
-            xs = [p.x for p in self.connected_points] + [r.x for r in self.rocks]
-            ys = [p.y for p in self.connected_points] + [r.y for r in self.rocks]
-            minx, maxx = min(xs) - 1, max(xs) + 1
-            miny, maxy = min(ys) - 1, max(ys) + 1
-            for p in list(self.points.values()):
-                if p.rocked_by is None and minx <= p.x <= maxx and miny <= p.y <= maxy:
-                    if coord_in_region(p.c):
-                        continue
-                    yield Move(p.x, p.y, "R")
+            anchors = list(self.connected_points) + list(self.rocks)
+            cand_coords: set[tuple[int, int]] = set()
+            for a in anchors:
+                ax, ay = a.c
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        cand_coords.add((ax + dx, ay + dy))
+            for c in cand_coords:
+                if coord_in_region(c):
+                    continue
+                p = self.points.get(c)
+                if p is not None and p.rocked_by is not None:
+                    continue
+                yield Move(c[0], c[1], "R")
         yield PASS
 
-    def valid_move(self, m: Move, player: Player) -> bool:
+    def valid_move(self, m: Move, player_number: int) -> bool:
+        player = self.players[player_number]
         if m is PASS:
             return True
         t = m.t
@@ -432,19 +476,26 @@ class Game:
             raise ValueError("Invalid move type")
 
         point = self.points.get(c)
-        if point is None:
-            return False
-
         if t == "R":
             if self.turn_number == 0:
                 return False
-            if point.rocked_by is not None:
+            if point is not None and point.rocked_by is not None:
                 return False
-            if self.num_rocks[player.number] <= 0:
+            if self.num_rocks[player_number] <= 0:
                 return False
             if self.coord_in_claimed_region(c):
                 return False
-            return True
+
+            x, y = c
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    point = self.points.get((x + dx, y + dy))
+                    if point is not None and (point.connected or point.rocked_by is not None):
+                        return True
+            return False
+
+        if point is None:
+            return False
 
         if not point.connected:
             return False
@@ -569,34 +620,3 @@ class Game:
             return
         if block:
             plt.show()  # type: ignore
-
-    def run(self, display: bool = True) -> None:
-        import time
-
-        while True:
-            print(f"Turn {self.turn_number}")
-            for player in self.players:
-                if display:
-                    self.render(block=False)
-                t0 = time.perf_counter()
-                m: Move = player.get_move(self)
-                dt = time.perf_counter() - t0
-                # Only print timing for non-human players (bots).
-                if player.__class__.__name__ != "HumanPlayer":
-                    extra = ""
-                    # MCTSPlayer exposes rollout settings; print actual rollouts when present.
-                    rollouts_used = getattr(player, "last_rollouts", None)
-                    sim_depth = getattr(player, "max_sim_depth", None)
-                    if isinstance(rollouts_used, int) and isinstance(sim_depth, int):
-                        extra = f" (rollouts={rollouts_used}, sim_depth={sim_depth})"
-                    print(f"Player {player.number + 1} ({player.__class__.__name__}) move time: {dt:.3f}s{extra}")
-                print(f"Player {player.number + 1} plays {m}")
-                self.do_move(player, m)
-                if display:
-                    self.render(block=False)
-
-            if self.winner is not None:
-                print(f"player {self.winner + 1} wins with area {self.players_scores[self.winner] / 2}")
-                if display:
-                    self.render(block=True)
-                break

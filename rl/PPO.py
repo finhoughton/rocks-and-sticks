@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import argparse
 import logging
 import os
 import random
-from typing import Any, Callable, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, cast
 
 import torch
 import torch.nn as nn
@@ -10,12 +12,14 @@ import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.nn import global_mean_pool
 
+if TYPE_CHECKING:
+    from game import GameProtocol
 from game import Game
 from gnn.encode import SAMPLE_ENC, encode_game_to_graph
 from gnn.game_generation import randomize_start
 from gnn.model import GNNEval
 from models import Move
-from players import Player, RandomPlayer
+from players.base import Player, RandomPlayer
 
 logger = logging.getLogger("rl_population")
 if not logger.handlers:
@@ -37,8 +41,8 @@ class PPOPlayer(Player):
         self.model = model
         self.device = device
 
-    def get_move(self, game: Game) -> Move:
-        legal_moves = list(game.get_possible_moves(self))
+    def get_move(self, game: GameProtocol) -> Move:
+        legal_moves = list(game.get_possible_moves(self.number))
         enc = encode_game_to_graph(game)
         data = enc.data.to(self.device)
         action_idx, _, _ = select_action(self.model, data, legal_moves)
@@ -166,7 +170,7 @@ def run_episode(
         while game.winner is None:
             p = game.players[game.current_player]
             move = p.get_move(game)
-            game.do_move(p, move)
+            game.do_move(p.number, move)
         return [], [], torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.float32), torch.tensor(
             [], dtype=torch.float32), torch.tensor([], dtype=torch.float32), 0
 
@@ -183,14 +187,14 @@ def run_episode(
     done = False
     while not done:
         player = game.players[game.current_player]
-        legal_moves = list(game.get_possible_moves(player))
+        legal_moves = list(game.get_possible_moves(player.number))
         max_legal = max(max_legal, len(legal_moves))
         enc = encode_game_to_graph(game)
         data = enc.data.to(device)
         with torch.no_grad():
             action_idx, log_prob, value = select_action(model, data, legal_moves)
         action = legal_moves[action_idx]
-        game.do_move(player, action)
+        game.do_move(player.number, action)
         # increment move counter and check max length
         if max_episode_length is not None:
             current_moves = len(action_list) + 1
@@ -357,7 +361,7 @@ def evaluate_agents(
             while game.winner is None and (max_episode_length is None or move_count < max_episode_length):
                 p = game.players[game.current_player]
                 move = p.get_move(game)
-                game.do_move(p, move)
+                game.do_move(p.number, move)
                 move_count += 1
             if game.winner == 0:
                 wins += 1
@@ -516,7 +520,7 @@ def population_train(
                         if a is None:
                             continue
                         try:
-                            a.load_state_dict(state_dict)
+                            a.load_state_dict(state_dict) # type: ignore
                             loaded += 1
                         except Exception as e:
                             log(f"Failed to load PPO checkpoint into agent {i}: {e}")
@@ -526,7 +530,7 @@ def population_train(
                     log(f"Loading PPO model weights from {load_model_path} into agent 0")
                     if len(agents) > 0 and agents[0] is not None:
                         try:
-                            agents[0].load_state_dict(state_dict)
+                            agents[0].load_state_dict(state_dict) # type: ignore
                         except Exception as e:
                             log(f"Failed to load PPO checkpoint into agent 0: {e}")
                     else:
@@ -639,7 +643,7 @@ def population_train(
                     steps = 0
                     while game.winner is None and steps < 20:
                         player = game.players[game.current_player]
-                        legal_moves = list(game.get_possible_moves(player))
+                        legal_moves = list(game.get_possible_moves(player.number))
                         if not legal_moves:
                             break
                         enc = encode_game_to_graph(game)
@@ -648,7 +652,7 @@ def population_train(
                         scores = []
                         for mv in legal_moves:
                             try:
-                                game.do_move(player, mv)
+                                game.do_move(player.number, mv)
                                 try:
                                     s = float(evaluate_game(game))
                                 except Exception:

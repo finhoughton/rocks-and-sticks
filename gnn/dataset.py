@@ -32,9 +32,8 @@ def load_balanced_saved_game_samples(
             trajectory: list[EncodedGraph] = []
             for mv_dict in moves_raw:
                 trajectory.append(encode_game_to_graph(game))
-                mover = game.players[game.current_player]
                 mv = Move(int(mv_dict["x"]), int(mv_dict["y"]), str(mv_dict["t"])) if mv_dict["t"] != "P" else PASS
-                game.do_move(mover, mv)
+                game.do_move(game.current_player, mv)
                 if game.winner is not None:
                     break
             n = len(trajectory)

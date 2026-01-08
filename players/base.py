@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from models import Move
 
 if TYPE_CHECKING:
-    from game import Game
+    from game import GameProtocol as Game
     from models import Node
 
 StateKey = tuple[object, ...]
@@ -17,7 +17,7 @@ StateKey = tuple[object, ...]
 def _game_key(game: Game) -> StateKey:
     # Canonical, hashable description of game state for MCTS
     sticks = tuple(sorted(s.ordered for s in game.sticks))
-    rocks = tuple(sorted(r.c for r in game.rocks))
+    rocks = tuple(sorted((r.c, r.rocked_by) for r in game.rocks))
     return (
         game.winner,
         game.turn_number,
@@ -30,8 +30,8 @@ def _game_key(game: Game) -> StateKey:
 
 
 @contextmanager
-def applied_move(game: Game, player: "Player", move: Move):
-    game.do_move(player, move)
+def applied_move(game: Game, player: Player, move: Move):
+    game.do_move(player.number, move)
     yield
     game.undo_move()
 
@@ -50,10 +50,10 @@ class Player:
         self.number = player_number
 
     @abstractmethod
-    def get_move(self, game: "Game") -> Move:
+    def get_move(self, game: Game) -> Move:
         raise NotImplementedError
 
-    def can_place(self, point: "Node") -> bool:
+    def can_place(self, point: Node) -> bool:
         # Identity comparison avoids calling Player.__eq__ in hot paths.
         return point.rocked_by is None or point.rocked_by is self
 
@@ -84,7 +84,7 @@ class HumanPlayer(Player):
 
             m = Move(x, y, t)
 
-            if not game.valid_move(m, self):
+            if not game.valid_move(m, self.number):
                 raise ValueError("Invalid move")
 
         except Exception as e:
@@ -101,7 +101,7 @@ class RandomPlayer(Player):
     def get_move(self, game: Game) -> Move:
         from models import PASS, move_key
 
-        moves = sorted((m for m in game.get_possible_moves(self) if m is not PASS), key=move_key)
+        moves = sorted((m for m in game.get_possible_moves(self.number) if m is not PASS), key=move_key)
         if not moves:
             from models import PASS
 
@@ -115,7 +115,7 @@ class RockBiasedRandomPlayer(RandomPlayer):
     def get_move(self, game: Game) -> Move:
         from models import PASS, move_key
 
-        moves = sorted((m for m in game.get_possible_moves(self) if m is not PASS), key=move_key)
+        moves = sorted((m for m in game.get_possible_moves(self.number) if m is not PASS), key=move_key)
         rock_moves = [m for m in moves if m.t == "R"]
         if rock_moves and self._rng.random() < 0.6:
             return self._rng.choice(rock_moves)

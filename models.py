@@ -68,10 +68,13 @@ class Move:
         self.t = t
 
     def __repr__(self) -> str:
-        return f"Move({self.c[0]}, {self.c[1]}, {self.t})"
+        return f"Move({self.c[0]}, {self.c[1]}, '{self.t}')"
 
     def __bool__(self) -> bool:
         return True
+    
+    def __hash__(self) -> int:
+        return hash((self.c, self.t))
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Move):

@@ -2,13 +2,16 @@ import argparse
 import glob
 import json
 import os
+import time
 
 import torch
 
-from game import Game
+from game import Game, GameProtocol
 from gnn.encode import SAMPLE_ENC
 from gnn.model import load_model
 from players import AlphaBetaPlayer, HumanPlayer, MCTSPlayer, Player
+from players.game_total import GameTotal
+from players.mcts_cpp import MCTSPlayerCPP
 from rl.PPO import PPOGNNPolicy, PPOPlayer
 
 
@@ -26,7 +29,7 @@ def _next_save_path(save_dir: str) -> str:
         start_idx = max(map(_idx, existing)) + 1
     return os.path.join(save_dir, f"game_{start_idx:05d}.json")
 
-def _save_game(game: Game, opponent: Player, save_dir: str = "saved_games_human") -> None:
+def _save_game(game: GameProtocol, opponent: Player, save_dir: str = "saved_games_human") -> None:
     path = _next_save_path(save_dir)
     payload: dict[str, object] = {
         "winner": game.winner,
@@ -48,12 +51,14 @@ def _load_gnn(model_path: str, device: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Play Rocks and Sticks")
-    parser.add_argument("--ai", choices=["mcts", "alphabeta", "ppo", "none"], default="none")
+    parser.add_argument("--ai", choices=["mcts", "alphabeta", "ppo", "mcts-cpp", "none"], default="none")
     parser.add_argument("--mcts-time-limit", type=float, default=None, help="time limit (seconds) for MCTS simulations")
     parser.add_argument("--mcts-rollouts",type=int,default=None,help="number of rollouts for MCTS simulations")
     parser.add_argument("--model", type=str, default=None, help="path to GNN weights to enable NN eval or PPO model for --ai ppo")
     parser.add_argument("--device", type=str, default="cpu", help="device for GNN (cpu/cuda)")
     args = parser.parse_args()
+
+    cpp = args.ai == "mcts-cpp"
 
     if args.ai == "ppo":
         if not args.model:
@@ -69,15 +74,46 @@ if __name__ == "__main__":
     elif args.model:
         print(f"Using GNN evaluator from {args.model} on device {args.device}.")
         _load_gnn(args.model, args.device)
+
     if args.ai == "mcts":
         opponent = MCTSPlayer(1, time_limit=args.mcts_time_limit, n_rollouts=args.mcts_rollouts, use_gnn=bool(args.model), check_forced_losses=not bool(args.model))
     elif args.ai == "alphabeta":
         opponent = AlphaBetaPlayer(1, use_gnn=bool(args.model))
+    elif args.ai == "mcts-cpp":
+        if not args.model:
+            raise ValueError("--model is required for --ai mcts-cpp (GNN evaluation cannot be disabled)")
+        opponent = MCTSPlayerCPP(1, n_rollouts=args.mcts_rollouts)
     else:
         opponent = HumanPlayer(1)
 
     players: list[Player] = [HumanPlayer(0), opponent]
-    game = Game(players=players)
+    game: GameProtocol
+    if cpp:
+        print("Using C++ GameState backend via pybind11.")
+        import mcts_ext
+        game = GameTotal(Game(players=players), mcts_ext.GameState()) # type: ignore
+    else:
+        game = Game(players=players)
 
-    game.run(display=True)
+
+
+    while True:
+        print(f"Turn {game.turn_number}")
+        for player in players:
+            game.render(block=False)
+            t0 = time.perf_counter()
+            m = player.get_move(game)
+            dt = time.perf_counter() - t0
+            # Only print timing for non-human players (bots).
+            if player.__class__.__name__ != "HumanPlayer":
+                print(f"Player {player.number + 1} ({player.__class__.__name__}) move time: {dt:.3f}s")
+            print(f"Player {player.number + 1} plays {m}")
+            game.do_move(player.number, m)
+            game.render(block=False)
+
+        if game.winner is not None:
+            print(f"player {game.winner + 1} wins with area {game.players_scores[game.winner] / 2}")
+            game.render(block=True)
+            break
+
     _save_game(game, opponent, save_dir="saved_games_human")

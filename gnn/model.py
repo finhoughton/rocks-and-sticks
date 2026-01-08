@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,6 +9,9 @@ import torch_geometric.data as Data
 from torch_geometric.nn import GINEConv, global_mean_pool  # type: ignore
 
 from game import Game
+
+if TYPE_CHECKING:
+    from game import GameProtocol as Game
 from gnn.encode import EncodedGraph, encode_game_to_graph
 
 INIT_MEAN = 0.0
@@ -112,7 +117,15 @@ def evaluate_encoding(enc: EncodedGraph) -> float:
 def evaluate_encodings(encs: list[EncodedGraph]) -> list[float]:
     if _model is None:
         raise RuntimeError("Model not loaded. Call load_model(...) first.")
-    datas = [e.data for e in encs]
+    if not encs:
+        return []
+    datas = []
+    for e in encs:
+        try:
+            d = e.data
+        except Exception:
+            d = e
+        datas.append(d)
     if not datas:
         return []
     batch = Data.Batch.from_data_list(datas).to(_device) # type: ignore

@@ -5,7 +5,7 @@ import json
 import os
 import random
 from glob import glob
-from typing import Callable, List
+from typing import Any, Callable, List, cast
 
 from game import Game
 from gnn.encode import SAMPLE_ENC
@@ -53,6 +53,25 @@ def _visits_to_policy(mcts: MCTSPlayer, root_key: StateKey) -> List[dict]:
     return out
 
 
+def _visits_to_policy_cpp(raw: list[dict]) -> list[dict]:
+    """Normalize visit distribution returned by the C++ backend.
+
+    Input entries are dicts: {"x":int,"y":int,"t":str,"visits":int}
+    Output adds "prob".
+    """
+    total = 0
+    for e in raw:
+        total += int(e.get("visits", 0))
+    if total <= 0:
+        n = max(1, len(raw))
+        for e in raw:
+            e["prob"] = 1.0 / n
+    else:
+        for e in raw:
+            e["prob"] = float(int(e.get("visits", 0))) / float(total)
+    return raw
+
+
 def play_self_play_games(
     num_games: int,
     mcts_rollouts: int | None,
@@ -65,6 +84,7 @@ def play_self_play_games(
     max_moves: int = 256,
     seed_base: int | None = None,
     prune_size: int | None = None,
+    backend: str = "python",
 ) -> None:
     save_path_factory = _next_save_path(save_games_dir)
     if seed_base is None:
@@ -75,32 +95,50 @@ def play_self_play_games(
         global_dim = SAMPLE_ENC.data.global_feats.size(1)
         load_model(model_path, node_dim, global_dim, device=device)
         print(f"Loaded GNN eval from {model_path} on {device}")
+    elif backend == "cpp":
+        raise ValueError("--model is required when --backend=cpp (GNN evaluation cannot be disabled)")
 
     for i in range(num_games):
         print(f"Generating game {i+1}/{num_games} (seed={seed_base + i})...")
-        game = Game()
+        if backend == "cpp":
+            import mcts_ext
+
+            from players.game_total import GameTotal
+
+            game = GameTotal(Game(), mcts_ext.GameState())
+        else:
+            game = Game()
         moves_log: list[Move] = []
-        randomize_start(game, move_log=moves_log)
-        mcts_players: dict[int, MCTSPlayer] = {
-            0: MCTSPlayer(0, check_forced_losses=False, use_gnn=bool(model_path), n_rollouts=mcts_rollouts if mcts_rollouts is not None else 1000, time_limit=mcts_time_limit, seed=seed_base + i),
-            1: MCTSPlayer(1, check_forced_losses=False, use_gnn=bool(model_path), n_rollouts=mcts_rollouts if mcts_rollouts is not None else 1000, time_limit=mcts_time_limit, seed=seed_base + i + 1),
-        }
+        randomize_start(cast(Any, game), move_log=moves_log)
+        if backend == "cpp":
+            from players.mcts_cpp import MCTSPlayerCPP
+            mcts_players = {
+                0: MCTSPlayerCPP(0, n_rollouts=mcts_rollouts if mcts_rollouts is not None else 1000, seed=seed_base + i),
+                1: MCTSPlayerCPP(1, n_rollouts=mcts_rollouts if mcts_rollouts is not None else 1000, seed=seed_base + i + 1),
+            }
+        else:
+            mcts_players = {
+                0: MCTSPlayer(0, check_forced_losses=False, use_gnn=bool(model_path), n_rollouts=mcts_rollouts if mcts_rollouts is not None else 1000, time_limit=mcts_time_limit, seed=seed_base + i),
+                1: MCTSPlayer(1, check_forced_losses=False, use_gnn=bool(model_path), n_rollouts=mcts_rollouts if mcts_rollouts is not None else 1000, time_limit=mcts_time_limit, seed=seed_base + i + 1),
+            }
         policy_targets: list[list[dict]] = []
 
         while game.winner is None and len(game.moves) < max_moves:
             player_idx = game.current_player
-            mcts = mcts_players[player_idx]
+            mcts: Any = mcts_players[player_idx]
             key = _game_key(game)
             move = mcts.get_move(game, reuse_tree=True)
             key_after = _game_key(game)
             if key != key_after:
                 raise Exception(f"keys not equal OLD: {key} \n\n NEW: {key_after}")
-            root_key = mcts._root_key
-            policy = _visits_to_policy(mcts, root_key) # type: ignore
+            if backend == "cpp":
+                policy = _visits_to_policy_cpp(mcts.get_root_visit_stats(game))
+            else:
+                policy = _visits_to_policy(mcts, mcts._root_key)
             policy_targets.append(policy)
             moves_log.append(move)
 
-            game.do_move(game.players[game.current_player], move)
+            game.do_move(game.current_player, move)
             for p_mcts in mcts_players.values():
                 p_mcts.advance_root(move, game)
 
@@ -133,6 +171,7 @@ def main() -> None:
     parser.add_argument("--max-moves", type=int, default=256)
     parser.add_argument("--seed-base", type=int, default=None)
     parser.add_argument("--prune-size", type=int, default=None, help="optional max MCTS state table size to prune to (per-player)")
+    parser.add_argument("--backend", type=str, default="python", choices=["python", "cpp"], help="MCTS backend: pure Python or C++ (mcts_ext)")
     args = parser.parse_args()
     play_self_play_games(
         num_games=args.games,
@@ -145,6 +184,7 @@ def main() -> None:
         max_moves=args.max_moves,
         seed_base=args.seed_base,
         prune_size=args.prune_size,
+        backend=args.backend,
     )
 
 

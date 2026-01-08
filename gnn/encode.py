@@ -10,6 +10,7 @@ from game import Game
 from players import RandomPlayer  # type: ignore
 
 if TYPE_CHECKING:
+    from game import GameProtocol
     from models import Node
 
 @dataclass
@@ -59,7 +60,7 @@ def _edge_index_and_attr_from_points(points: Iterable['Node']) -> tuple[torch.Te
     return edge_index, edge_attr
 
 
-def encode_game_to_graph(game: Game) -> EncodedGraph:
+def encode_game_to_graph(game: GameProtocol) -> EncodedGraph:
     """Encode the visible board graph and global features for the current player."""
     point_set = game.connected_points.copy()
     point_set.update(game.rocks)

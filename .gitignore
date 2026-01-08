@@ -10,5 +10,8 @@ test.txt
 !players
 !scripts/eval.py
 !scripts/rewatch.py
+!tests
 *.png
 *.log
+*.so
+gnn_benchmark_output.txt

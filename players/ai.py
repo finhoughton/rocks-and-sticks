@@ -12,7 +12,7 @@ from models import PASS, D, Move, MoveKey, calculate_area, calculate_end, move_k
 from .base import Player, StateKey, _game_key
 
 if TYPE_CHECKING:
-    from game import Game
+    from game import GameProtocol as Game
     from gnn.encode import EncodedGraph
 
 
@@ -193,7 +193,7 @@ class AIPlayer(Player):
             closure_area_by_key[move_key(mv)] = self._closure_area(game, state_key, mv)
 
         for mv in stick_sample:
-            game.do_move(player, mv)
+            game.do_move(player.number, mv)
             if game.winner == player.number:
                 max_gain = max(max_gain, 999.0)
                 scoring_count += 1
@@ -231,7 +231,7 @@ class AIPlayer(Player):
                 key=lambda mv: (-approx_gain(mv), move_key(mv)),
             )
             for mv in ranked[:reply_lines]:
-                game.do_move(player, mv)
+                game.do_move(player.number, mv)
                 if game.winner == player.number:
                     game.undo_move()
                     continue
@@ -311,7 +311,7 @@ class AIPlayer(Player):
 
         rock_moves = sorted([
             m
-            for m in game.get_possible_moves(me)
+            for m in game.get_possible_moves(me.number)
             if m is not PASS and m.t == "R" and self._rock_is_search_worthy(game, m.c)
         ], key=move_key)
 
@@ -414,7 +414,7 @@ class AIPlayer(Player):
         cache_key = (state_key, player.number)
         moves = self._moves_cache.get(cache_key)
         if moves is None:
-            moves = list(game.get_possible_moves(player))
+            moves = list(game.get_possible_moves(player.number))
             self._moves_cache[cache_key] = moves
         for m in moves:
             if m.t == "R" and not self._rock_is_search_worthy(game, m.c):
@@ -482,11 +482,11 @@ class AIPlayer(Player):
 class OnePlyGreedyPlayer(AIPlayer):
     def get_move(self, game: "Game") -> Move:
         self._clear_heuristic_caches()
-        moves = sorted(game.get_possible_moves(self), key=move_key)
+        moves = sorted(game.get_possible_moves(self.number), key=move_key)
         best = moves[0]
         best_v = float("-inf")
         for mv in moves:
-            game.do_move(self, mv)
+            game.do_move(self.number, mv)
             v = self._eval_game_probability(game, self) + random.uniform(-0.04, 0.04)
             game.undo_move()
             if v > best_v:
@@ -518,7 +518,7 @@ class AlphaBetaPlayer(AIPlayer):
         if maximising:
             value = float("-inf")
             for move in self.search_moves_all(game, self):
-                game.do_move(self, move)
+                game.do_move(self.number, move)
                 _, v2 = self.alpha_beta(game, depth - 1, a, b, False)
                 game.undo_move()
                 if move is PASS:
@@ -534,7 +534,7 @@ class AlphaBetaPlayer(AIPlayer):
         value = float("inf")
         opp = game.players[1 - self.number]
         for move in self.search_moves_all(game, opp):
-            game.do_move(opp, move)
+            game.do_move(opp.number, move)
             _, v2 = self.alpha_beta(game, depth - 1, a, b, True)
             game.undo_move()
             if move is PASS:

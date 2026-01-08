@@ -3,7 +3,8 @@ import json
 from typing import List, Optional, Tuple
 
 from game import Game
-from players import PASS, Move, Player, RandomPlayer
+from models import PASS, Move
+from players import Player, RandomPlayer
 
 
 def load_moves_from_json(path: str) -> Tuple[List[Move], Optional[str]]:
@@ -28,9 +29,8 @@ def rewatch_game(path: str, delay: float = 1.0) -> None:
 
     game.render(block=False)
     for i, mv in enumerate(moves):
-        player = game.players[game.current_player]
-        print(f"Move {i+1}: Player {player.number+1} plays {mv}")
-        game.do_move(player, mv)
+        print(f"Move {i+1}: Player {game.current_player+1} plays {mv}")
+        game.do_move(game.current_player, mv)
         game.render(block=False)
         plt.pause(delay)
     print(f"Game over. Winner: {winner}")

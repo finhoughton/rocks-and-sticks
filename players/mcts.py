@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 import time
 from collections import defaultdict
@@ -12,7 +13,7 @@ from .ai import AIPlayer
 from .base import Player, StateKey, _game_key, applied_move, rollback_to
 
 if TYPE_CHECKING:
-    from game import Game
+    from game import GameProtocol as Game
 
 
 # based on https://gist.github.com/qpwo/c538c6f73727e254fdc7fab81024f6e1
@@ -102,7 +103,7 @@ class MCTSPlayer(AIPlayer):
 
         safe_root_moves: list[Move] = []
         for move in root_moves:
-            working_game.do_move(player, move)
+            working_game.do_move(player.number, move)
             if working_game.winner == self.number:
                 working_game.undo_move()
                 return move
@@ -134,7 +135,8 @@ class MCTSPlayer(AIPlayer):
 
         self.last_rollouts = rollouts_done
 
-        print(f"rollouts = {rollouts_done} for player {self.number}. time taken: {time.perf_counter() - start_time:.2f}s")
+        if os.environ.get("PYTEST_CURRENT_TEST") is None:
+            print(f"rollouts = {rollouts_done} for player {self.number}. time taken: {time.perf_counter() - start_time:.2f}s")
 
         best_move = self.choose(root_key, working_game, allowed_root_moves=allowed_root_moves)
 
@@ -147,7 +149,7 @@ class MCTSPlayer(AIPlayer):
         for m in ranked_moves[:safety_limit]:
             if deadline is not None and time.perf_counter() >= deadline:
                 break
-            working_game.do_move(player, m)
+            working_game.do_move(player.number, m)
             if working_game.winner == self.number:
                 working_game.undo_move()
                 return m
@@ -184,7 +186,7 @@ class MCTSPlayer(AIPlayer):
         return True
     
     def score_after(self, working_game: Game, p: Player, mv: Move) -> float:
-        working_game.do_move(p, mv)
+        working_game.do_move(p.number, mv)
         score = self._eval_game_probability(working_game, p)
         working_game.undo_move()
         return score
@@ -332,7 +334,7 @@ class MCTSPlayer(AIPlayer):
         # Take an immediate win if available (even if never visited).
         player = game.players[game.current_player]
         for m in candidates:
-            game.do_move(player, m)
+            game.do_move(player.number, m)
             if game.winner == self.number:
                 game.undo_move()
                 return m
@@ -395,7 +397,7 @@ class MCTSPlayer(AIPlayer):
             move = self._puct_select_move(state_key)
 
             player = game.players[game.current_player]
-            game.do_move(player, move)
+            game.do_move(player.number, move)
             n_applied += 1
             path_edges.append((state_key, move))
 
@@ -437,7 +439,7 @@ class MCTSPlayer(AIPlayer):
         eval_encodings: list = []
         eval_moves_order: list[Move] = []
         for m in eval_moves:
-            game.do_move(player, m)
+            game.do_move(player.number, m)
             eval_encodings.append(encode_game_to_graph(game))
             game.undo_move()
             eval_moves_order.append(m)
@@ -449,7 +451,7 @@ class MCTSPlayer(AIPlayer):
 
         if not eval_encodings or not probs:
             for m in eval_moves:
-                game.do_move(player, m)
+                game.do_move(player.number, m)
                 p = self._eval_game_probability(game, player)
                 game.undo_move()
                 if m.t == "R":
@@ -565,7 +567,7 @@ class MCTSPlayer(AIPlayer):
             mover_idx = game.current_player
             player = game.players[mover_idx]
             move = self._rollout_pick_move(game)
-            game.do_move(player, move)
+            game.do_move(player.number, move)
             sim_moves.append((mover_idx, move_key(move)))
             n_applied += 1
 
