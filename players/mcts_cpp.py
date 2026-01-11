@@ -1,43 +1,21 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from game import GameProtocol
 from players.game_total import GameTotal
 from players.move_utils import to_py_move
 
 try:
-    import mcts_ext
+    import players_ext
 except Exception as e:
-    raise ImportError("mcts_ext extension not available; build with `python setup.py build_ext --inplace`") from e
+    raise ImportError("players_ext extension not available; build with `python setup.py build_ext --inplace`") from e
 
-from models import PASS, move_key
 from models import Move as PyMove
 
 from .ai import AIPlayer
 
-if TYPE_CHECKING:
-    from game import GameProtocol as Game
-
-
-def _py_move_to_cpp(mv: PyMove) -> mcts_ext.Move:
-    cm = mcts_ext.Move()
-    cm.x = int(mv.c[0])
-    cm.y = int(mv.c[1])
-    cm.t = mv.t
-    return cm
-
-
-def _py_game_to_cpp(game: Game) -> mcts_ext.GameState:
-    gs = mcts_ext.GameState()
-    player = 0
-    for mv in game.moves:
-        gs.do_move(_py_move_to_cpp(mv), player)
-        player = (player + 1) % game.num_players
-    return gs
 
 class MCTSPlayerCPP(AIPlayer):
-    # Thin wrapper around the C++ `mcts_ext.MCTSEngine`.
+    # Thin wrapper around the C++ `players_ext.MCTSEngine`.
 
     def __init__(
         self,
@@ -50,7 +28,7 @@ class MCTSPlayerCPP(AIPlayer):
         # GNN evaluation is mandatory for the C++ MCTS backend.
         # Ensure `gnn.model.load_model(...)` has been called before using this.
         super().__init__(player_number, True)
-        self.engine = mcts_ext.MCTSEngine(seed, c_puct)
+        self.engine = players_ext.MCTSEngine(seed, c_puct)
         self.n_rollouts = int(n_rollouts)
 
     @property
@@ -62,14 +40,9 @@ class MCTSPlayerCPP(AIPlayer):
         best_move = self.engine.choose_move(game.cpp, self.n_rollouts)
         py_move = to_py_move(best_move)
 
-        # Safety net: if the C++ backend ever disagrees with Python legality (e.g.
-        # due to subtle claimed-region/intersection differences), fall back to a
-        # deterministic Python-legal move.
-        player = game.py.players[game.py.current_player]
-        if not game.py.valid_move(py_move, player.number):
-            legal_moves = sorted(list(game.py.get_possible_moves(player.number)), key=move_key)
-            non_pass = [m for m in legal_moves if m is not PASS]
-            return non_pass[0] if non_pass else PASS
+        player = game.players[game.current_player]
+        if not game.valid_move(py_move, player.number):
+            raise ValueError(f"C++ MCTSPlayerCPP selected illegal move {py_move} for player {player.number}")
 
         return py_move
 
@@ -79,6 +52,27 @@ class MCTSPlayerCPP(AIPlayer):
 
     def prune_tables(self, max_states: int) -> None:
         self.engine.prune_tables(int(max_states))
+
+    def set_exploration(
+        self,
+        *,
+        dirichlet_alpha: float,
+        dirichlet_epsilon: float,
+        temperature: float,
+        temperature_moves: int,
+    ) -> None:
+        self.engine.set_exploration(
+            float(dirichlet_alpha),
+            float(dirichlet_epsilon),
+            float(temperature),
+            int(temperature_moves),
+        )
+
+    def set_model_checkpoint(self, path: str, device: str = "cpu") -> None:
+        self.engine.set_model_checkpoint(str(path), str(device))
+
+    def reset_search(self) -> None:
+        self.engine.reset_search()
 
     def get_root_visit_stats(self, game: GameProtocol) -> list[dict]:
         assert isinstance(game, GameTotal), "MCTSPlayerCPP requires GameTotal wrapper"

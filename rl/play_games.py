@@ -101,11 +101,11 @@ def play_self_play_games(
     for i in range(num_games):
         print(f"Generating game {i+1}/{num_games} (seed={seed_base + i})...")
         if backend == "cpp":
-            import mcts_ext
+            import players_ext
 
             from players.game_total import GameTotal
 
-            game = GameTotal(Game(), mcts_ext.GameState())
+            game = GameTotal(Game(), players_ext.GameState())
         else:
             game = Game()
         moves_log: list[Move] = []
@@ -116,6 +116,14 @@ def play_self_play_games(
                 0: MCTSPlayerCPP(0, n_rollouts=mcts_rollouts if mcts_rollouts is not None else 1000, seed=seed_base + i),
                 1: MCTSPlayerCPP(1, n_rollouts=mcts_rollouts if mcts_rollouts is not None else 1000, seed=seed_base + i + 1),
             }
+
+            for p in mcts_players.values():
+                p.set_exploration(
+                    dirichlet_alpha=0.3,
+                    dirichlet_epsilon=0.25,
+                    temperature=float(temp),
+                    temperature_moves=20,
+                )
         else:
             mcts_players = {
                 0: MCTSPlayer(0, check_forced_losses=False, use_gnn=bool(model_path), n_rollouts=mcts_rollouts if mcts_rollouts is not None else 1000, time_limit=mcts_time_limit, seed=seed_base + i),
@@ -171,7 +179,7 @@ def main() -> None:
     parser.add_argument("--max-moves", type=int, default=256)
     parser.add_argument("--seed-base", type=int, default=None)
     parser.add_argument("--prune-size", type=int, default=None, help="optional max MCTS state table size to prune to (per-player)")
-    parser.add_argument("--backend", type=str, default="python", choices=["python", "cpp"], help="MCTS backend: pure Python or C++ (mcts_ext)")
+    parser.add_argument("--backend", type=str, default="python", choices=["python", "cpp"], help="MCTS backend: pure Python or C++ (players_ext)")
     args = parser.parse_args()
     play_self_play_games(
         num_games=args.games,

@@ -185,7 +185,6 @@ def train(
     use_amp = bool(amp) and device_t.type in ("cuda", "mps")
     amp_dtype = torch.bfloat16 if device_t.type == "mps" else torch.float16
     amp_ctx = torch.autocast(device_type=device_t.type, dtype=amp_dtype) if use_amp else nullcontext()
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp and device_t.type == "cuda")
 
     if device_t.type == "mps" and mps_cache_ratio is not None:
         try:
@@ -351,13 +350,8 @@ def train(
                     loss = loss_p + loss_v
 
                 opt.zero_grad(set_to_none=True)
-                if scaler.is_enabled():
-                    scaler.scale(loss).backward()
-                    scaler.step(opt)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    opt.step()
+                loss.backward()
+                opt.step()
                 scheduler.step()
                 tot_loss += float(loss.item())
                 n_batches += 1
@@ -383,7 +377,6 @@ def train(
                 if rss_log_interval and rss_log_interval > 0 and n_batches % rss_log_interval == 0:
                     try:
                         ru = resource.getrusage(resource.RUSAGE_SELF)
-                        # macOS returns bytes; Linux returns KB
                         rss_bytes = float(ru.ru_maxrss if os.name == "posix" and hasattr(os, "uname") and os.uname().sysname == "Darwin" else ru.ru_maxrss * 1024.0)
                         rss_mb = rss_bytes / (1024.0 * 1024.0)
                         print(f"[rss] batch={n_batches} rss={rss_mb:.2f}MB (bytes={rss_bytes:.0f})")

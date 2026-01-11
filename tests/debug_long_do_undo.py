@@ -1,12 +1,12 @@
 import random
 
-import mcts_ext
+import players_ext
 
 import game
 
 random.seed(2026)
 py_game = game.Game()
-cpp_state = mcts_ext.GameState()
+cpp_state = players_ext.GameState()
 
 history = []
 
@@ -21,7 +21,7 @@ for i in range(100):
     before_cpp = len(cpp_state.get_possible_moves(py_game.current_player))
 
     py_game.do_move(player.number, move)
-    cm = mcts_ext.Move()
+    cm = players_ext.Move()
     cm.x = move.c[0]
     cm.y = move.c[1]
     map_dir = {

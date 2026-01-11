@@ -26,17 +26,19 @@ else:
 
 ext_modules = [
     Pybind11Extension(
-        "mcts_ext",
-        ["players/mcts_ext.cpp"],
+        "players_ext",
+        ["players/players_ext.cpp"],
         extra_compile_args=extra_compile_args,
         extra_link_args=extra_link_args,
     ),
 ]
 
 setup(
-    name="mcts_ext",
+    name="players_ext",
     version="0.0.0",
     description="Pybind11 scaffold for MCTS engine",
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
 )
+
+# BUILD_PROFILE=release python setup.py build_ext --inplace

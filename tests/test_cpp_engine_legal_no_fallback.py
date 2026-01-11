@@ -1,4 +1,4 @@
-import mcts_ext
+import players_ext
 
 import game
 from gnn.encode import SAMPLE_ENC
@@ -19,13 +19,13 @@ def test_cpp_engine_choose_move_is_python_legal_through_play():
     _load_eval()
 
     py_game = game.Game()
-    cpp_state = mcts_ext.GameState()
+    cpp_state = players_ext.GameState()
     total = GameTotal(py_game, cpp_state)
 
     randomize_start(total, 50, 20)
 
-    e0 = mcts_ext.MCTSEngine(123)
-    e1 = mcts_ext.MCTSEngine(456)
+    e0 = players_ext.MCTSEngine(123)
+    e1 = players_ext.MCTSEngine(456)
 
     # Keep this test unit-speed: low rollouts, bounded moves.
     for _ in range(120):
@@ -52,7 +52,7 @@ def test_cpp_possible_moves_match_python_after_randomize_start():
 
     for _ in range(50):
         py_game = game.Game()
-        cpp_state = mcts_ext.GameState()
+        cpp_state = players_ext.GameState()
         total = GameTotal(py_game, cpp_state)
 
         randomize_start(total, 50, 20)

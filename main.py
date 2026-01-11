@@ -10,6 +10,7 @@ from game import Game, GameProtocol
 from gnn.encode import SAMPLE_ENC
 from gnn.model import load_model
 from players import AlphaBetaPlayer, HumanPlayer, MCTSPlayer, Player
+from players.alphabeta_cpp import AlphaBetaPlayerCPP
 from players.game_total import GameTotal
 from players.mcts_cpp import MCTSPlayerCPP
 from rl.PPO import PPOGNNPolicy, PPOPlayer
@@ -51,14 +52,14 @@ def _load_gnn(model_path: str, device: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Play Rocks and Sticks")
-    parser.add_argument("--ai", choices=["mcts", "alphabeta", "ppo", "mcts-cpp", "none"], default="none")
+    parser.add_argument("--ai", choices=["mcts", "alphabeta", "ppo", "mcts-cpp", "alphabeta-cpp", "none"], default="none")
     parser.add_argument("--mcts-time-limit", type=float, default=None, help="time limit (seconds) for MCTS simulations")
     parser.add_argument("--mcts-rollouts",type=int,default=None,help="number of rollouts for MCTS simulations")
     parser.add_argument("--model", type=str, default=None, help="path to GNN weights to enable NN eval or PPO model for --ai ppo")
-    parser.add_argument("--device", type=str, default="cpu", help="device for GNN (cpu/cuda)")
+    parser.add_argument("--device", type=str, default="cpu", help="device for GNN)")
     args = parser.parse_args()
 
-    cpp = args.ai == "mcts-cpp"
+    cpp = args.ai in {"mcts-cpp", "alphabeta-cpp"}
 
     if args.ai == "ppo":
         if not args.model:
@@ -83,6 +84,10 @@ if __name__ == "__main__":
         if not args.model:
             raise ValueError("--model is required for --ai mcts-cpp (GNN evaluation cannot be disabled)")
         opponent = MCTSPlayerCPP(1, n_rollouts=args.mcts_rollouts)
+    elif args.ai == "alphabeta-cpp":
+        if not args.model:
+            raise ValueError("--model is required for --ai alphabeta-cpp (GNN evaluation cannot be disabled)")
+        opponent = AlphaBetaPlayerCPP(1, depth=3)
     else:
         opponent = HumanPlayer(1)
 
@@ -90,8 +95,8 @@ if __name__ == "__main__":
     game: GameProtocol
     if cpp:
         print("Using C++ GameState backend via pybind11.")
-        import mcts_ext
-        game = GameTotal(Game(players=players), mcts_ext.GameState()) # type: ignore
+        import players_ext
+        game = GameTotal(Game(players=players), players_ext.GameState()) # type: ignore
     else:
         game = Game(players=players)
 

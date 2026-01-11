@@ -174,8 +174,8 @@ public:
             Node *end = get_node({0, 1});
             start->neighbours[d] = end;
             end->neighbours[reverse_dir(d)] = start;
-            start->empty_mask = static_cast<uint8_t>(~(1 << d));
-            end->empty_mask = static_cast<uint8_t>(~(1 << reverse_dir(d)));
+            start->empty_mask &= static_cast<uint8_t>(~(1u << d));
+            end->empty_mask &= static_cast<uint8_t>(~(1u << reverse_dir(d)));
             connected_points_push_unique(start);
             connected_points_push_unique(end);
 
@@ -416,11 +416,8 @@ public:
                 continue;
             for (int d = 0; d < 8; ++d)
             {
-                if (p->neighbours[d])
-                {
-                    p->empty_mask &= static_cast<uint8_t>(~(1 << d));
+                if ((p->empty_mask & static_cast<std::uint8_t>(1u << d)) == 0)
                     continue;
-                }
                 if (intersects_stick(pc, d))
                     continue;
                 Coord endc = calc_end(pc, d);
@@ -941,11 +938,12 @@ public:
                 sticks_hash ^= edge_feat;
             }
 
-            if (start->neighbours[d] == end)
-                start->neighbours[d] = nullptr;
+            // Undo must restore a canonical, symmetric adjacency state.
+            // Using pointer-equality guards here can leave a stale occupied edge
+            // if state ever gets slightly inconsistent during deep rollout/undo cycles.
+            start->neighbours[d] = nullptr;
             int rd = reverse_dir(d);
-            if (end->neighbours[rd] == start)
-                end->neighbours[rd] = nullptr;
+            end->neighbours[rd] = nullptr;
             start->empty_mask |= static_cast<uint8_t>(1 << d);
             end->empty_mask |= static_cast<uint8_t>(1 << rd);
             if (!node_is_connected(start) && !(start->x == 0 && start->y == 0))
@@ -1203,12 +1201,8 @@ private:
                 int iy = p->y - lowy;
                 if (ix < 0 || iy < 0 || (size_t)ix >= width || (size_t)iy >= height)
                     continue;
-                std::uint8_t mask = 0;
-                for (int d = 0; d < 8; ++d)
-                {
-                    if (p->neighbours[d])
-                        mask |= static_cast<std::uint8_t>(1u << d);
-                }
+                // reachable_blocked_grid stores occupied directions (bit=1 means blocked).
+                std::uint8_t mask = static_cast<std::uint8_t>(~p->empty_mask);
                 size_t idx = (size_t)ix + (size_t)iy * width;
                 reachable_blocked_grid[idx] |= mask;
             }
@@ -1643,6 +1637,7 @@ private:
     }
     inline bool node_is_connected(const Node *n) const
     {
+        // empty_mask bit=1 means empty; if all 8 are empty, node is disconnected.
         return n->empty_mask != 0xFF;
     }
 
@@ -1831,22 +1826,31 @@ public:
             }
 
             auto &moves = it_existing->second;
-            // this should be a no-op, but idk weird things happen
-            const bool changed = filter_legal_moves_inplace(moves, g, g.current_player);
-            if (changed)
-            {
-                auto it_ec = expanded_count.find(skey);
-                if (it_ec != expanded_count.end())
-                    it_ec->second = std::min(it_ec->second, (int)moves.size());
-            }
 
+            // The move list is cached by TTKey (transposition table). In practice, we've observed
+            // rare cases where the cached list can become inconsistent with the current state's
+            // legality (e.g. after deep rollout/undo cycles or other subtle state interactions).
+            // If that happens, MCTS can select an illegal move.
+            //
+            // Root-cause: cached move lists must be treated as derived data and validated.
+            // If any cached move is illegal, regenerate the full list from the GameState.
+            bool any_illegal = false;
+            for (const auto &m : moves)
+            {
+                if (!g.is_move_legal(m, g.current_player))
+                {
+                    any_illegal = true;
+                    break;
+                }
+            }
+            if (any_illegal)
+            {
+                log_stage("stage2_regen_moves");
+                moves = g.get_possible_moves_for_player(g.current_player);
+                expanded_count[skey] = 0;
+            }
             if (skey == root_key)
             {
-                if (changed)
-                {
-                    root_priors.clear();
-                }
-
                 if (root_priors.empty())
                 {
                     log_stage("stage3_build_priors");
@@ -1867,9 +1871,36 @@ public:
                                 torch_module = py::module::import("torch");
                                 pyg_data_module = py::module::import("torch_geometric.data");
                                 pyg_data_Data = pyg_data_module.attr("Data");
+                                pyg_data_Batch = pyg_data_module.attr("Batch");
                                 gnn_module = py::module::import("gnn.model");
                                 types_module = py::module::import("types");
                             }
+
+                            auto eval_probs = [&](py::list encs) -> py::list
+                            {
+                                if (!model_override.is_none())
+                                {
+                                    py::list datas;
+                                    for (auto item : encs)
+                                    {
+                                        py::object enc_obj = py::cast<py::object>(item);
+                                        datas.append(enc_obj.attr("data"));
+                                    }
+                                    py::object batch = pyg_data_Batch.attr("from_data_list")(datas);
+                                    if (!model_device.empty())
+                                        batch = batch.attr("to")(py::cast(model_device));
+
+                                    py::object no_grad = torch_module.attr("no_grad")();
+                                    no_grad.attr("__enter__")();
+                                    py::object logits = model_override(batch);
+                                    no_grad.attr("__exit__")(py::none(), py::none(), py::none());
+                                    py::object probs = torch_module.attr("sigmoid")(logits).attr("detach")().attr("cpu")();
+                                    return py::cast<py::list>(probs.attr("tolist")());
+                                }
+
+                                py::object py_probs = gnn_module.attr("evaluate_encodings")(encs);
+                                return py::cast<py::list>(py_probs);
+                            };
 
                             for (const auto &m : moves)
                                 root_priors[mk_of(m)] = 0.0;
@@ -2069,11 +2100,9 @@ public:
                             {
                                 log_stage("stage4_eval_model");
                                 auto model_start = std::chrono::high_resolution_clock::now();
-                                py::object py_probs = gnn_module.attr("evaluate_encodings")(encs);
+                                py::list probs_list = eval_probs(encs);
                                 auto model_end = std::chrono::high_resolution_clock::now();
                                 total_model_time += std::chrono::duration<double>(model_end - model_start).count();
-
-                                py::list probs_list = py::cast<py::list>(py_probs);
                                 for (size_t j = 0; j < valid_indices.size(); ++j)
                                 {
                                     size_t mi = valid_indices[j];
@@ -2090,6 +2119,34 @@ public:
                                 "Ensure a GNN evaluator is loaded in Python (call gnn.model.load_model(...)) before running MCTSPlayerCPP. " +
                                 std::string("Python error: ") + e.what());
                         }
+                    }
+                }
+            }
+
+            // AlphaZero-style root exploration: mix Dirichlet noise into root priors.
+            if (skey == root_key && dirichlet_epsilon > 0.0 && dirichlet_alpha > 0.0 && moves.size() > 1)
+            {
+                std::gamma_distribution<double> gamma(dirichlet_alpha, 1.0);
+                std::vector<double> noise;
+                noise.reserve(moves.size());
+                double sum = 0.0;
+                for (size_t i = 0; i < moves.size(); ++i)
+                {
+                    double v = std::max(0.0, gamma(rng));
+                    noise.push_back(v);
+                    sum += v;
+                }
+                if (sum > 0.0)
+                {
+                    for (size_t i = 0; i < moves.size(); ++i)
+                    {
+                        MoveKey mk = mk_of(moves[i]);
+                        double p = 0.0;
+                        auto itp = root_priors.find(mk);
+                        if (itp != root_priors.end())
+                            p = itp->second;
+                        double n = noise[i] / sum;
+                        root_priors[mk] = (1.0 - dirichlet_epsilon) * p + dirichlet_epsilon * n;
                     }
                 }
             }
@@ -2315,6 +2372,36 @@ public:
             py::list encs;
             encs.append(encode_state(g));
 
+            if (!model_override.is_none())
+            {
+                py::list datas;
+                for (auto item : encs)
+                {
+                    py::object enc_obj = py::cast<py::object>(item);
+                    datas.append(enc_obj.attr("data"));
+                }
+                py::object batch = pyg_data_Batch.attr("from_data_list")(datas);
+                if (!model_device.empty())
+                    batch = batch.attr("to")(py::cast(model_device));
+
+                py::object no_grad = torch_module.attr("no_grad")();
+                no_grad.attr("__enter__")();
+                py::object logits = model_override(batch);
+                no_grad.attr("__exit__")(py::none(), py::none(), py::none());
+                py::object probs = torch_module.attr("sigmoid")(logits).attr("detach")().attr("cpu")();
+                py::list probs_list = py::cast<py::list>(probs.attr("tolist")());
+                if (py::len(probs_list) == 0)
+                    return 0.5;
+                double p = py::cast<double>(probs_list[0]);
+                if (g.current_player != perspective)
+                    p = 1.0 - p;
+                if (p < 1e-6)
+                    p = 1e-6;
+                if (p > 1.0 - 1e-6)
+                    p = 1.0 - 1e-6;
+                return p;
+            }
+
             py::object py_probs = gnn_module.attr("evaluate_encodings")(encs);
             py::list probs_list = py::cast<py::list>(py_probs);
             if (py::len(probs_list) == 0)
@@ -2443,7 +2530,12 @@ public:
 
                 int mover_idx = game.current_player;
                 if (!game.is_move_legal(best_move, game.current_player))
-                    throw std::runtime_error(std::string("Internal error: MCTS selected an illegal move (legal_moves should be filtered). ") + explain_illegal(best_move, game.current_player));
+                {
+                    std::ostringstream dbg;
+                    dbg << "Internal error: MCTS selected an illegal move (legal_moves should be filtered). "
+                        << explain_illegal(best_move, game.current_player);
+                    throw std::runtime_error(dbg.str());
+                }
                 game.do_move(best_move, game.current_player);
                 path.emplace_back(skey, best_move, mover_idx);
 
@@ -2504,7 +2596,7 @@ public:
                     }
                     catch (const std::exception &e)
                     {
-                        fprintf(stderr, "[mcts_ext choose_move] value_exception: %s\n", e.what());
+                        fprintf(stderr, "[players_ext choose_move] value_exception: %s\n", e.what());
                         fflush(stderr);
                         throw;
                     }
@@ -2591,6 +2683,11 @@ public:
             return a.t < b.t; });
 
         int safety_limit = std::min((int)ranked.size(), std::max(tactical_root_limit, 40));
+        std::vector<Move> safe_moves;
+        safe_moves.reserve((size_t)safety_limit);
+        std::vector<double> safe_visits;
+        safe_visits.reserve((size_t)safety_limit);
+
         for (int i = 0; i < safety_limit; ++i)
         {
             Move m = ranked[i];
@@ -2610,7 +2707,25 @@ public:
             game.undo_move();
             if (game.allows_forced_loss_next_round(m, const_cast<GameState &>(game), root_player))
                 continue;
-            return m;
+
+            safe_moves.push_back(m);
+            safe_visits.push_back((double)std::max(0, visits(m)));
+        }
+
+        if (!safe_moves.empty())
+        {
+            const bool explore = (temperature > 0.0 && temperature_moves > 0 && game.turn_number < temperature_moves);
+            if (explore)
+            {
+                double inv_temp = 1.0 / std::max(1e-9, temperature);
+                std::vector<double> weights;
+                weights.reserve(safe_visits.size());
+                for (double v : safe_visits)
+                    weights.push_back(std::pow(std::max(1e-12, v), inv_temp));
+                std::discrete_distribution<size_t> dd(weights.begin(), weights.end());
+                return safe_moves[dd(rng)];
+            }
+            return safe_moves[0];
         }
 
         for (const auto &m : ranked)
@@ -2633,6 +2748,51 @@ public:
     void set_prior_eval_cap(int v) { prior_eval_cap = v; }
     void set_max_sim_depth(int v) { max_sim_depth = v; }
     void clear_root_priors() { root_priors.clear(); }
+
+    void set_exploration(double alpha, double epsilon, double temp, int temp_moves)
+    {
+        dirichlet_alpha = std::max(0.0, alpha);
+        dirichlet_epsilon = std::max(0.0, std::min(1.0, epsilon));
+        temperature = std::max(0.0, temp);
+        temperature_moves = std::max(0, temp_moves);
+    }
+
+    void set_model_checkpoint(const std::string &path, const std::string &device)
+    {
+        py::gil_scoped_acquire gil;
+
+        if (!torch_module)
+        {
+            torch_module = py::module::import("torch");
+            pyg_data_module = py::module::import("torch_geometric.data");
+            pyg_data_Data = pyg_data_module.attr("Data");
+            pyg_data_Batch = pyg_data_module.attr("Batch");
+            gnn_module = py::module::import("gnn.model");
+            types_module = py::module::import("types");
+        }
+
+        py::object sample_enc = py::module::import("gnn.encode").attr("SAMPLE_ENC");
+        int node_dim = sample_enc.attr("data").attr("x").attr("size")(1).cast<int>();
+        int global_dim = sample_enc.attr("data").attr("global_feats").attr("size")(1).cast<int>();
+
+        py::object GNNEval = gnn_module.attr("GNNEval");
+        py::object model = GNNEval("node_feat_dim"_a = node_dim, "global_feat_dim"_a = global_dim);
+        py::object state = torch_module.attr("load")(py::cast(path), "map_location"_a = py::cast(device));
+        model.attr("load_state_dict")(state);
+        model.attr("to")(py::cast(device));
+        model.attr("eval")();
+
+        model_override = model;
+        model_device = device;
+
+        // Search caches are model-dependent.
+        clear_stats();
+    }
+
+    void reset_search()
+    {
+        clear_stats();
+    }
 
     std::uint64_t get_current_root_key() const { return _root_key; }
 
@@ -2770,21 +2930,6 @@ public:
     }
 
 private:
-    static bool filter_legal_moves_inplace(std::vector<Move> &moves, GameState &g, int player)
-    {
-        const size_t before = moves.size();
-        moves.erase(
-            std::remove_if(
-                moves.begin(),
-                moves.end(),
-                [&](const Move &m)
-                {
-                    return !g.is_move_legal(m, player);
-                }),
-            moves.end());
-        return moves.size() != before;
-    }
-
     std::mt19937 rng;
     double c_puct;
     bool verbose = true;
@@ -2810,8 +2955,17 @@ private:
     py::object torch_module;
     py::object pyg_data_module;
     py::object pyg_data_Data;
+    py::object pyg_data_Batch;
     py::object gnn_module;
     py::object types_module;
+
+    py::object model_override = py::none();
+    std::string model_device = "cpu";
+
+    double dirichlet_alpha = 0.0;
+    double dirichlet_epsilon = 0.0;
+    double temperature = 0.0;
+    int temperature_moves = 0;
 
     std::unordered_map<std::uint64_t, py::object> enc_cache;
     static constexpr size_t ENC_CACHE_MAX = 4096;
@@ -2820,7 +2974,924 @@ private:
     double total_model_time = 0.0;
 };
 
-PYBIND11_MODULE(mcts_ext, m)
+class AlphaBetaEngine
+{
+public:
+    AlphaBetaEngine(int seed = 0, double pass_penalty = 1.2)
+        : rng((seed == 0) ? std::mt19937(std::random_device{}()) : std::mt19937((std::uint32_t)seed)), pass_penalty(pass_penalty)
+    {
+    }
+
+    Move choose_move(const GameState &root, int depth = 3, int move_cap = 48)
+    {
+        auto &game = const_cast<GameState &>(root);
+
+        struct RngGuard
+        {
+            GameState &g;
+            std::mt19937 snapshot;
+            explicit RngGuard(GameState &gs) : g(gs), snapshot(gs.rng_snapshot()) {}
+            ~RngGuard() { g.rng_restore(snapshot); }
+        } rng_guard(game);
+
+        if (depth <= 0)
+        {
+            auto moves = game.get_possible_moves_for_player(game.current_player);
+            if (moves.empty())
+                return Move{0, 0, 'P'};
+            return moves[0];
+        }
+
+        root_player = game.current_player;
+        if (last_root_player != -1 && root_player != last_root_player)
+        {
+            // TT / eval caches depend on root_player perspective.
+            tt.clear();
+            eval_cache.clear();
+        }
+        last_root_player = root_player;
+        this->move_cap = std::max(1, move_cap);
+
+        {
+            auto moves = game.get_possible_moves_for_player(game.current_player);
+            order_moves_inplace(moves);
+            for (auto &m : moves)
+            {
+                game.do_move(m, game.current_player);
+                if (game.winner == root_player)
+                {
+                    game.undo_move();
+                    return m;
+                }
+                game.undo_move();
+            }
+        }
+
+        auto moves = game.get_possible_moves_for_player(game.current_player);
+        if (!moves.empty())
+        {
+            moves = filter_search_moves(moves, game, game.current_player);
+        }
+        if (moves.empty())
+            return Move{0, 0, 'P'};
+
+        order_moves_inplace(moves);
+        if ((int)moves.size() > this->move_cap)
+            moves.resize((size_t)this->move_cap);
+
+        Move best_move = moves[0];
+        double best_value = -1e300;
+        double alpha = -1e300;
+        double beta = 1e300;
+
+        for (auto &m : moves)
+        {
+            if (!game.is_move_legal(m, game.current_player))
+                continue;
+            int mover = game.current_player;
+            game.do_move(m, mover);
+            double v = alpha_beta(game, depth - 1, alpha, beta);
+            game.undo_move();
+
+            if (m.t == 'P')
+                v -= pass_penalty;
+
+            if (v > best_value || (v == best_value && move_less(m, best_move)))
+            {
+                best_value = v;
+                best_move = m;
+            }
+            alpha = std::max(alpha, best_value);
+            if (alpha >= beta)
+                break;
+        }
+
+        return best_move;
+    }
+
+    void set_model_checkpoint(const std::string &path, const std::string &device)
+    {
+        py::gil_scoped_acquire gil;
+
+        if (!torch_module)
+        {
+            torch_module = py::module::import("torch");
+            pyg_data_module = py::module::import("torch_geometric.data");
+            pyg_data_Data = pyg_data_module.attr("Data");
+            pyg_data_Batch = pyg_data_module.attr("Batch");
+            gnn_module = py::module::import("gnn.model");
+            types_module = py::module::import("types");
+        }
+
+        py::object sample_enc = py::module::import("gnn.encode").attr("SAMPLE_ENC");
+        int node_dim = sample_enc.attr("data").attr("x").attr("size")(1).cast<int>();
+        int global_dim = sample_enc.attr("data").attr("global_feats").attr("size")(1).cast<int>();
+
+        py::object GNNEval = gnn_module.attr("GNNEval");
+        py::object model = GNNEval("node_feat_dim"_a = node_dim, "global_feat_dim"_a = global_dim);
+        py::object state = torch_module.attr("load")(py::cast(path), "map_location"_a = py::cast(device));
+        model.attr("load_state_dict")(state);
+        model.attr("to")(py::cast(device));
+        model.attr("eval")();
+
+        model_override = model;
+        model_device = device;
+
+        // Caches depend on the model.
+        clear_stats();
+    }
+
+    void clear_stats()
+    {
+        tt.clear();
+        eval_cache.clear();
+        enc_cache.clear();
+        total_encode_time = 0.0;
+        total_model_time = 0.0;
+    }
+
+    py::dict get_profile_stats()
+    {
+        py::dict d;
+        d["total_encode_time"] = total_encode_time;
+        d["total_model_time"] = total_model_time;
+        d["model_calls"] = (int)model_calls;
+        d["model_batch_items"] = (int)model_batch_items;
+        d["tt_entries"] = (int)tt.size();
+        d["eval_cache_entries"] = (int)eval_cache.size();
+        d["enc_cache_entries"] = (int)enc_cache.size();
+        return d;
+    }
+
+private:
+    struct TTEntry
+    {
+        int depth = 0;
+        double value = 0.0;
+        // 0 exact, 1 lower bound, 2 upper bound
+        int flag = 0;
+        Move best{0, 0, 'P'};
+    };
+
+    static inline bool move_less(const Move &a, const Move &b)
+    {
+        if (a.x != b.x)
+            return a.x < b.x;
+        if (a.y != b.y)
+            return a.y < b.y;
+        return a.t < b.t;
+    }
+
+    static inline int move_type_rank(const Move &m)
+    {
+        if (m.t == 'P')
+            return 3;
+        if (m.t == 'R')
+            return 2;
+        return 1;
+    }
+
+    static void order_moves_inplace(std::vector<Move> &moves)
+    {
+        std::sort(moves.begin(), moves.end(), [](const Move &a, const Move &b)
+                  {
+            int ra = move_type_rank(a);
+            int rb = move_type_rank(b);
+            if (ra != rb) return ra < rb;
+            return move_less(a,b); });
+    }
+
+    static bool rock_is_search_worthy(GameState &g, const Move &m)
+    {
+        if (m.t != 'R')
+            return true;
+        auto it = g.points.find(GameState::key_from_coord({m.x, m.y}));
+        if (it != g.points.end())
+        {
+            Node *p = it->second.get();
+            if (p->in_connected_points)
+                return true;
+            for (int d = 0; d < 8; ++d)
+                if (p->neighbours[d])
+                    return true;
+        }
+
+        std::unordered_set<std::uint64_t> rock_coords;
+        rock_coords.reserve(g.rocks.size() * 2 + 8);
+        for (Node *r : g.rocks)
+            rock_coords.insert(GameState::key_from_coord({r->x, r->y}));
+        int adjacent = 0;
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            for (int dy = -1; dy <= 1; ++dy)
+            {
+                if (dx == 0 && dy == 0)
+                    continue;
+                if (rock_coords.find(GameState::key_from_coord({m.x + dx, m.y + dy})) != rock_coords.end())
+                {
+                    adjacent++;
+                    if (adjacent >= 2)
+                        return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    static std::vector<Move> filter_search_moves(const std::vector<Move> &moves, GameState &g, int player)
+    {
+        std::vector<Move> out;
+        out.reserve(moves.size());
+        for (const auto &m : moves)
+        {
+            if (m.t == 'R' && !rock_is_search_worthy(g, m))
+                continue;
+            out.push_back(m);
+        }
+        return out;
+    }
+
+    static inline double clamp_prob(double p)
+    {
+        if (p < 1e-4)
+            p = 1e-4;
+        if (p > 1.0 - 1e-4)
+            p = 1.0 - 1e-4;
+        return p;
+    }
+
+    static inline double prob_to_value(double prob)
+    {
+        // Match players/ai.py::_evaluate_with_gnn scaling.
+        prob = clamp_prob(prob);
+        double logit = std::log(prob / (1.0 - prob));
+        logit /= 2.0;
+        double p2 = 1.0 / (1.0 + std::exp(-logit));
+        double x = (p2 - 0.5) * 2.0;
+        x = std::max(-0.999999, std::min(0.999999, x));
+        return 6.0 * std::atanh(x);
+    }
+
+    void ensure_py_modules()
+    {
+        if (torch_module)
+            return;
+        py::gil_scoped_acquire gil;
+        torch_module = py::module::import("torch");
+        pyg_data_module = py::module::import("torch_geometric.data");
+        pyg_data_Data = pyg_data_module.attr("Data");
+        pyg_data_Batch = pyg_data_module.attr("Batch");
+        gnn_module = py::module::import("gnn.model");
+        types_module = py::module::import("types");
+    }
+
+    py::object encode_state(GameState &g)
+    {
+        ensure_py_modules();
+
+        std::uint64_t enc_key = g.state_key();
+        auto it_cache = enc_cache.find(enc_key);
+        if (it_cache != enc_cache.end())
+            return it_cache->second;
+
+        g.scratch_node_set.clear();
+        if (g.connected_points.size() + g.rocks.size() > 0)
+            g.scratch_node_set.reserve(g.connected_points.size() + g.rocks.size());
+        for (auto *p : g.connected_points)
+            g.scratch_node_set.insert(p);
+        for (auto *p : g.rocks)
+            g.scratch_node_set.insert(p);
+
+        g.scratch_nodes.clear();
+        g.scratch_nodes.reserve(g.scratch_node_set.size());
+        for (auto *p : g.scratch_node_set)
+            g.scratch_nodes.push_back(p);
+        std::sort(g.scratch_nodes.begin(), g.scratch_nodes.end(), [](Node *a, Node *b)
+                  {
+            if (a->x != b->x) return a->x < b->x;
+            return a->y < b->y; });
+
+        g.scratch_idx_map.clear();
+        if (!g.scratch_nodes.empty())
+            g.scratch_idx_map.reserve(g.scratch_nodes.size() * 2);
+        for (size_t i = 0; i < g.scratch_nodes.size(); ++i)
+            g.scratch_idx_map[g.scratch_nodes[i]] = (int)i;
+
+        std::vector<std::vector<double>> node_feats;
+        node_feats.reserve(g.scratch_nodes.size());
+        std::vector<std::array<long long, 2>> coords;
+        coords.reserve(g.scratch_nodes.size());
+        for (auto *n : g.scratch_nodes)
+        {
+            int num_players = GameState::num_players;
+            std::vector<double> owner_one_hot(num_players + 1, 0.0);
+            int owner_idx = (n->rocked_by >= 0) ? (n->rocked_by + 1) : 0;
+            if (owner_idx >= 0 && owner_idx < (int)owner_one_hot.size())
+                owner_one_hot[owner_idx] = 1.0;
+            int neighbour_count = 0;
+            for (int d = 0; d < 8; ++d)
+                if (n->neighbours[d])
+                    neighbour_count++;
+            double deg = (double)neighbour_count / 8.0;
+            double is_leaf = (neighbour_count == 1) ? 1.0 : 0.0;
+            double x = (double)n->x;
+            double y = (double)n->y;
+            double r2 = x * x + y * y;
+            std::vector<double> feats = owner_one_hot;
+            feats.push_back(deg);
+            feats.push_back(is_leaf);
+            feats.push_back(x);
+            feats.push_back(y);
+            feats.push_back(r2);
+            node_feats.push_back(std::move(feats));
+            coords.push_back({n->x, n->y});
+        }
+
+        std::vector<long long> srcs;
+        std::vector<long long> dsts;
+        std::vector<std::vector<double>> edge_attrs;
+        for (size_t i = 0; i < g.scratch_nodes.size(); ++i)
+        {
+            Node *p = g.scratch_nodes[i];
+            for (int d = 0; d < 8; ++d)
+            {
+                Node *q = p->neighbours[d];
+                if (!q)
+                    continue;
+                auto it_idx = g.scratch_idx_map.find(q);
+                if (it_idx == g.scratch_idx_map.end())
+                    continue;
+                int j = it_idx->second;
+                double dx = double(q->x - p->x);
+                double dy = double(q->y - p->y);
+                double is_diag = (std::abs(dx) == 1.0 && std::abs(dy) == 1.0) ? 1.0 : 0.0;
+                double orth = 1.0 - is_diag;
+                srcs.push_back((long long)i);
+                dsts.push_back((long long)j);
+                edge_attrs.push_back({orth, is_diag});
+            }
+        }
+
+        py::gil_scoped_acquire gil;
+        auto enc_start = std::chrono::high_resolution_clock::now();
+
+        py::object x_tensor = torch_module.attr("tensor")(py::cast(node_feats));
+        py::object edge_index;
+        if (!srcs.empty())
+        {
+            std::vector<std::vector<long long>> ei = {srcs, dsts};
+            edge_index = torch_module.attr("tensor")(py::cast(ei));
+        }
+        else
+        {
+            edge_index = torch_module.attr("empty")(py::make_tuple(2, 0));
+        }
+        py::object edge_attr = edge_attrs.empty() ? torch_module.attr("empty")(py::make_tuple(0, 2)) : torch_module.attr("tensor")(py::cast(edge_attrs));
+        py::object batch = torch_module.attr("zeros")(py::make_tuple((py::int_)g.scratch_nodes.size())).attr("to")(torch_module.attr("long"));
+
+        double turn = (double)g.turn_number;
+        std::vector<double> cur_one_hot(GameState::num_players, 0.0);
+        if (g.current_player >= 0 && g.current_player < GameState::num_players)
+            cur_one_hot[g.current_player] = 1.0;
+        std::vector<double> scores;
+        for (auto s : g.players_scores)
+            scores.push_back((double)s);
+        std::vector<double> rocks_left;
+        for (auto r : g.num_rocks)
+            rocks_left.push_back((double)r);
+        std::vector<double> rocks_placed(GameState::num_players, 0.0);
+        for (auto *n : g.scratch_nodes)
+            if (n->rocked_by != -1)
+                rocks_placed[n->rocked_by] += 1.0;
+        double max_r2 = 0.0;
+        for (auto &pr : coords)
+        {
+            double r2 = double(pr[0] * pr[0] + pr[1] * pr[1]);
+            if (r2 > max_r2)
+                max_r2 = r2;
+        }
+        std::vector<double> global_feats;
+        global_feats.push_back(turn);
+        for (double v : cur_one_hot)
+            global_feats.push_back(v);
+        for (double v : scores)
+            global_feats.push_back(v);
+        for (double v : rocks_left)
+            global_feats.push_back(v);
+        for (double v : rocks_placed)
+            global_feats.push_back(v);
+        global_feats.push_back(max_r2);
+        py::object global_tensor = torch_module.attr("tensor")(py::cast(global_feats)).attr("unsqueeze")(0);
+
+        py::object data = pyg_data_Data("x"_a = x_tensor, "edge_index"_a = edge_index, "edge_attr"_a = edge_attr, "batch"_a = batch, "global_feats"_a = global_tensor);
+        data.attr("node_coords") = torch_module.attr("tensor")(py::cast(coords));
+        py::object enc_obj = types_module.attr("SimpleNamespace")("data"_a = data);
+
+        auto enc_end = std::chrono::high_resolution_clock::now();
+        total_encode_time += std::chrono::duration<double>(enc_end - enc_start).count();
+
+        if (enc_cache.size() > ENC_CACHE_MAX)
+            enc_cache.clear();
+        enc_cache[enc_key] = enc_obj;
+        return enc_obj;
+    }
+
+    double gnn_prob_root(GameState &g)
+    {
+        // Returns P(root_player wins) from current state.
+        if (g.winner != -1)
+            return (g.winner == root_player) ? 1.0 : 0.0;
+        if (g.connected_points.empty() && g.rocks.empty())
+            return 0.5;
+
+        ensure_py_modules();
+        py::gil_scoped_acquire gil;
+        py::list encs;
+        encs.append(encode_state(g));
+
+        double p = 0.5;
+        try
+        {
+            auto model_start = std::chrono::high_resolution_clock::now();
+            model_calls += 1;
+            model_batch_items += 1;
+            if (!model_override.is_none())
+            {
+                py::list datas;
+                for (auto item : encs)
+                {
+                    py::object enc_obj = py::cast<py::object>(item);
+                    datas.append(enc_obj.attr("data"));
+                }
+                py::object batch = pyg_data_Batch.attr("from_data_list")(datas);
+                if (!model_device.empty())
+                    batch = batch.attr("to")(py::cast(model_device));
+
+                py::object no_grad = torch_module.attr("no_grad")();
+                no_grad.attr("__enter__")();
+                py::object logits = model_override(batch);
+                no_grad.attr("__exit__")(py::none(), py::none(), py::none());
+                py::object probs = torch_module.attr("sigmoid")(logits).attr("detach")().attr("cpu")();
+                py::list probs_list = py::cast<py::list>(probs.attr("tolist")());
+                p = (py::len(probs_list) > 0) ? py::cast<double>(probs_list[0]) : 0.5;
+            }
+            else
+            {
+                py::object py_probs = gnn_module.attr("evaluate_encodings")(encs);
+                py::list probs_list = py::cast<py::list>(py_probs);
+                p = (py::len(probs_list) > 0) ? py::cast<double>(probs_list[0]) : 0.5;
+            }
+            auto model_end = std::chrono::high_resolution_clock::now();
+            total_model_time += std::chrono::duration<double>(model_end - model_start).count();
+        }
+        catch (const py::error_already_set &e)
+        {
+            throw std::runtime_error(
+                std::string("GNN evaluation is mandatory for AlphaBetaEngine and failed. ") +
+                "Ensure a GNN evaluator is loaded in Python (call gnn.model.load_model(...)) or use set_model_checkpoint(...). " +
+                std::string("Python error: ") + e.what());
+        }
+
+        if (g.current_player != root_player)
+            p = 1.0 - p;
+        return clamp_prob(p);
+    }
+
+    std::vector<double> gnn_probs_root_for_encodings(const py::list &encs)
+    {
+        // Returns P(root_player wins) for each encoding.
+        ensure_py_modules();
+        py::gil_scoped_acquire gil;
+
+        std::vector<double> probs;
+        probs.reserve((size_t)py::len(encs));
+
+        try
+        {
+            auto model_start = std::chrono::high_resolution_clock::now();
+            model_calls += 1;
+            model_batch_items += (size_t)py::len(encs);
+            if (!model_override.is_none())
+            {
+                py::list datas;
+                for (auto item : encs)
+                {
+                    py::object enc_obj = py::cast<py::object>(item);
+                    datas.append(enc_obj.attr("data"));
+                }
+                py::object batch = pyg_data_Batch.attr("from_data_list")(datas);
+                if (!model_device.empty())
+                    batch = batch.attr("to")(py::cast(model_device));
+
+                py::object no_grad = torch_module.attr("no_grad")();
+                no_grad.attr("__enter__")();
+                py::object logits = model_override(batch);
+                no_grad.attr("__exit__")(py::none(), py::none(), py::none());
+                py::object out = torch_module.attr("sigmoid")(logits).attr("detach")().attr("cpu")();
+                py::list out_list = py::cast<py::list>(out.attr("tolist")());
+                for (auto v : out_list)
+                    probs.push_back(py::cast<double>(v));
+            }
+            else
+            {
+                py::object py_probs = gnn_module.attr("evaluate_encodings")(encs);
+                py::list probs_list = py::cast<py::list>(py_probs);
+                for (auto v : probs_list)
+                    probs.push_back(py::cast<double>(v));
+            }
+            auto model_end = std::chrono::high_resolution_clock::now();
+            total_model_time += std::chrono::duration<double>(model_end - model_start).count();
+        }
+        catch (const py::error_already_set &e)
+        {
+            throw std::runtime_error(
+                std::string("GNN evaluation is mandatory for AlphaBetaEngine and failed. ") +
+                "Ensure a GNN evaluator is loaded in Python (call gnn.model.load_model(...)) or use set_model_checkpoint(...). " +
+                std::string("Python error: ") + e.what());
+        }
+
+        if (probs.size() != (size_t)py::len(encs))
+        {
+            // Defensive: fall back to 0.5 for missing outputs.
+            probs.resize((size_t)py::len(encs), 0.5);
+        }
+        for (auto &p : probs)
+            p = clamp_prob(p);
+        return probs;
+    }
+
+    double evaluate(GameState &g)
+    {
+        TTKey key = g.tt_key();
+        auto it = eval_cache.find(key);
+        if (it != eval_cache.end())
+            return it->second;
+
+        double p = gnn_prob_root(g);
+        double v = prob_to_value(p);
+        eval_cache[key] = v;
+        return v;
+    }
+
+    std::vector<double> evaluate_children_depth1_batched(GameState &g, const std::vector<Move> &moves, bool parent_maximising)
+    {
+        // For depth==1, children are evaluated at depth 0.
+        // We batch all uncached leaf evals into a single model call.
+        std::vector<double> values;
+        values.resize(moves.size(), 0.0);
+
+        std::vector<TTKey> keys;
+        keys.resize(moves.size());
+
+        std::vector<size_t> need_eval_indices;
+        need_eval_indices.reserve(moves.size());
+
+        std::vector<char> flip_flags;
+        flip_flags.reserve(moves.size());
+
+        py::list encs;
+
+        for (size_t i = 0; i < moves.size(); ++i)
+        {
+            const auto &m = moves[i];
+            int mover = g.current_player;
+            g.do_move(m, mover);
+
+            TTKey key = g.tt_key();
+            keys[i] = key;
+            auto it = eval_cache.find(key);
+            if (it != eval_cache.end())
+            {
+                values[i] = it->second;
+                g.undo_move();
+                continue;
+            }
+
+            // Terminal/empty fast paths without model.
+            if (g.winner != -1)
+            {
+                double p = (g.winner == root_player) ? 1.0 : 0.0;
+                if (g.current_player != root_player)
+                    p = 1.0 - p;
+                double v = prob_to_value(p);
+                eval_cache[key] = v;
+                values[i] = v;
+                g.undo_move();
+                continue;
+            }
+            if (g.connected_points.empty() && g.rocks.empty())
+            {
+                double v = prob_to_value(0.5);
+                eval_cache[key] = v;
+                values[i] = v;
+                g.undo_move();
+                continue;
+            }
+
+            // Need model: build encoding for this child.
+            encs.append(encode_state(g));
+            need_eval_indices.push_back(i);
+            flip_flags.push_back((g.current_player != root_player) ? 1 : 0);
+            g.undo_move();
+        }
+
+        if (!need_eval_indices.empty())
+        {
+            auto probs = gnn_probs_root_for_encodings(encs);
+            for (size_t j = 0; j < need_eval_indices.size(); ++j)
+            {
+                size_t i = need_eval_indices[j];
+                double p = probs[j];
+                if (flip_flags[j])
+                    p = 1.0 - p;
+
+                double v = prob_to_value(p);
+                eval_cache[keys[i]] = v;
+                values[i] = v;
+            }
+        }
+
+        // Apply pass penalty at the parent node (matches alpha_beta recursion).
+        for (size_t i = 0; i < moves.size(); ++i)
+        {
+            if (moves[i].t == 'P')
+            {
+                if (parent_maximising)
+                    values[i] -= pass_penalty;
+                else
+                    values[i] += pass_penalty;
+            }
+        }
+        return values;
+    }
+
+    void order_moves_by_child_eval_inplace(std::vector<Move> &moves, GameState &g, bool parent_maximising)
+    {
+        if (moves.size() <= 1)
+            return;
+
+        std::vector<double> scores;
+        scores.resize(moves.size(), 0.0);
+
+        std::vector<TTKey> keys;
+        keys.resize(moves.size());
+
+        std::vector<size_t> need_eval_indices;
+        need_eval_indices.reserve(moves.size());
+        std::vector<char> flip_flags;
+        flip_flags.reserve(moves.size());
+
+        py::list encs;
+
+        for (size_t i = 0; i < moves.size(); ++i)
+        {
+            const auto &m = moves[i];
+            int mover = g.current_player;
+            g.do_move(m, mover);
+
+            TTKey key = g.tt_key();
+            keys[i] = key;
+            auto it = eval_cache.find(key);
+            if (it != eval_cache.end())
+            {
+                scores[i] = it->second;
+                g.undo_move();
+                continue;
+            }
+
+            if (g.winner != -1)
+            {
+                double p = (g.winner == root_player) ? 1.0 : 0.0;
+                if (g.current_player != root_player)
+                    p = 1.0 - p;
+                double v = prob_to_value(p);
+                eval_cache[key] = v;
+                scores[i] = v;
+                g.undo_move();
+                continue;
+            }
+            if (g.connected_points.empty() && g.rocks.empty())
+            {
+                double v = prob_to_value(0.5);
+                eval_cache[key] = v;
+                scores[i] = v;
+                g.undo_move();
+                continue;
+            }
+
+            encs.append(encode_state(g));
+            need_eval_indices.push_back(i);
+            flip_flags.push_back((g.current_player != root_player) ? 1 : 0);
+            g.undo_move();
+        }
+
+        if (!need_eval_indices.empty())
+        {
+            auto probs = gnn_probs_root_for_encodings(encs);
+            for (size_t j = 0; j < need_eval_indices.size(); ++j)
+            {
+                size_t i = need_eval_indices[j];
+                double p = probs[j];
+                if (flip_flags[j])
+                    p = 1.0 - p;
+                double v = prob_to_value(p);
+                eval_cache[keys[i]] = v;
+                scores[i] = v;
+            }
+        }
+
+        for (size_t i = 0; i < moves.size(); ++i)
+        {
+            if (moves[i].t == 'P')
+            {
+                if (parent_maximising)
+                    scores[i] -= pass_penalty;
+                else
+                    scores[i] += pass_penalty;
+            }
+        }
+
+        std::vector<size_t> idx(moves.size());
+        for (size_t i = 0; i < idx.size(); ++i)
+            idx[i] = i;
+
+        std::stable_sort(idx.begin(), idx.end(), [&](size_t ia, size_t ib)
+                         {
+            double a = scores[ia];
+            double b = scores[ib];
+            if (a != b) return parent_maximising ? (a > b) : (a < b);
+            int ra = move_type_rank(moves[ia]);
+            int rb = move_type_rank(moves[ib]);
+            if (ra != rb) return ra < rb;
+            return move_less(moves[ia], moves[ib]); });
+
+        std::vector<Move> reordered;
+        reordered.reserve(moves.size());
+        for (size_t i : idx)
+            reordered.push_back(moves[i]);
+        moves.swap(reordered);
+    }
+
+    double alpha_beta(GameState &g, int depth, double alpha, double beta)
+    {
+        TTKey key = g.tt_key();
+        auto it = tt.find(key);
+        if (it != tt.end() && it->second.depth >= depth)
+        {
+            const TTEntry &e = it->second;
+            if (e.flag == 0)
+                return e.value;
+            if (e.flag == 1)
+                alpha = std::max(alpha, e.value);
+            else if (e.flag == 2)
+                beta = std::min(beta, e.value);
+            if (alpha >= beta)
+                return e.value;
+        }
+
+        if (depth <= 0 || g.winner != -1)
+            return evaluate(g);
+
+        bool maximising = (g.current_player == root_player);
+        double best = maximising ? -1e300 : 1e300;
+        Move best_move{0, 0, 'P'};
+        double a0 = alpha;
+        double b0 = beta;
+
+        auto moves = g.get_possible_moves_for_player(g.current_player);
+        moves = filter_search_moves(moves, g, g.current_player);
+        order_moves_inplace(moves);
+        if ((int)moves.size() > move_cap)
+            moves.resize((size_t)move_cap);
+
+        // Use a one-shot batched child evaluation for move ordering at depth==2.
+        // This adds one model call but can improve pruning significantly.
+        if (depth == 2)
+        {
+            order_moves_by_child_eval_inplace(moves, g, maximising);
+        }
+
+        if (moves.empty())
+            return evaluate(g);
+
+        if (depth == 1)
+        {
+            auto vals = evaluate_children_depth1_batched(g, moves, maximising);
+            for (size_t i = 0; i < moves.size(); ++i)
+            {
+                const auto &m = moves[i];
+                double v = vals[i];
+
+                if (maximising)
+                {
+                    if (v > best || (v == best && move_less(m, best_move)))
+                    {
+                        best = v;
+                        best_move = m;
+                    }
+                    alpha = std::max(alpha, best);
+                    if (alpha >= beta)
+                        break;
+                }
+                else
+                {
+                    if (v < best || (v == best && move_less(m, best_move)))
+                    {
+                        best = v;
+                        best_move = m;
+                    }
+                    beta = std::min(beta, best);
+                    if (alpha >= beta)
+                        break;
+                }
+            }
+        }
+        else
+        {
+            for (auto &m : moves)
+            {
+                int mover = g.current_player;
+                g.do_move(m, mover);
+                double v = alpha_beta(g, depth - 1, alpha, beta);
+                g.undo_move();
+
+                if (m.t == 'P')
+                {
+                    if (maximising)
+                        v -= pass_penalty;
+                    else
+                        v += pass_penalty;
+                }
+
+                if (maximising)
+                {
+                    if (v > best || (v == best && move_less(m, best_move)))
+                    {
+                        best = v;
+                        best_move = m;
+                    }
+                    alpha = std::max(alpha, best);
+                    if (alpha >= beta)
+                        break;
+                }
+                else
+                {
+                    if (v < best || (v == best && move_less(m, best_move)))
+                    {
+                        best = v;
+                        best_move = m;
+                    }
+                    beta = std::min(beta, best);
+                    if (alpha >= beta)
+                        break;
+                }
+            }
+        }
+
+        TTEntry e;
+        e.depth = depth;
+        e.value = best;
+        e.best = best_move;
+        if (best <= a0)
+            e.flag = 2; // upper
+        else if (best >= b0)
+            e.flag = 1; // lower
+        else
+            e.flag = 0; // exact
+        tt[key] = e;
+        return best;
+    }
+
+    std::mt19937 rng;
+    double pass_penalty = 1.2;
+    int move_cap = 48;
+    int root_player = 0;
+    int last_root_player = -1;
+
+    std::unordered_map<TTKey, TTEntry, TTKeyHash> tt;
+    std::unordered_map<TTKey, double, TTKeyHash> eval_cache;
+
+    py::object torch_module;
+    py::object pyg_data_module;
+    py::object pyg_data_Data;
+    py::object pyg_data_Batch;
+    py::object gnn_module;
+    py::object types_module;
+
+    py::object model_override = py::none();
+    std::string model_device = "cpu";
+
+    std::unordered_map<std::uint64_t, py::object> enc_cache;
+    static constexpr size_t ENC_CACHE_MAX = 4096;
+
+    double total_encode_time = 0.0;
+    double total_model_time = 0.0;
+
+    size_t model_calls = 0;
+    size_t model_batch_items = 0;
+};
+
+PYBIND11_MODULE(players_ext, m)
 {
     py::class_<Move>(m, "Move")
         .def(py::init<>())
@@ -2830,7 +3901,7 @@ PYBIND11_MODULE(mcts_ext, m)
         .def("__repr__", [](const Move &mv)
              {
             std::ostringstream os;
-            os << "mcts_ext.Move(" << mv.x << ", " << mv.y << ", '" << mv.t << "')";
+            os << "players_ext.Move(" << mv.x << ", " << mv.y << ", '" << mv.t << "')";
             return os.str(); });
 
     py::class_<GameState>(m, "GameState")
@@ -2853,6 +3924,9 @@ PYBIND11_MODULE(mcts_ext, m)
         .def("set_prior_eval_cap", &MCTSEngine::set_prior_eval_cap)
         .def("set_max_sim_depth", &MCTSEngine::set_max_sim_depth)
         .def("clear_root_priors", &MCTSEngine::clear_root_priors)
+        .def("set_exploration", &MCTSEngine::set_exploration, py::arg("dirichlet_alpha"), py::arg("dirichlet_epsilon"), py::arg("temperature"), py::arg("temperature_moves"))
+        .def("set_model_checkpoint", &MCTSEngine::set_model_checkpoint, py::arg("path"), py::arg("device") = "cpu")
+        .def("reset_search", &MCTSEngine::reset_search)
         .def("set_root_priors", &MCTSEngine::set_root_priors_py)
         .def("get_current_root_key", &MCTSEngine::get_current_root_key)
         .def("get_root_visit_stats", &MCTSEngine::get_root_visit_stats_py, py::arg("root"))
@@ -2860,4 +3934,11 @@ PYBIND11_MODULE(mcts_ext, m)
         .def("get_profile_stats", &MCTSEngine::get_profile_stats)
         .def("advance_root", &MCTSEngine::advance_root, py::arg("game"))
         .def("prune_tables", &MCTSEngine::prune_tables, py::arg("max_states"));
+
+    py::class_<AlphaBetaEngine>(m, "AlphaBetaEngine")
+        .def(py::init<int, double>(), py::arg("seed") = 0, py::arg("pass_penalty") = 1.2)
+        .def("choose_move", &AlphaBetaEngine::choose_move, py::arg("root"), py::arg("depth") = 3, py::arg("move_cap") = 48)
+        .def("set_model_checkpoint", &AlphaBetaEngine::set_model_checkpoint, py::arg("path"), py::arg("device") = "cpu")
+        .def("clear_stats", &AlphaBetaEngine::clear_stats)
+        .def("get_profile_stats", &AlphaBetaEngine::get_profile_stats);
 }

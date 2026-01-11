@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator, Optional, Protocol
 
@@ -87,8 +88,6 @@ def _point_in_polygon_strict(point: tuple[int, int], poly: tuple[tuple[int, int]
         j = i
     return inside
 
-
-# this is for typing, really, GameTotal is a valid game class used in python to c++ conversion but doesn't work with the type checker directly
 class GameProtocol(Protocol):
     players: list[Player]
     current_player: int
@@ -140,6 +139,14 @@ class Game:
         self.stick_endpoints: set[Edge] = set()
         self.claimed_regions: list[ClaimedRegion] = []
 
+        # Cached reachability map used by coord_in_claimed_region().
+        self._reachable_cache_key: int | None = None
+        self._reachable_lowx = 0
+        self._reachable_highx = -1
+        self._reachable_lowy = 0
+        self._reachable_highy = -1
+        self._reachable_coords: set[tuple[int, int]] = set()
+
         # Cache for diagonal intersection checks: (x, y) -> bool
         self._intersects_cache: set[tuple[int, int]] = set()
 
@@ -164,16 +171,87 @@ class Game:
         return {r.edge_key for r in self.claimed_regions}
 
     def coord_in_claimed_region(self, c: tuple[int, int]) -> bool:
-        """True if coordinate is strictly inside any claimed region."""
+
+        if not self.connected_points:
+            return False
+
+        self._ensure_reachable_cache()
 
         x, y = c
-        for r in self.claimed_regions:
-            minx, maxx, miny, maxy = r.bbox
-            if x <= minx or x >= maxx or y <= miny or y >= maxy:
-                continue
-            if _point_in_polygon_strict(c, r.vertices):
+        if x < self._reachable_lowx or x > self._reachable_highx or y < self._reachable_lowy or y > self._reachable_highy:
+            return False
+
+        return c not in self._reachable_coords
+
+    def _invalidate_reachable_cache(self) -> None:
+        self._reachable_cache_key = None
+        self._reachable_coords.clear()
+
+    def _sticks_cache_key(self) -> int:
+        return hash(tuple(sorted(self.stick_endpoints)))
+
+    def _ensure_reachable_cache(self) -> None:
+        key = self._sticks_cache_key()
+        if self._reachable_cache_key == key:
+            return
+
+        minx = min(p.x for p in self.connected_points)
+        maxx = max(p.x for p in self.connected_points)
+        miny = min(p.y for p in self.connected_points)
+        maxy = max(p.y for p in self.connected_points)
+
+        margin = 1
+        lowx = minx - margin
+        highx = maxx + margin
+        lowy = miny - margin
+        highy = maxy + margin
+
+        def in_bounds(cx: int, cy: int) -> bool:
+            return lowx <= cx <= highx and lowy <= cy <= highy
+
+        def blocked_edge(cx: int, cy: int, nx: int, ny: int, d: D) -> bool:
+            p = self.points.get((cx, cy))
+            if p is not None and p.neighbours[d.as_int] is not None:
                 return True
-        return False
+            q = self.points.get((nx, ny))
+            if q is not None and q.neighbours[d.reversed.as_int] is not None:
+                return True
+            return False
+
+        reachable: set[tuple[int, int]] = set()
+        q: deque[tuple[int, int]] = deque()
+
+        for x in range(lowx, highx + 1):
+            q.append((x, lowy))
+            q.append((x, highy))
+        for y in range(lowy, highy + 1):
+            q.append((lowx, y))
+            q.append((highx, y))
+
+        while q:
+            cx, cy = q.popleft()
+            if (cx, cy) in reachable:
+                continue
+            if not in_bounds(cx, cy):
+                continue
+            reachable.add((cx, cy))
+
+            for d in D:
+                dx, dy = d.delta
+                nx, ny = cx + dx, cy + dy
+                if not in_bounds(nx, ny):
+                    continue
+                if blocked_edge(cx, cy, nx, ny, d):
+                    continue
+                if (nx, ny) not in reachable:
+                    q.append((nx, ny))
+
+        self._reachable_cache_key = key
+        self._reachable_lowx = lowx
+        self._reachable_highx = highx
+        self._reachable_lowy = lowy
+        self._reachable_highy = highy
+        self._reachable_coords = reachable
     
     def _all_paths(self, start: Node, end: Node) -> list[list[Node]]:
         if start is end:
@@ -279,6 +357,7 @@ class Game:
 
         self.sticks.append(stick)
         self.stick_endpoints.add(stick.ordered)
+        self._invalidate_reachable_cache()
 
         best_cycle = self._path_of_smallest_area(start, end)
         if best_cycle is None:
@@ -313,6 +392,7 @@ class Game:
             self.remove_connected_point(stick.end)
 
         self.stick_endpoints.discard(stick.ordered)
+        self._invalidate_reachable_cache()
         return stick
 
     def do_move(self, player_number: int, m: Move) -> None:

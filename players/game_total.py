@@ -1,6 +1,6 @@
 from typing import Iterator, Optional
 
-import mcts_ext
+import players_ext
 
 from game import Game, GameProtocol
 from models import Move, Node, Stick
@@ -37,7 +37,7 @@ class GameTotal(GameProtocol):
         "connected_points",
     }
 
-    def __init__(self, py: Game, cpp: mcts_ext.GameState) -> None:
+    def __init__(self, py: Game, cpp: players_ext.GameState) -> None:
         object.__setattr__(self, "py", py)
         object.__setattr__(self, "cpp", cpp)
 

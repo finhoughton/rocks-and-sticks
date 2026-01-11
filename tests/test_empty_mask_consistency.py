@@ -1,6 +1,6 @@
 import random
 
-import mcts_ext
+import players_ext
 import pytest
 
 import game
@@ -50,7 +50,7 @@ def test_empty_mask_does_not_drift_after_mctsplayercpp_get_move():
 
     for _ in range(50):
         py_game = game.Game()
-        cpp_state = mcts_ext.GameState()
+        cpp_state = players_ext.GameState()
         total = GameTotal(py_game, cpp_state)
         randomize_start(total, 3, 1)
 

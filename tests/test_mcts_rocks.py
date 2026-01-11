@@ -1,11 +1,11 @@
-import mcts_ext
+import players_ext
 
 import game
 from models import PASS, Move
 
 
 def _to_cpp_move(move):
-    cm = mcts_ext.Move()
+    cm = players_ext.Move()
     cm.x = move.c[0]
     cm.y = move.c[1]
     map_dir = {
@@ -27,15 +27,15 @@ def _to_cpp_move(move):
 
 def test_rock_placement_and_undo():
     py_game = game.Game()
-    cpp_state = mcts_ext.GameState()
+    cpp_state = players_ext.GameState()
 
     # advance two passes so rocks become available
     py_game.do_move(0, PASS)
-    cpp_p0 = mcts_ext.Move()
+    cpp_p0 = players_ext.Move()
     cpp_p0.t = 'P'
     cpp_state.do_move(cpp_p0, 0)
     py_game.do_move(1, PASS)
-    cpp_p1 = mcts_ext.Move()
+    cpp_p1 = players_ext.Move()
     cpp_p1.t = 'P'
     cpp_state.do_move(cpp_p1, 1)
 
@@ -68,15 +68,15 @@ def test_rock_placement_and_undo():
 
 def test_rock_must_be_adjacent_to_anchor():
     py_game = game.Game()
-    cpp_state = mcts_ext.GameState()
+    cpp_state = players_ext.GameState()
 
     # advance two passes so rocks become available
     py_game.do_move(0, PASS)
-    cpp_p0 = mcts_ext.Move()
+    cpp_p0 = players_ext.Move()
     cpp_p0.t = 'P'
     cpp_state.do_move(cpp_p0, 0)
     py_game.do_move(1, PASS)
-    cpp_p1 = mcts_ext.Move()
+    cpp_p1 = players_ext.Move()
     cpp_p1.t = 'P'
     cpp_state.do_move(cpp_p1, 1)
 
@@ -92,7 +92,7 @@ def test_rock_must_be_adjacent_to_anchor():
     except ValueError:
         pass
 
-    cm = mcts_ext.Move()
+    cm = players_ext.Move()
     cm.x = 100
     cm.y = 100
     cm.t = 'R'

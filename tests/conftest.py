@@ -1,4 +1,4 @@
-import mcts_ext
+import players_ext
 import pytest
 
 import game
@@ -22,7 +22,7 @@ def py_moves_as_cpp_tuples(py_game: game.Game):
     return out
 
 
-def cpp_moves_as_py_tuples(cpp_state: mcts_ext.GameState, player_number: int):
+def cpp_moves_as_py_tuples(cpp_state: players_ext.GameState, player_number: int):
     out = set()
     for m in cpp_state.get_possible_moves(player_number):
         if m.t == "P" or m.t == "R":
@@ -32,7 +32,7 @@ def cpp_moves_as_py_tuples(cpp_state: mcts_ext.GameState, player_number: int):
     return out
 
 
-def apply_move_both(py_game: game.Game, cpp_state: mcts_ext.GameState, py_move: models.Move):
+def apply_move_both(py_game: game.Game, cpp_state: players_ext.GameState, py_move: models.Move):
     player_num = py_game.current_player
     py_game.do_move(player_num, py_move)
     cpp_state.do_move(to_cpp_move(py_move), player_num)
@@ -45,7 +45,7 @@ def py_game():
 
 @pytest.fixture
 def cpp_state():
-    return mcts_ext.GameState()
+    return players_ext.GameState()
 
 
 @pytest.fixture

@@ -1,4 +1,4 @@
-import mcts_ext
+import players_ext
 
 import game
 from gnn.encode import SAMPLE_ENC
@@ -18,7 +18,7 @@ def test_mctsplayercpp_move_is_legal_from_random_positions():
 
     for _ in range(250):
         py_game = game.Game()
-        cpp_state = mcts_ext.GameState()
+        cpp_state = players_ext.GameState()
         total = GameTotal(py_game, cpp_state)
         randomize_start(total, 50, 20)
 

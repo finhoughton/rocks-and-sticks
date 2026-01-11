@@ -1,9 +1,13 @@
 import argparse
 import gc
+import json
+import random
 import re
 import shutil
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -66,6 +70,200 @@ def _cleanup_old_datasets(data_dir: Path, *, keep_last: int, current_iter: int) 
             print(f"Warning: failed to delete {pt_path}: {e}")
 
 
+def _append_jsonl(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _evaluate_vs_random(
+    *,
+    backend: str,
+    device: str,
+    eval_games: int,
+    eval_rollouts: int,
+    eval_max_moves: int,
+    eval_seed: int,
+    iteration: int,
+    model_path: str,
+) -> dict:
+    wins = 0
+    losses = 0
+    draws = 0
+    max_moves_reached = 0
+    move_counts: list[int] = []
+
+    t0 = time.time()
+    for gidx in range(int(eval_games)):
+        print(f"Eval game {gidx + 1}/{eval_games}...")
+        random.seed(int(eval_seed) + int(gidx))
+
+        agent_player = 0 if (gidx % 2 == 0) else 1
+        random_player = 1 - agent_player
+
+        if backend == 'cpp':
+            import players_ext
+
+            from players.game_total import GameTotal
+            from players.mcts_cpp import MCTSPlayerCPP
+
+            mcts = MCTSPlayerCPP(agent_player, n_rollouts=eval_rollouts, seed=gidx)
+            rnd = RandomPlayer(random_player, seed=gidx + 1)
+            players = [mcts, rnd] if agent_player == 0 else [rnd, mcts]
+            game = GameTotal(Game(players=players), players_ext.GameState())
+            randomize_start(game)
+        else:
+            mcts = MCTSPlayer(agent_player, use_gnn=True, n_rollouts=eval_rollouts, seed=gidx)
+            rnd = RandomPlayer(random_player, seed=gidx + 1)
+            players = [mcts, rnd] if agent_player == 0 else [rnd, mcts]
+            game = Game(players=players)
+            randomize_start(game)
+
+        move_count = 0
+        while game.winner is None and move_count < int(eval_max_moves):
+            p = game.players[game.current_player]
+            mv = p.get_move(game)
+            try:
+                game.do_move(game.current_player, mv)
+            except Exception:
+                print(f"Error during eval game {gidx} move {move_count} by player {game.current_player}: {p}, {p.__class__.__name__}")
+                raise
+            move_count += 1
+
+        move_counts.append(move_count)
+        if game.winner == agent_player:
+            wins += 1
+        elif game.winner == random_player:
+            losses += 1
+        else:
+            draws += 1
+            if move_count >= int(eval_max_moves):
+                max_moves_reached += 1
+
+    dt = time.time() - t0
+    games = max(1, int(eval_games))
+    avg_moves = float(sum(move_counts)) / float(max(1, len(move_counts)))
+    win_rate = float(wins) / float(games)
+
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "iter": int(iteration),
+        "backend": str(backend),
+        "device": str(device),
+        "model_path": str(model_path),
+        "eval_games": int(eval_games),
+        "eval_rollouts": int(eval_rollouts),
+        "eval_max_moves": int(eval_max_moves),
+        "eval_seed": int(eval_seed),
+        "eval_alternate_roles": True,
+        "wins": int(wins),
+        "losses": int(losses),
+        "draws": int(draws),
+        "win_rate": win_rate,
+        "avg_moves": avg_moves,
+        "max_moves_reached": int(max_moves_reached),
+        "seconds": float(dt),
+    }
+
+
+def _evaluate_cpp_model_vs_model(
+    *,
+    device: str,
+    eval_games: int,
+    eval_rollouts: int,
+    eval_max_moves: int,
+    eval_seed: int,
+    iteration: int,
+    model_a_path: str,
+    model_b_path: str,
+    model_a_label: str,
+    model_b_label: str,
+) -> dict:
+
+    import players_ext
+
+    from players.game_total import GameTotal
+    from players.mcts_cpp import MCTSPlayerCPP
+
+    wins = 0
+    losses = 0
+    draws = 0
+    max_moves_reached = 0
+    move_counts: list[int] = []
+
+    t0 = time.time()
+    for gidx in range(int(eval_games)):
+        random.seed(int(eval_seed) + int(gidx))
+
+        a_as_p0 = (gidx % 2 == 0)
+
+        p0 = MCTSPlayerCPP(0, n_rollouts=eval_rollouts, seed=gidx)
+        p1 = MCTSPlayerCPP(1, n_rollouts=eval_rollouts, seed=gidx + 1)
+
+        # disable exploration
+        p0.set_exploration(dirichlet_alpha=0.0, dirichlet_epsilon=0.0, temperature=0.0, temperature_moves=0)
+        p1.set_exploration(dirichlet_alpha=0.0, dirichlet_epsilon=0.0, temperature=0.0, temperature_moves=0)
+
+        if a_as_p0:
+            p0.set_model_checkpoint(model_a_path, device=device)
+            p1.set_model_checkpoint(model_b_path, device=device)
+        else:
+            p0.set_model_checkpoint(model_b_path, device=device)
+            p1.set_model_checkpoint(model_a_path, device=device)
+
+        game = GameTotal(Game(players=[p0, p1]), players_ext.GameState())
+        randomize_start(game)
+
+        move_count = 0
+        while game.winner is None and move_count < int(eval_max_moves):
+            pl = game.players[game.current_player]
+            mv = pl.get_move(game)
+            game.do_move(game.current_player, mv)
+            move_count += 1
+
+        move_counts.append(move_count)
+
+        if game.winner is None:
+            draws += 1
+            if move_count >= int(eval_max_moves):
+                max_moves_reached += 1
+        else:
+            a_player_num = 0 if a_as_p0 else 1
+            if int(game.winner) == a_player_num:
+                wins += 1
+            else:
+                losses += 1
+
+    dt = time.time() - t0
+    games = max(1, int(eval_games))
+    avg_moves = float(sum(move_counts)) / float(max(1, len(move_counts)))
+    win_rate = float(wins) / float(games)
+
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "iter": int(iteration),
+        "backend": "cpp",
+        "device": str(device),
+        "match": "checkpoint_vs_checkpoint",
+        "model_a": str(model_a_path),
+        "model_b": str(model_b_path),
+        "model_a_label": str(model_a_label),
+        "model_b_label": str(model_b_label),
+        "eval_games": int(eval_games),
+        "eval_rollouts": int(eval_rollouts),
+        "eval_max_moves": int(eval_max_moves),
+        "eval_seed": int(eval_seed),
+        "eval_alternate_roles": True,
+        "wins": int(wins),
+        "losses": int(losses),
+        "draws": int(draws),
+        "win_rate": win_rate,
+        "avg_moves": avg_moves,
+        "max_moves_reached": int(max_moves_reached),
+        "seconds": float(dt),
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--iters', type=int, default=3)
@@ -84,8 +282,14 @@ def main():
     p.add_argument('--data-dir', default='data')
     p.add_argument('--dataset-shard-size', type=int, default=0, help='If >0, write training dataset in shards of this many samples (reduces peak memory). Suggested: 20000-50000 for ~300k+ samples.')
     p.add_argument('--keep-last-datasets', type=int, default=1, help='How many most-recent iteration datasets to keep on disk (pt + .shards). Older iterations are deleted after a successful iteration.')
-    p.add_argument('--eval-games', type=int, default=10, help='Number of games to evaluate vs RandomPlayer after each iteration')
-    p.add_argument('--eval-rollouts', type=int, default=100, help='MCTS rollouts to use during evaluation')
+    p.add_argument('--eval-games', type=int, default=100, help='Number of games to evaluate vs RandomPlayer after each iteration')
+    p.add_argument('--eval-rollouts', type=int, default=500, help='MCTS rollouts to use during evaluation')
+    p.add_argument('--eval-max-moves', type=int, default=256, help='Max moves per evaluation game before counting as draw')
+    p.add_argument('--eval-seed', type=int, default=12345, help='Base RNG seed for deterministic evaluation starting positions')
+    p.add_argument('--strength-log', default='logs/strength_curve.jsonl', help='Append JSONL evaluation records here each iteration')
+    p.add_argument('--eval-vs-prev', type=int, default=0, help='If >0 and --backend=cpp: also evaluate vs the last N previous evaluator checkpoints')
+    p.add_argument('--eval-prev-games', type=int, default=40, help='Games per previous-checkpoint opponent')
+    p.add_argument('--eval-prev-rollouts', type=int, default=200, help='MCTS rollouts per move for previous-checkpoint evaluation')
     p.add_argument('--no-augment', action='store_true', help='Disable symmetric augmentation during conversion')
     p.add_argument('--backend', type=str, default='python', choices=['python', 'cpp'], help='MCTS backend for self-play/eval')
     args = p.parse_args()
@@ -132,6 +336,7 @@ def main():
             model_path=model_path,
             device=args.device,
             backend=args.backend,
+            temp=1.1
         )
 
         dataset_path = data_dir / f'alpha_dataset_iter_{i}.pt'
@@ -250,35 +455,68 @@ def main():
                 print(f"Failed to load evaluator for evaluation: {e}")
                 continue
 
-            wins = 0
-            for gidx in range(args.eval_games):
-                if args.backend == 'cpp':
-                    import mcts_ext
+            record = _evaluate_vs_random(
+                backend=str(args.backend),
+                device=str(args.device),
+                eval_games=int(args.eval_games),
+                eval_rollouts=int(args.eval_rollouts),
+                eval_max_moves=int(args.eval_max_moves),
+                eval_seed=int(args.eval_seed),
+                iteration=int(i),
+                model_path=str(gnn_eval_ckpt),
+            )
 
-                    from players.game_total import GameTotal
-                    from players.mcts_cpp import MCTSPlayerCPP
-
-                    mcts = MCTSPlayerCPP(0, n_rollouts=args.eval_rollouts, seed=gidx)
-                    rnd = RandomPlayer(1, seed=gidx + 1)
-                    game = GameTotal(Game(players=[mcts, rnd]), mcts_ext.GameState())
-                    randomize_start(game)
+            # Optional: ladder eval vs prior checkpoints (C++ backend only).
+            if int(args.eval_vs_prev) > 0:
+                if str(args.backend) != 'cpp':
+                    print('Note: --eval-vs-prev requires --backend=cpp (needs per-engine checkpoint loading).')
+                elif i <= 1:
+                    pass
                 else:
-                    mcts = MCTSPlayer(0, use_gnn=True, n_rollouts=args.eval_rollouts, seed=gidx)
-                    rnd = RandomPlayer(1, seed=gidx + 1)
-                    game = Game(players=[mcts, rnd])
-                    randomize_start(game)
-                move_count = 0
-                while game.winner is None:
-                    p = game.players[game.current_player]
-                    mv = p.get_move(game)
-                    game.do_move(game.current_player, mv)
-                    move_count += 1
-                    if move_count > 100:
-                        break
-                if game.winner == 0:
-                    wins += 1
-            win_rate = wins / args.eval_games
-            print(f"Evaluation vs RandomPlayer: {wins}/{args.eval_games} wins (win rate={win_rate:.2f})")
+                    prev_n = int(args.eval_vs_prev)
+                    prev_games = int(args.eval_prev_games)
+                    prev_rollouts = int(args.eval_prev_rollouts)
+                    start_opp = max(1, int(i) - prev_n)
+                    vs_prev: dict[str, dict] = {}
+                    for opp_iter in range(start_opp, int(i)):
+                        opp_ckpt = out_dir / f'gnn_eval_iter_{opp_iter}.pt'
+                        if not opp_ckpt.exists():
+                            continue
+                        print(f"Evaluating vs checkpoint iter {opp_iter}...")
+                        res = _evaluate_cpp_model_vs_model(
+                            device=str(args.device),
+                            eval_games=prev_games,
+                            eval_rollouts=prev_rollouts,
+                            eval_max_moves=int(args.eval_max_moves),
+                            eval_seed=int(args.eval_seed) + 100000 * int(opp_iter),
+                            iteration=int(i),
+                            model_a_path=str(gnn_eval_ckpt),
+                            model_b_path=str(opp_ckpt),
+                            model_a_label=f"iter_{i}",
+                            model_b_label=f"iter_{opp_iter}",
+                        )
+                        vs_prev[str(opp_iter)] = {
+                            "wins": int(res["wins"]),
+                            "losses": int(res["losses"]),
+                            "draws": int(res["draws"]),
+                            "win_rate": float(res["win_rate"]),
+                            "eval_games": int(res["eval_games"]),
+                            "eval_rollouts": int(res["eval_rollouts"]),
+                            "seconds": float(res["seconds"]),
+                        }
+                    record["vs_prev_checkpoints"] = vs_prev
+
+            print(
+                "Evaluation vs RandomPlayer: "
+                f"{record['wins']}/{record['eval_games']} wins, "
+                f"{record['losses']} losses, {record['draws']} draws "
+                f"(win_rate={record['win_rate']:.2f}, avg_moves={record['avg_moves']:.1f})"
+            )
+            try:
+                _append_jsonl(Path(str(args.strength_log)), record)
+                print(f"Appended strength record to {args.strength_log}")
+            except Exception as e:
+                print(f"Warning: failed to write strength log {args.strength_log}: {e}")
 
     print('All iterations completed')
 

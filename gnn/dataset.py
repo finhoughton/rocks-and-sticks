@@ -33,7 +33,12 @@ def load_balanced_saved_game_samples(
             for mv_dict in moves_raw:
                 trajectory.append(encode_game_to_graph(game))
                 mv = Move(int(mv_dict["x"]), int(mv_dict["y"]), str(mv_dict["t"])) if mv_dict["t"] != "P" else PASS
-                game.do_move(game.current_player, mv)
+                try:
+                    game.do_move(game.current_player, mv)
+                except Exception:
+                    os.remove(path)
+                    print(f"Removed corrupted game file: {path}")
+                    break
                 if game.winner is not None:
                     break
             n = len(trajectory)
