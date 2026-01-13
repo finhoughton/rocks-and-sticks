@@ -23,12 +23,13 @@ class MCTSPlayerCPP(AIPlayer):
         seed: int = 0,
         c_puct: float = 1.41421356,
         n_rollouts: int = 1000,
+        *,
+        verbose: bool = False,
     ) -> None:
 
-        # GNN evaluation is mandatory for the C++ MCTS backend.
-        # Ensure `gnn.model.load_model(...)` has been called before using this.
         super().__init__(player_number, True)
         self.engine = players_ext.MCTSEngine(seed, c_puct)
+        self.engine.set_verbose(bool(verbose))
         self.n_rollouts = int(n_rollouts)
 
     @property
@@ -42,8 +43,30 @@ class MCTSPlayerCPP(AIPlayer):
 
         player = game.players[game.current_player]
         if not game.valid_move(py_move, player.number):
-            raise ValueError(f"C++ MCTSPlayerCPP selected illegal move {py_move} for player {player.number}")
+            try:
+                py_moves = {(m.c[0], m.c[1], m.t) for m in game.get_possible_moves(player.number)}
+                cpp_moves = game.cpp.get_possible_moves(player.number)
+                cpp_moves_py = set()
+                for m in cpp_moves:
+                    t = m.t
+                    if t in ("P", "R"):
+                        cpp_moves_py.add((m.x, m.y, t))
+                    else:
+                        pm = to_py_move(m)
+                        cpp_moves_py.add((pm.c[0], pm.c[1], pm.t))
 
+                only_cpp = list(cpp_moves_py - py_moves)[:20]
+                only_py = list(py_moves - cpp_moves_py)[:20]
+                raise ValueError(
+                    "C++ MCTSPlayerCPP selected illegal move "
+                    f"{py_move} for player {player.number}. "
+                    f"state_key={int(game.cpp.state_key())} "
+                    f"root_key={int(self.engine.get_current_root_key())} "
+                    f"py_moves={len(py_moves)} cpp_moves={len(cpp_moves_py)} "
+                    f"only_cpp_sample={only_cpp} only_py_sample={only_py}"
+                )
+            except Exception:
+                raise ValueError(f"C++ MCTSPlayerCPP selected illegal move {py_move} for player {player.number}")
         return py_move
 
     def advance_root(self, move: PyMove, game: GameProtocol) -> None:

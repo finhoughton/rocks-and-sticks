@@ -5,9 +5,10 @@ import random
 from glob import glob
 from typing import Callable, Iterable
 
+from constants import HALF_AREA_COUNTS
 from game import Game, GameProtocol
 from gnn.encode import EncodedGraph, encode_game_to_graph
-from models import D, Move
+from models import D, Move, calculate_end
 from players import Player
 
 
@@ -16,6 +17,7 @@ def randomize_start(
     max_sticks: int = 5,
     max_rocks: int = 3, # per player
     move_log: list[Move] | None = None,
+    mover_log: list[int] | None = None,
 ) -> None:
     # not true randomization; biased towards interesting / good for training positions
 
@@ -29,22 +31,36 @@ def randomize_start(
         if not moves:
             break
         mv = random.choice(moves)
-        game.do_move(game.current_player, mv)
+        mover = game.current_player
+        game.do_move(mover, mv)
         failed = False
-        for move in game.get_possible_moves(game.current_player):
-            if move.t in D.__members__:
-                game.do_move(game.current_player, move)
-                if max(game.players_scores) > 0:
-                    failed = True
-                    game.undo_move()
-                    break
-                game.undo_move()
+        # for move in game.get_possible_moves(game.current_player):
+        #     if move.t in D.__members__:
+        #         game.do_move(game.current_player, move)
+        #         if max(game.players_scores) > 0:
+        #             failed = True
+        #             game.undo_move()
+        #             break
+        #         game.undo_move()
+        for p in game.connected_points:
+            for d in D:
+                q = game.points.get(calculate_end(p.c, d), None)
+                if q is not None and q.connected:
+                    path = game._path_of_smallest_area(p, q)
+                    if path is not None and (HALF_AREA_COUNTS or path[0] > 1):
+                        failed = True
+                        break
+            else:
+                continue
+            break
         if failed:
             game.undo_move()
             continue
         target_sticks -= 1
         if move_log is not None:
             move_log.append(mv)
+        if mover_log is not None:
+            mover_log.append(mover)
 
     alpha = 0.7
     r_weights = [math.exp(alpha * k) for k in range(0, max_rocks)]
@@ -59,6 +75,8 @@ def randomize_start(
             game.do_move(p.number, mv)
             if move_log is not None:
                 move_log.append(mv)
+            if mover_log is not None:
+                mover_log.append(p.number)
 
     game.set_current_player0()
 

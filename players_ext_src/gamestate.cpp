@@ -1,5 +1,6 @@
 #include "gamestate.hpp"
 
+#include <cmath>
 #include <stdexcept>
 
 GameState::GameState()
@@ -1287,15 +1288,6 @@ double GameState::score_after(GameState &g, int player_number, const Move &m) co
 
 Move GameState::rollout_pick_move(GameState &game)
 {
-    auto move_less = [](const Move &a, const Move &b) -> bool
-    {
-        if (a.x != b.x)
-            return a.x < b.x;
-        if (a.y != b.y)
-            return a.y < b.y;
-        return a.t < b.t;
-    };
-
     int mover = game.current_player;
     auto moves = game.get_possible_moves_for_player(mover);
     if (moves.empty())
@@ -1318,6 +1310,8 @@ Move GameState::rollout_pick_move(GameState &game)
 
     double best_score = -1e300;
     Move best_move = moves[0];
+    int tie_count = 0;
+    constexpr double SCORE_TIE_EPS = 1e-12;
     for (auto &m : moves)
     {
         double s = score_after(game, mover, m);
@@ -1327,10 +1321,18 @@ Move GameState::rollout_pick_move(GameState &game)
         {
             s += stick_between_opp_rocks_bonus;
         }
-        if (s > best_score || (s == best_score && move_less(m, best_move)))
+        if (s > best_score + SCORE_TIE_EPS)
         {
             best_score = s;
             best_move = m;
+            tie_count = 1;
+        }
+        else if (std::fabs(s - best_score) <= SCORE_TIE_EPS)
+        {
+            tie_count += 1;
+            std::uniform_int_distribution<int> uid(0, tie_count - 1);
+            if (uid(rng) == 0)
+                best_move = m;
         }
     }
     return best_move;

@@ -34,6 +34,7 @@ def _node_feature(node: 'Node', num_players: int) -> list[float]:
 def _edge_index_and_attr_from_points(points: Iterable['Node']) -> tuple[torch.Tensor, torch.Tensor]:
     edges: list[tuple[int, int]] = []
     attrs: list[list[float]] = []
+    seen: set[tuple[int, int]] = set()
     nodes = list(points)
     idx_map = {p: i for i, p in enumerate(nodes)}
     for p in nodes:
@@ -44,13 +45,14 @@ def _edge_index_and_attr_from_points(points: Iterable['Node']) -> tuple[torch.Te
             b = idx_map.get(nbr)
             if b is None:
                 continue
+            if (a, b) in seen:
+                continue
+            seen.add((a, b))
             dx = float(nbr.x - p.x)
             dy = float(nbr.y - p.y)
             is_diag = 1.0 if abs(dx) == 1.0 and abs(dy) == 1.0 else 0.0
             orth = 1.0 - is_diag
             edges.append((a, b))
-            attrs.append([orth, is_diag])
-            edges.append((b, a))
             attrs.append([orth, is_diag])
     if not edges:
         return torch.empty((2, 0), dtype=torch.long), torch.empty((0, 2), dtype=torch.float32)

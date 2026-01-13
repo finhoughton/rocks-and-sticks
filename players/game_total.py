@@ -2,8 +2,8 @@ from typing import Iterator, Optional
 
 import players_ext
 
-from game import Game, GameProtocol
-from models import Move, Node, Stick
+from game import Edge, Game, GameProtocol
+from models import D, Move, Node, Stick
 from players.base import Player
 from players.move_utils import to_cpp_move
 
@@ -75,10 +75,19 @@ class GameTotal(GameProtocol):
         assert self.py.current_player == self.cpp.current_player
 
     def valid_move(self, m: Move, player_number: int) -> bool:
-        return m in self.get_possible_moves(player_number)
+        return self.py.valid_move(m, player_number)
     
     def wait_for_move_input(self, prompt: str) -> str:
         return self.py.wait_for_move_input(prompt)
     
     def render(self, block: bool = False, game_index: Optional[int] = None, total_games: Optional[int] = None) -> None:
-        self.py.render(block, game_index, total_games)
+        return self.py.render(block, game_index, total_games)
+    
+    def intersects_stick(self, start: tuple[int, int], d: D) -> bool:
+        return self.py.intersects_stick(start, d)
+
+    def coord_in_claimed_region(self, c: tuple[int, int]) -> bool:
+        return self.py.coord_in_claimed_region(c)
+
+    def _path_of_smallest_area(self, start: Node, end: Node) -> tuple[int, tuple[tuple[int, int], ...], frozenset[Edge]] | None:
+        return self.py._path_of_smallest_area(start, end)

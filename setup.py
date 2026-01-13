@@ -27,7 +27,14 @@ else:
 ext_modules = [
     Pybind11Extension(
         "players_ext",
-        ["players/players_ext.cpp"],
+        [
+            "players_ext_src/players_ext.cpp",
+            "players_ext_src/gamestate.cpp",
+            "players_ext_src/gnn_helpers.cpp",
+            "players_ext_src/mcts.cpp",
+            "players_ext_src/alphabeta.cpp",
+        ],
+        include_dirs=["players_ext_src"],
         extra_compile_args=extra_compile_args,
         extra_link_args=extra_link_args,
     ),

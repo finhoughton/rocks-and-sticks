@@ -7,15 +7,16 @@ from models import PASS, Move
 from players import Player, RandomPlayer
 
 
-def load_moves_from_json(path: str) -> Tuple[List[Move], Optional[str]]:
+def load_moves_from_json(path: str) -> Tuple[List[Tuple[int | None, Move]], Optional[str]]:
     with open(path, "r", encoding="utf-8") as fh:
         payload = json.load(fh)
-    moves: List[Move] = []
+    moves: List[Tuple[int | None, Move]] = []
     for mv in payload["moves"]:
+        p = mv.get("p", None)
         if mv["t"] == "P":
-            moves.append(PASS)
+            moves.append((p, PASS))
         else:
-            moves.append(Move(int(mv["x"]), int(mv["y"]), str(mv["t"])))
+            moves.append((p, Move(int(mv["x"]), int(mv["y"]), str(mv["t"]))))
     winner: Optional[str] = payload.get("winner", None)
     return moves, winner
 
@@ -28,9 +29,10 @@ def rewatch_game(path: str, delay: float = 1.0) -> None:
     import matplotlib.pyplot as plt
 
     game.render(block=False)
-    for i, mv in enumerate(moves):
-        print(f"Move {i+1}: Player {game.current_player+1} plays {mv}")
-        game.do_move(game.current_player, mv)
+    for i, (p, mv) in enumerate(moves):
+        mover = int(p) if p is not None else game.current_player
+        print(f"Move {i+1}: Player {mover+1} plays {mv}")
+        game.do_move(mover, mv)
         game.render(block=False)
         plt.pause(delay)
     print(f"Game over. Winner: {winner}")

@@ -101,13 +101,14 @@ def convert_games_to_dataset(input_dir: str, out_path: str, augment: bool = Fals
 
             for j in range(n_initial):
                 mv = moves[j]
+                mover = mv.get("p", None)
                 if mv.get("t") == "P":
                     mobj = PASS
                 else:
                     mobj = Move(mv["x"], mv["y"], mv["t"])
                 if mobj is not PASS:
                     game.add_node_and_neighbours(mobj.c)
-                game.do_move(game.current_player, mobj)
+                game.do_move(int(mover) if mover is not None else game.current_player, mobj)
 
             for k in range(n_policy_steps):
                 enc = encode_game_to_graph(game)
@@ -204,13 +205,14 @@ def convert_games_to_dataset(input_dir: str, out_path: str, augment: bool = Fals
                             flush_shard(out_samples)
 
                 mv = moves[n_initial + k]
+                mover = mv.get("p", None)
                 if mv.get("t") == "P":
                     mobj = PASS
                 else:
                     mobj = Move(mv["x"], mv["y"], mv["t"])
                 if mobj is not PASS:
                     game.add_node_and_neighbours(mobj.c)
-                game.do_move(game.current_player, mobj)
+                game.do_move(int(mover) if mover is not None else game.current_player, mobj)
     except KeyboardInterrupt:
         interrupted = True
 

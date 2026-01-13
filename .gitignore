@@ -11,6 +11,7 @@ test.txt
 !scripts/eval.py
 !scripts/rewatch.py
 !tests
+!players_ext_src
 *.png
 *.log
 *.so

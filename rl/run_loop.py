@@ -38,11 +38,27 @@ def export_gnn_eval_from_policy(policy_ckpt: Path, out_path: Path):
     model = GNNEval(node_feat_dim=node_feat_dim, global_feat_dim=global_feat_dim)
     model_sd = model.state_dict()
 
-    # copy matching keys
-    new_sd = {}
+    # Copy matching trunk keys (convs/norms/etc).
+    new_sd: dict[str, torch.Tensor] = {}
     for k in model_sd.keys():
         if k in state:
             new_sd[k] = state[k]
+
+    # If this checkpoint came from PolicyValueNet, map its value head into GNNEval.head.
+    # PolicyValueNet has: value_mlp = [Linear, ReLU, Linear]
+    # GNNEval has: head = [Linear, ReLU, Dropout, Linear]
+    if isinstance(state, dict) and any(str(k).startswith('value_mlp.') for k in state.keys()):
+        # First linear
+        if 'value_mlp.0.weight' in state and 'head.0.weight' in model_sd:
+            new_sd['head.0.weight'] = state['value_mlp.0.weight']
+        if 'value_mlp.0.bias' in state and 'head.0.bias' in model_sd:
+            new_sd['head.0.bias'] = state['value_mlp.0.bias']
+        # Final linear
+        if 'value_mlp.2.weight' in state and 'head.3.weight' in model_sd:
+            new_sd['head.3.weight'] = state['value_mlp.2.weight']
+        if 'value_mlp.2.bias' in state and 'head.3.bias' in model_sd:
+            new_sd['head.3.bias'] = state['value_mlp.2.bias']
+
     model_sd.update(new_sd)
     model.load_state_dict(model_sd)
     torch.save(model.state_dict(), out_path)
@@ -86,6 +102,7 @@ def _evaluate_vs_random(
     eval_seed: int,
     iteration: int,
     model_path: str,
+    cpp_verbose: bool,
 ) -> dict:
     wins = 0
     losses = 0
@@ -95,7 +112,7 @@ def _evaluate_vs_random(
 
     t0 = time.time()
     for gidx in range(int(eval_games)):
-        print(f"Eval game {gidx + 1}/{eval_games}...")
+        print(f"Eval game {gidx + 1}/{eval_games}... vs RandomPlayer")
         random.seed(int(eval_seed) + int(gidx))
 
         agent_player = 0 if (gidx % 2 == 0) else 1
@@ -107,7 +124,7 @@ def _evaluate_vs_random(
             from players.game_total import GameTotal
             from players.mcts_cpp import MCTSPlayerCPP
 
-            mcts = MCTSPlayerCPP(agent_player, n_rollouts=eval_rollouts, seed=gidx)
+            mcts = MCTSPlayerCPP(agent_player, n_rollouts=eval_rollouts, seed=gidx, verbose=bool(cpp_verbose))
             rnd = RandomPlayer(random_player, seed=gidx + 1)
             players = [mcts, rnd] if agent_player == 0 else [rnd, mcts]
             game = GameTotal(Game(players=players), players_ext.GameState())
@@ -178,6 +195,7 @@ def _evaluate_cpp_model_vs_model(
     model_b_path: str,
     model_a_label: str,
     model_b_label: str,
+    cpp_verbose: bool,
 ) -> dict:
 
     import players_ext
@@ -193,12 +211,13 @@ def _evaluate_cpp_model_vs_model(
 
     t0 = time.time()
     for gidx in range(int(eval_games)):
+        print(f"Eval game {gidx + 1}/{eval_games}... vs {model_a_label} and {model_b_label}")
         random.seed(int(eval_seed) + int(gidx))
 
         a_as_p0 = (gidx % 2 == 0)
 
-        p0 = MCTSPlayerCPP(0, n_rollouts=eval_rollouts, seed=gidx)
-        p1 = MCTSPlayerCPP(1, n_rollouts=eval_rollouts, seed=gidx + 1)
+        p0 = MCTSPlayerCPP(0, n_rollouts=eval_rollouts, seed=gidx, verbose=bool(cpp_verbose))
+        p1 = MCTSPlayerCPP(1, n_rollouts=eval_rollouts, seed=gidx + 1, verbose=bool(cpp_verbose))
 
         # disable exploration
         p0.set_exploration(dirichlet_alpha=0.0, dirichlet_epsilon=0.0, temperature=0.0, temperature_moves=0)
@@ -292,6 +311,12 @@ def main():
     p.add_argument('--eval-prev-rollouts', type=int, default=200, help='MCTS rollouts per move for previous-checkpoint evaluation')
     p.add_argument('--no-augment', action='store_true', help='Disable symmetric augmentation during conversion')
     p.add_argument('--backend', type=str, default='python', choices=['python', 'cpp'], help='MCTS backend for self-play/eval')
+    p.add_argument(
+        '--cpp-verbose',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='If --backend=cpp: enable verbose C++ MCTS logging.',
+    )
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -326,8 +351,20 @@ def main():
         saved_games_path = Path(saved_games_dir)
         saved_games_path.mkdir(parents=True, exist_ok=True)
 
-        evaluator_path = (Path(args.out_dir) / f'gnn_eval_iter_{i-1}.pt') if i > 1 else (Path(args.out_dir) / 'gnn_eval_balanced.pt')
-        model_path = str(evaluator_path) if evaluator_path.exists() else None
+        # Resolve the evaluator checkpoint used for self-play.
+        # When --out-dir is not the default 'checkpoints', we still want to be able to
+        # fall back to an existing balanced evaluator shipped in ./checkpoints.
+        candidates: list[Path] = []
+        out_dir_path = Path(args.out_dir)
+        default_ckpt_dir = Path('checkpoints')
+        if i > 1:
+            candidates.append(out_dir_path / f'gnn_eval_iter_{i-1}.pt')
+            candidates.append(default_ckpt_dir / f'gnn_eval_iter_{i-1}.pt')
+        candidates.append(out_dir_path / 'gnn_eval_balanced.pt')
+        candidates.append(default_ckpt_dir / 'gnn_eval_balanced.pt')
+
+        evaluator_path = next((p for p in candidates if p.exists()), None)
+        model_path = str(evaluator_path) if evaluator_path is not None else None
         play_self_play_games(
             num_games=args.games,
             mcts_rollouts=args.rollouts,
@@ -336,6 +373,7 @@ def main():
             model_path=model_path,
             device=args.device,
             backend=args.backend,
+            cpp_verbose=bool(args.cpp_verbose),
             temp=1.1
         )
 
@@ -464,6 +502,7 @@ def main():
                 eval_seed=int(args.eval_seed),
                 iteration=int(i),
                 model_path=str(gnn_eval_ckpt),
+                cpp_verbose=bool(args.cpp_verbose),
             )
 
             # Optional: ladder eval vs prior checkpoints (C++ backend only).
@@ -476,10 +515,10 @@ def main():
                     prev_n = int(args.eval_vs_prev)
                     prev_games = int(args.eval_prev_games)
                     prev_rollouts = int(args.eval_prev_rollouts)
-                    start_opp = max(1, int(i) - prev_n)
+                    start_opp = max(0, int(i) - prev_n)
                     vs_prev: dict[str, dict] = {}
                     for opp_iter in range(start_opp, int(i)):
-                        opp_ckpt = out_dir / f'gnn_eval_iter_{opp_iter}.pt'
+                        opp_ckpt = out_dir / f'gnn_eval_iter_{opp_iter}.pt' if opp_iter > 0 else out_dir / 'gnn_eval_balanced.pt'
                         if not opp_ckpt.exists():
                             continue
                         print(f"Evaluating vs checkpoint iter {opp_iter}...")
@@ -494,6 +533,7 @@ def main():
                             model_b_path=str(opp_ckpt),
                             model_a_label=f"iter_{i}",
                             model_b_label=f"iter_{opp_iter}",
+                            cpp_verbose=bool(args.cpp_verbose),
                         )
                         vs_prev[str(opp_iter)] = {
                             "wins": int(res["wins"]),

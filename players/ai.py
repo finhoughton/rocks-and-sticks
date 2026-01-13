@@ -509,7 +509,7 @@ class AlphaBetaPlayer(AIPlayer):
         move, _ = self.alpha_beta(game, self.depth, float("-inf"), float("inf"), True)
         return move
 
-    def alpha_beta(self, game: "Game", depth: int, a: float, b: float, maximising: bool) -> tuple[Move, float]:
+    def alpha_beta(self, game: Game, depth: int, a: float, b: float, maximising: bool) -> tuple[Move, float]:
         if depth == 0 or game.winner is not None:
             return (PASS, self._evaluate_position(game, self))
 

@@ -85,6 +85,7 @@ def play_self_play_games(
     seed_base: int | None = None,
     prune_size: int | None = None,
     backend: str = "python",
+    cpp_verbose: bool = False,
 ) -> None:
     save_path_factory = _next_save_path(save_games_dir)
     if seed_base is None:
@@ -109,12 +110,23 @@ def play_self_play_games(
         else:
             game = Game()
         moves_log: list[Move] = []
-        randomize_start(cast(Any, game), move_log=moves_log)
+        movers_log: list[int] = []
+        randomize_start(cast(Any, game), move_log=moves_log, mover_log=movers_log)
         if backend == "cpp":
             from players.mcts_cpp import MCTSPlayerCPP
             mcts_players = {
-                0: MCTSPlayerCPP(0, n_rollouts=mcts_rollouts if mcts_rollouts is not None else 1000, seed=seed_base + i),
-                1: MCTSPlayerCPP(1, n_rollouts=mcts_rollouts if mcts_rollouts is not None else 1000, seed=seed_base + i + 1),
+                0: MCTSPlayerCPP(
+                    0,
+                    n_rollouts=mcts_rollouts if mcts_rollouts is not None else 1000,
+                    seed=seed_base + i,
+                    verbose=cpp_verbose,
+                ),
+                1: MCTSPlayerCPP(
+                    1,
+                    n_rollouts=mcts_rollouts if mcts_rollouts is not None else 1000,
+                    seed=seed_base + i + 1,
+                    verbose=cpp_verbose,
+                ),
             }
 
             for p in mcts_players.values():
@@ -145,6 +157,7 @@ def play_self_play_games(
                 policy = _visits_to_policy(mcts, mcts._root_key)
             policy_targets.append(policy)
             moves_log.append(move)
+            movers_log.append(player_idx)
 
             game.do_move(game.current_player, move)
             for p_mcts in mcts_players.values():
@@ -157,7 +170,10 @@ def play_self_play_games(
         out_path = save_path_factory(i)
         payload = {
             "winner": game.winner,
-            "moves": [{"x": move.c[0], "y": move.c[1], "t": move.t} for move in moves_log],
+            "moves": [
+                {"x": move.c[0], "y": move.c[1], "t": move.t, "p": int(movers_log[j])}
+                for j, move in enumerate(moves_log)
+            ],
             "max_moves_reached": (len(game.moves) >= max_moves and game.winner is None),
             "policy_targets": policy_targets,
         }

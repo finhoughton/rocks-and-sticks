@@ -1,5 +1,6 @@
 #include "mcts.hpp"
 
+#include <cmath>
 #include <chrono>
 #include <iomanip>
 #include <iostream>
@@ -438,13 +439,24 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
 
         Move best = moves[0];
         double best_score = -1e300;
+        int tie_count = 0;
+        constexpr double SCORE_TIE_EPS = 1e-12;
         for (const auto &m : moves)
         {
             double score = Q(skey, m) + U(skey, m);
-            if (score > best_score || (score == best_score && move_less(m, best)))
+            if (score > best_score + SCORE_TIE_EPS)
             {
                 best_score = score;
                 best = m;
+                tie_count = 1;
+            }
+            else if (std::fabs(score - best_score) <= SCORE_TIE_EPS)
+            {
+                // Random tie-break (uniform among tied best) to avoid systematic drift on symmetric boards.
+                tie_count += 1;
+                std::uniform_int_distribution<int> uid(0, tie_count - 1);
+                if (uid(rng) == 0)
+                    best = m;
             }
         }
         return best;
@@ -527,16 +539,25 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
     std::vector<Move> ranked = it_moves->second;
     order_moves_inplace(ranked);
 
-    // Choose argmax visits (break ties deterministically)
+    // Choose argmax visits (break ties randomly but deterministically from RNG seed)
     Move best = ranked[0];
     int best_v = -1;
+    int tie_count = 0;
     for (const auto &m : ranked)
     {
         int v = visits(m);
-        if (v > best_v || (v == best_v && move_less(m, best)))
+        if (v > best_v)
         {
             best_v = v;
             best = m;
+            tie_count = 1;
+        }
+        else if (v == best_v)
+        {
+            tie_count += 1;
+            std::uniform_int_distribution<int> uid(0, tie_count - 1);
+            if (uid(rng) == 0)
+                best = m;
         }
     }
 
@@ -557,6 +578,21 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
 
     if (!safe_moves.empty())
     {
+        // If any move produces an immediate win for the current player, take it.
+        // This avoids random tie-breaks/exploration skipping forced wins.
+        {
+            GameState tmp = game;
+            const int mover = game.current_player;
+            for (const auto &m : safe_moves)
+            {
+                tmp.do_move(m, mover);
+                const bool is_immediate_win = (tmp.winner == mover);
+                tmp.undo_move();
+                if (is_immediate_win)
+                    return ret(m);
+            }
+        }
+
         const bool explore = (temperature > 0.0 && temperature_moves > 0 && game.turn_number < temperature_moves);
         if (explore)
         {
@@ -568,7 +604,28 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
             std::discrete_distribution<size_t> dd(weights.begin(), weights.end());
             return ret(safe_moves[dd(rng)]);
         }
-        return ret(safe_moves[0]);
+        // Greedy: pick among max-visit moves uniformly at random (seeded).
+        Move chosen = safe_moves[0];
+        int chosen_v = -1;
+        int chosen_ties = 0;
+        for (const auto &m : safe_moves)
+        {
+            int v = visits(m);
+            if (v > chosen_v)
+            {
+                chosen_v = v;
+                chosen = m;
+                chosen_ties = 1;
+            }
+            else if (v == chosen_v)
+            {
+                chosen_ties += 1;
+                std::uniform_int_distribution<int> uid(0, chosen_ties - 1);
+                if (uid(rng) == 0)
+                    chosen = m;
+            }
+        }
+        return ret(chosen);
     }
 
     for (const auto &m : ranked)

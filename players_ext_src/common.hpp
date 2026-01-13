@@ -156,4 +156,3 @@ constexpr Coord calc_end(Coord p, int d)
 {
     return {p.first + DIR_DELTAS[d][0], p.second + DIR_DELTAS[d][1]};
 }
-

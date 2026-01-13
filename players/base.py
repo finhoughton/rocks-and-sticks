@@ -103,8 +103,6 @@ class RandomPlayer(Player):
 
         moves = sorted((m for m in game.get_possible_moves(self.number) if m is not PASS), key=move_key)
         if not moves:
-            from models import PASS
-
             return PASS
         return self._rng.choice(moves)
 

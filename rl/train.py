@@ -417,7 +417,7 @@ def train(
 
             print(f"epoch {epoch+1}/{epochs} train_loss={avg_loss:.4f} val_loss={val_loss if val_loss is not None else 'NA'}")
             if out_path and val_loss is not None:
-                if best_val is None or val_loss < best_val:
+                if best_val is None or (val_loss * 0.96) < best_val:
                     torch.save(model.state_dict(), out_path)
                     best_val = val_loss
                     print(f"Saved best model to {out_path} (val_loss={best_val:.6f})")
