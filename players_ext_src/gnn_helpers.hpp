@@ -30,5 +30,6 @@ namespace players_ext_internal
         const py::list &encs,
         double *total_model_time,
         size_t *model_calls,
-        size_t *model_batch_items);
+        size_t *model_batch_items,
+        int verbose_level);
 } // namespace players_ext_internal

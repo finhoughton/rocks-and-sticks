@@ -25,8 +25,7 @@ namespace py = pybind11;
 using namespace py::literals;
 
 // Direction deltas: 0:N,1:E,2:NE,3:SE,4:NW,5:SW,6:W,7:S
-static const int DIR_DELTAS[8][2] = {
-    {0, 1}, {1, 0}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}, {-1, 0}, {0, -1}};
+constexpr static int DIR_DELTAS[8][2] = {{0, 1}, {1, 0}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}, {-1, 0}, {0, -1}};
 
 struct Move
 {

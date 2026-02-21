@@ -1,18 +1,25 @@
+import tempfile
+
 import players_ext
+import torch
 
 import game
 from gnn.encode import SAMPLE_ENC
 from gnn.game_generation import randomize_start
-from gnn.model import load_model
+from gnn.model import init_random_model
 from models import move_key
 from players.game_total import GameTotal
 from players.move_utils import to_py_move
+from rl.train import PolicyValueNet
 
 
 def _load_eval() -> None:
+    # Tests shouldn't depend on a specific on-disk checkpoint format.
+    # Use a deterministic randomly-initialized evaluator (GraphNorm-compatible).
+    torch.manual_seed(0)
     node_dim = SAMPLE_ENC.data.x.size(1)  # type: ignore
     global_dim = SAMPLE_ENC.data.global_feats.size(1)
-    load_model("checkpoints/gnn_eval_balanced.pt", node_dim, global_dim, device="cpu")
+    init_random_model(node_dim, global_dim, device="cpu")
 
 
 def test_cpp_engine_choose_move_is_python_legal_through_play():
@@ -26,6 +33,25 @@ def test_cpp_engine_choose_move_is_python_legal_through_play():
 
     e0 = players_ext.MCTSEngine(123)
     e1 = players_ext.MCTSEngine(456)
+    # For this unit test we don't need NN leaf values; disable to avoid loading a value model.
+    e0.set_use_nn_value(False)
+    e1.set_use_nn_value(False)
+
+    # Create and load a temporary policy checkpoint so the C++ engine can compute priors.
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tf:
+        node_dim = SAMPLE_ENC.data.x.size(1)
+        global_dim = SAMPLE_ENC.data.global_feats.size(1)
+        pol = PolicyValueNet(node_feat_dim=node_dim, global_feat_dim=global_dim, move_feat_dim=16)
+        torch.save(pol.state_dict(), tf.name)
+        e0.set_policy_checkpoint(tf.name, "cpu")
+        e1.set_policy_checkpoint(tf.name, "cpu")
+        # Also write and load a GNNEval checkpoint for the engine's value model.
+        from gnn.model import GNNEval
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as mf:
+            model = GNNEval(node_feat_dim=node_dim, global_feat_dim=global_dim)  # type: ignore[arg-type]
+            torch.save(model.state_dict(), mf.name)
+            e0.set_model_checkpoint(mf.name, "cpu")
+            e1.set_model_checkpoint(mf.name, "cpu")
 
     # Keep this test unit-speed: low rollouts, bounded moves.
     for _ in range(120):

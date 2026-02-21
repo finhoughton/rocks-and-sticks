@@ -114,7 +114,7 @@ def train(
                 val_pos_prob = v_pos_prob_sum / max(1e-12, v_pos_w)
                 val_neg_prob = v_neg_prob_sum / max(1e-12, v_neg_w)
                 if best_model_out is not None:
-                    if (best_val is None) or (val_loss < best_val):
+                    if (best_val is None) or (val_loss * 0.96 < best_val):
                         try:
                             torch.save(model.state_dict(), best_model_out)
                             best_val = float(val_loss)

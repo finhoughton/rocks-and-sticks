@@ -133,9 +133,15 @@ public:
     int best_new_cycle_area2(Node *start, Node *end, std::uint64_t &out_edge_key);
 
     bool is_move_legal(const Move &m, int player_number) const;
+    // Return true if applying `m` for `player_number` would succeed on a copy
+    // of this state (used for validation without mutating the original).
+    bool can_apply_move(const Move &m, int player_number) const;
     std::string explain_illegal_move(const Move &m, int player_number);
     void do_move(const Move &m, int player_number);
     void undo_move();
+
+    // Public wrapper for Python parity bonus in MCTS priors.
+    bool stick_between_opp_rocks_public(int player_number, const Move &mv) const;
 
     bool coord_in_claimed_region_cached(Coord c);
     bool coord_in_claimed_region(Coord start);
@@ -168,6 +174,15 @@ private:
 
 public:
     constexpr static int reverse_dir(int d) { return 7 - d; }
+    constexpr static int dir_from_delta(int dx, int dy)
+    {
+        for (int d = 0; d < 8; ++d)
+        {
+            if (DIR_DELTAS[d][0] == dx && DIR_DELTAS[d][1] == dy)
+                return d;
+        }
+        return -1;
+    }
     constexpr static int dir_from_name(char name)
     {
         switch (name)

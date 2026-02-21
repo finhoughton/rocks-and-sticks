@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch_geometric.data as Data
 from torch_geometric.nn import GINEConv, global_mean_pool  # type: ignore
+from torch_geometric.nn.norm import GraphNorm  # type: ignore
 
 from game import Game
 
@@ -15,7 +16,7 @@ if TYPE_CHECKING:
 from gnn.encode import EncodedGraph, encode_game_to_graph
 
 INIT_MEAN = 0.0
-INIT_STD = 0.1
+INIT_STD = 0.4
 
 def _init_parameters(module: nn.Module, mean: float = INIT_MEAN, std: float = INIT_STD) -> None:
     for p in module.parameters():
@@ -29,8 +30,8 @@ class GNNEval(nn.Module):
         self,
         node_feat_dim: int,
         global_feat_dim: int,
-        hidden: int = 256,
-        num_hidden_layers: int = 3,
+        hidden: int = 384,
+        num_hidden_layers: int = 5,
         dropout: float = 0.1,
     ) -> None:
         super().__init__() # type: ignore
@@ -42,7 +43,7 @@ class GNNEval(nn.Module):
         dims = [node_feat_dim] + [hidden] * num_hidden_layers
         edge_dim = 2  # [orth, diag]
         self.convs = nn.ModuleList([GINEConv(mlp(dims[i], dims[i + 1]), edge_dim=edge_dim) for i in range(num_hidden_layers)])
-        self.norms = nn.ModuleList([nn.BatchNorm1d(dims[i + 1]) for i in range(num_hidden_layers)])
+        self.norms = nn.ModuleList([GraphNorm(dims[i + 1]) for i in range(num_hidden_layers)])
 
         self.head = nn.Sequential(
             nn.Linear(hidden + global_feat_dim, hidden),
@@ -59,7 +60,7 @@ class GNNEval(nn.Module):
         for i, conv in enumerate(self.convs):
             h_in = h
             h = conv(h, edge_index, edge_attr)
-            h = self.norms[i](h)
+            h = self.norms[i](h, batch)
             h = F.relu(h)
             h = F.dropout(h, p=self.dropout_p, training=self.training)
             if h.shape == h_in.shape:

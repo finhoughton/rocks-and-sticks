@@ -272,7 +272,7 @@ double AlphaBetaEngine::gnn_prob_root(GameState &g)
     try
     {
         py::list probs_list = players_ext_internal::eval_probs_common(
-            py_mods, model_override, model_device, encs, &total_model_time, &model_calls, &model_batch_items);
+            py_mods, model_override, model_device, encs, &total_model_time, &model_calls, &model_batch_items, 0);
         p = (py::len(probs_list) > 0) ? py::cast<double>(probs_list[0]) : 0.5;
     }
     catch (const py::error_already_set &e)
@@ -300,7 +300,7 @@ std::vector<double> AlphaBetaEngine::gnn_probs_root_for_encodings(const py::list
     try
     {
         py::list probs_list = players_ext_internal::eval_probs_common(
-            py_mods, model_override, model_device, encs, &total_model_time, &model_calls, &model_batch_items);
+            py_mods, model_override, model_device, encs, &total_model_time, &model_calls, &model_batch_items, 0);
         for (auto v : probs_list)
             probs.push_back(py::cast<double>(v));
     }

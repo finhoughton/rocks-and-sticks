@@ -180,7 +180,8 @@ namespace players_ext_internal
         const py::list &encs,
         double *total_model_time,
         size_t *model_calls,
-        size_t *model_batch_items)
+        size_t *model_batch_items,
+        int verbose_level)
     {
         ensure_py_gnn_modules(mods);
         py::gil_scoped_acquire gil;
@@ -220,6 +221,46 @@ namespace players_ext_internal
         auto model_end = std::chrono::high_resolution_clock::now();
         if (total_model_time)
             *total_model_time += std::chrono::duration<double>(model_end - model_start).count();
+        if (verbose_level >= 2)
+        {
+            // Instrumentation: emit compact stats about returned probabilities.
+            try
+            {
+                size_t m = (size_t)py::len(out);
+                if (m > 0)
+                {
+                    double sum = 0.0, sumsq = 0.0;
+                    double minp = 1.0, maxp = 0.0;
+                    size_t sample_n = std::min<size_t>(m, 6);
+                    std::ostringstream os;
+                    os << "gnn.eval: m=" << m << " samples=[";
+                    for (size_t i = 0; i < m; ++i)
+                    {
+                        double p = py::cast<double>(out[i]);
+                        if (!std::isfinite(p))
+                            p = 0.0;
+                        p = std::max(0.0, std::min(1.0, p));
+                        sum += p;
+                        sumsq += p * p;
+                        minp = std::min(minp, p);
+                        maxp = std::max(maxp, p);
+                        if (i < sample_n)
+                        {
+                            if (i)
+                                os << ",";
+                            os << p;
+                        }
+                    }
+                    double mean = sum / (double)m;
+                    double var = std::max(0.0, sumsq / (double)m - mean * mean);
+                    os << "] min=" << minp << " max=" << maxp << " mean=" << mean << " var=" << var;
+                    std::cerr << os.str() << std::endl;
+                }
+            }
+            catch (const std::exception &)
+            {
+            }
+        }
         return out;
     }
 } // namespace players_ext_internal

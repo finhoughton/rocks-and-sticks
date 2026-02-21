@@ -25,11 +25,19 @@ class MCTSPlayerCPP(AIPlayer):
         n_rollouts: int = 1000,
         *,
         verbose: bool = False,
+        use_nn_value: bool = True,
     ) -> None:
 
         super().__init__(player_number, True)
         self.engine = players_ext.MCTSEngine(seed, c_puct)
-        self.engine.set_verbose(bool(verbose))
+        # Accept bool or int for backward compatibility; map to verbosity level.
+        try:
+            vlevel = int(verbose)
+        except Exception:
+            vlevel = 1 if bool(verbose) else 0
+        self.engine.set_verbose_level(vlevel)
+        # AlphaZero-style: use NN value at leaves (in addition to priors).
+        self.engine.set_use_nn_value(bool(use_nn_value))
         self.n_rollouts = int(n_rollouts)
 
     @property
@@ -38,6 +46,11 @@ class MCTSPlayerCPP(AIPlayer):
 
     def get_move(self, game: GameProtocol, reuse_tree: bool = False) -> PyMove:
         assert isinstance(game, GameTotal), "MCTSPlayerCPP requires GameTotal wrapper"
+        if not reuse_tree:
+            # Match Python MCTSPlayer semantics: when reuse_tree=False, drop all
+            # accumulated search statistics (but keep the loaded model).
+            self.engine.reset_search()
+            self.engine.clear_root_priors()
         best_move = self.engine.choose_move(game.cpp, self.n_rollouts)
         py_move = to_py_move(best_move)
 
@@ -71,6 +84,11 @@ class MCTSPlayerCPP(AIPlayer):
 
     def advance_root(self, move: PyMove, game: GameProtocol) -> None:
         assert isinstance(game, GameTotal), "MCTSPlayerCPP requires GameTotal wrapper"
+        # WARNING: Tree reuse (advance_root) is currently buggy and reduces strength by ~15-20%.
+        # Do NOT call this method in evaluation or training. Always reset search with reset_search().
+        # See diagnostics: fresh search 89% win rate vs 70% with tree reuse (both 5000 rollouts).
+        # TODO: Fix advance_root by validating the new root exists in transposition table,
+        # or by properly rebuilding tree structure after moves.
         self.engine.advance_root(game.cpp)
 
     def prune_tables(self, max_states: int) -> None:
@@ -93,6 +111,14 @@ class MCTSPlayerCPP(AIPlayer):
 
     def set_model_checkpoint(self, path: str, device: str = "cpu") -> None:
         self.engine.set_model_checkpoint(str(path), str(device))
+
+    def set_policy_checkpoint(self, path: str, device: str = "cpu") -> None:
+        # Optional: use PolicyValueNet policy head as priors.
+        self.engine.set_policy_checkpoint(str(path), str(device))
+
+    def set_seed(self, seed: int) -> None:
+        # Used by self-play to reuse engines across games while keeping runs deterministic.
+        self.engine.set_seed(int(seed))
 
     def reset_search(self) -> None:
         self.engine.reset_search()

@@ -315,7 +315,7 @@ class Game:
     def __deepcopy__(self, memo: dict[int, object]) -> Game:
         # Deepcopy is used by MCTS to create a private working game.
         # copying matplotlib objects can cause bugs, skip them.
-        
+
         result: Game = type(self).__new__(type(self))
         memo[id(self)] = result
 

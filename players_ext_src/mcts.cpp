@@ -4,30 +4,41 @@
 #include <chrono>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <fstream>
 
 MCTSEngine::MCTSEngine(int seed, double c_puct_)
-    : rng(seed),
-      c_puct(c_puct_),
-      progressive_widening_c(1.6),
-      progressive_widening_alpha(0.55),
-      rave_k(250.0),
-      prior_eval_cap(48),
-      max_sim_depth(50),
-      check_forced_losses(true),
-      tactical_root_limit(20)
+        : rng(seed),
+            c_puct(c_puct_),
+            progressive_widening_c(1.6),
+            progressive_widening_alpha(0.55),
+            rave_k(250.0),
+            prior_eval_cap(48),
+            max_sim_depth(20),
+            check_forced_losses(true),
+            tactical_root_limit(20),
+            rock_prior_bonus_connected(1.5),
+            rock_prior_bonus_disconnected(0.06),
+            stick_between_opp_rocks_bonus(0.4)
 {
-    // silence when running as test
-    verbose = (std::getenv("PYTEST_CURRENT_TEST") == nullptr);
+    // Default to silent; tests won't be noisy. Use set_verbose_level() to adjust.
+    verbose_level = 0;
+}
+
+void MCTSEngine::set_seed(int seed)
+{
+    rng.seed((std::uint32_t)seed);
 }
 
 Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
 {
     auto &game = const_cast<GameState &>(root);
+    const int root_player = game.current_player;
 
     const auto t_start = std::chrono::high_resolution_clock::now();
     auto ret = [&](const Move &mv) -> Move
     {
-        if (verbose)
+        if (verbose_level >= 1)
         {
             const auto t_end = std::chrono::high_resolution_clock::now();
             const double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
@@ -133,11 +144,11 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
 
     auto move_less = [](const Move &a, const Move &b) -> bool
     {
+        if (a.t != b.t)
+            return a.t < b.t;
         if (a.x != b.x)
             return a.x < b.x;
-        if (a.y != b.y)
-            return a.y < b.y;
-        return a.t < b.t;
+        return a.y < b.y;
     };
 
     auto ensure_state_initialized = [&](const TTKey &skey, GameState &g)
@@ -154,28 +165,6 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
         }
 
         auto &moves = it_existing->second;
-
-        // The move list is cached by TTKey (transposition table). In practice, we've observed
-        // rare cases where the cached list can become inconsistent with the current state's
-        // geometry due to incremental caches on the GameState side. To be robust, we re-check
-        // legality before using cached moves.
-        if (!moves.empty())
-        {
-            bool any_illegal = false;
-            for (auto &m : moves)
-            {
-                if (!g.is_move_legal(m, g.current_player))
-                {
-                    any_illegal = true;
-                    break;
-                }
-            }
-            if (any_illegal)
-            {
-                log_stage("stage2_regen_moves_due_to_illegal");
-                moves = g.get_possible_moves_for_player(g.current_player);
-            }
-        }
     };
 
     auto visits = [&](const Move &m) -> int
@@ -191,7 +180,7 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
         auto itN = Nsa.find(ek);
         auto itW = Wsa.find(ek);
         if (itN == Nsa.end() || itW == Wsa.end() || itN->second == 0)
-            return 0.0;
+            return 0.5; // neutral prior value for unseen edges (match Python)
         return itW->second / (double)itN->second;
     };
 
@@ -204,6 +193,10 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
         auto itR = root_priors.find(mk_of(m));
         if (itR != root_priors.end())
             return itR->second;
+        // Fallback to uniform prior (match Python behavior).
+        auto it_moves = legal_moves.find(s);
+        if (it_moves != legal_moves.end() && !it_moves->second.empty())
+            return 1.0 / (double)it_moves->second.size();
         return 0.0;
     };
 
@@ -220,6 +213,15 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
             N_sa = itNsa->second;
         double p = P(s, m);
         return c_puct * p * std::sqrt((double)(N_s + 1)) / (double)(1 + N_sa);
+    };
+
+    auto temper_prob = [](double p) -> double
+    {
+        p = std::max(1e-6, std::min(1.0 - 1e-6, p));
+        double logit = std::log(p / (1.0 - p));
+        logit *= 0.5; // match Python's logit/2 tempering
+        double prob2 = 1.0 / (1.0 + std::exp(-logit));
+        return std::max(0.0, std::min(1.0, prob2));
     };
 
     auto random_shuffle_moves = [&](std::vector<Move> &moves)
@@ -276,13 +278,17 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
 
     auto order_moves_inplace = [&](std::vector<Move> &moves)
     {
+        // Order moves to match Python's `move_key` ordering: primary by
+        // move-type token `t` (lexical), then x, then y. Python sorts by
+        // `(m.t, m.c[0], m.c[1])` so use the same comparator here to ensure
+        // the deterministic prefix selection aligns between backends.
         std::sort(moves.begin(), moves.end(), [&](const Move &a, const Move &b)
                   {
-					  int ra = move_type_rank(a);
-					  int rb = move_type_rank(b);
-					  if (ra != rb)
-						  return ra < rb;
-					  return move_less(a, b); });
+                      if (a.t != b.t)
+                          return a.t < b.t;
+                      if (a.x != b.x)
+                          return a.x < b.x;
+                      return a.y < b.y; });
     };
 
     auto rollout = [&](GameState &g, int root_player) -> int
@@ -352,77 +358,552 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
         const size_t n_cand = std::min(cap, moves.size());
         std::vector<Move> candidates;
         candidates.reserve(n_cand);
-        for (size_t i = 0; i < n_cand; ++i)
-            candidates.push_back(moves[i]);
 
-        std::vector<Move> filtered = tactical_filter(candidates, g);
-        order_moves_inplace(filtered);
-
-        try
+        // Candidate selection: match Python MCTS deterministic behavior.
+        // Take the first `prior_eval_cap` moves in deterministic order and
+        // include up to 12 additional rock moves from the remainder. Avoid
+        // random sampling here to keep deterministic evals reproducible and
+        // consistent with the Python engine.
+        if (n_cand == moves.size())
         {
-            py::list encs;
-            std::vector<Move> used;
-            used.reserve(filtered.size());
-            for (auto &m : filtered)
+            candidates = moves;
+        }
+        else
+        {
+            // Ensure deterministic ordering of the full move list, then take
+            // a prefix plus optional extra rock moves from the tail.
+            std::vector<Move> ordered = moves;
+            order_moves_inplace(ordered);
+
+            size_t take = std::min(n_cand, ordered.size());
+            for (size_t i = 0; i < take; ++i)
+                candidates.push_back(ordered[i]);
+
+            // Collect up to 12 extra rock moves from the remainder, like Python.
+            std::vector<Move> extra_rocks;
+            for (size_t i = take; i < ordered.size() && extra_rocks.size() < 12; ++i)
+            {
+                if (ordered[i].t == 'R')
+                    extra_rocks.push_back(ordered[i]);
+            }
+            if (!extra_rocks.empty())
+            {
+                candidates.insert(candidates.end(), extra_rocks.begin(), extra_rocks.end());
+            }
+        }
+
+        // Match Python: do not apply tactical filtering to the candidate set
+        // prior to policy evaluation; evaluate the deterministic prefix (and
+        // extra rocks) directly. Use candidates directly without re-sorting,
+        // since it is already built from sorted moves (prefix + extra rocks).
+        std::vector<Move> filtered = candidates;
+
+        std::vector<Move> used;
+        used.reserve(filtered.size());
+        std::vector<double> priors;
+        // acquire GIL
+        py::gil_scoped_acquire gil;
+
+        players_ext_internal::ensure_py_gnn_modules(py_mods);
+
+        if (verbose_level >= 2)
+        {
+            std::cerr << "MCTS prior eval: prior_eval_cap=" << prior_eval_cap
+                      << " candidates=" << candidates.size()
+                      << " filtered=" << filtered.size() << std::endl;
+            std::cerr << "MCTS prior eval: policy_model_override=" << (!policy_model_override.is_none())
+                      << " model_override=" << (!model_override.is_none()) << std::endl;
+        }
+
+        // Policy-head priors: if a policy model is available, evaluate the current
+        // state once and score candidate moves via the policy head's softmax.
+        // This is much faster than the value-child path (one NN call vs N).
+        if (!policy_model_override.is_none())
+        {
+            // Build move features for ALL legal moves (policy head handles all in one pass).
+            std::vector<Move> policy_used;
+            policy_used.reserve(moves.size());
+            py::list policy_move_feats;
+            for (auto &m : moves)
             {
                 if (!g.is_move_legal(m, g.current_player))
                     continue;
-                int mover = g.current_player;
-                struct UndoGuard
+                policy_used.push_back(m);
+
+                const double x = (double)m.x;
+                const double y = (double)m.y;
+                const double is_p = (m.t == 'P') ? 1.0 : 0.0;
+                const double is_r = (m.t == 'R') ? 1.0 : 0.0;
+
+                int dir_idx = -1;
+                double dx = 0.0;
+                double dy = 0.0;
+                double end_x = x;
+                double end_y = y;
+                std::array<double, 8> onehot{};
+                onehot.fill(0.0);
+
+                if (!is_p && !is_r)
                 {
-                    GameState *g;
-                    bool active;
-                    explicit UndoGuard(GameState &gs) : g(&gs), active(true) {}
-                    ~UndoGuard()
+                    dir_idx = GameState::dir_from_name(m.t);
+                    if (dir_idx >= 0 && dir_idx < 8)
                     {
-                        if (active)
-                            g->undo_move();
+                        dx = (double)DIR_DELTAS[dir_idx][0];
+                        dy = (double)DIR_DELTAS[dir_idx][1];
+                        end_x = x + dx;
+                        end_y = y + dy;
+                        onehot[(size_t)dir_idx] = 1.0;
                     }
-                } undo_guard(g);
+                }
 
-                g.do_move(m, mover);
-                py::object enc_obj = players_ext_internal::encode_state_common(g, py_mods, enc_cache, ENC_CACHE_MAX, &total_encode_time);
-                encs.append(enc_obj);
-                used.push_back(m);
+                policy_move_feats.append(py::make_tuple(
+                    x, y, is_p, is_r, end_x, end_y, dx, dy,
+                    onehot[0], onehot[1], onehot[2], onehot[3],
+                    onehot[4], onehot[5], onehot[6], onehot[7]));
             }
-            if ((size_t)py::len(encs) == 0)
+
+            if (policy_used.empty())
+            {
+                if (verbose_level >= 2)
+                    std::cerr << "MCTS prior eval (policy head): no legal moves." << std::endl;
                 return;
-
-            py::list probs_list = players_ext_internal::eval_probs_common(py_mods, model_override, model_device, encs, &total_model_time, nullptr, nullptr);
-            const size_t n = (size_t)py::len(probs_list);
-            if (n != used.size())
-                return;
-
-            // Convert list of probs into priors and store in Psa.
-            double sum_p = 0.0;
-            std::vector<double> probs;
-            probs.reserve(n);
-            for (size_t i = 0; i < n; ++i)
-            {
-                double p = py::cast<double>(probs_list[i]);
-                p = std::max(0.0, std::min(1.0, p));
-                probs.push_back(p);
-                sum_p += p;
-            }
-            if (sum_p <= 0.0)
-            {
-                // fallback uniform
-                sum_p = (double)n;
-                for (double &p : probs)
-                    p = 1.0;
             }
 
-            for (size_t i = 0; i < n; ++i)
+            // Encode the current state (not children).
+            py::object enc = players_ext_internal::encode_state_common(
+                g, py_mods, enc_cache, ENC_CACHE_MAX, &total_encode_time);
+
+            policy_prior_calls += 1;
+            policy_prior_items += policy_used.size();
+
+            try
             {
-                EdgeKey ek{skey, mk_of(used[i])};
-                Psa[ek] = probs[i] / sum_p;
+                auto t0 = std::chrono::high_resolution_clock::now();
+                py::object policy_infer = py::module::import("rl.policy_infer");
+                py::list softmax_priors = policy_infer.attr("policy_priors_from_enc_and_moves")(
+                    policy_model_override, enc, policy_move_feats,
+                    py::cast(policy_model_device));
+                auto t1 = std::chrono::high_resolution_clock::now();
+                policy_total_time += std::chrono::duration<double>(t1 - t0).count();
+
+                const size_t np = (size_t)py::len(softmax_priors);
+                if (np != policy_used.size())
+                {
+                    if (verbose_level >= 1)
+                        std::cerr << "MCTS policy head: size mismatch " << np
+                                  << " vs " << policy_used.size() << std::endl;
+                    return;
+                }
+
+                // Mix with uniform prior for exploration robustness.
+                const double uniform_p = 1.0 / (double)policy_used.size();
+                for (size_t i = 0; i < np; ++i)
+                {
+                    double p = py::cast<double>(softmax_priors[i]);
+                    if (!std::isfinite(p) || p < 0.0)
+                        p = 0.0;
+                    // Apply prior_mix_uniform blending.
+                    p = (1.0 - prior_mix_uniform) * p + prior_mix_uniform * uniform_p;
+                    // Scale by prior_scale.
+                    // (prior_scale acts on the non-uniform portion; applied after mix for simplicity.)
+
+                    EdgeKey ek{skey, mk_of(policy_used[i])};
+                    Psa[ek] = p;
+                }
+
+                if (verbose_level >= 2)
+                {
+                    std::cerr << "MCTS prior eval (policy head): priors:";
+                    for (size_t i = 0; i < np; ++i)
+                    {
+                        const Move &um = policy_used[i];
+                        std::cerr << " (" << um.x << "," << um.y << "," << um.t
+                                  << ")=" << Psa[EdgeKey{skey, mk_of(um)}];
+                    }
+                    std::cerr << std::endl;
+                }
+            }
+            catch (const std::exception &e)
+            {
+                if (verbose_level >= 1)
+                    std::cerr << "MCTS policy head error: " << e.what() << std::endl;
+                // Fall through to re-set uniform priors on failure.
+                const double p = 1.0 / (double)moves.size();
+                for (const auto &m : moves)
+                    Psa[EdgeKey{skey, mk_of(m)}] = p;
+            }
+
+            // Re-order moves by prior (best first) for progressive widening.
+            std::vector<std::pair<Move, double>> all_with_p;
+            all_with_p.reserve(moves.size());
+            for (const auto &m : moves)
+            {
+                double p = Psa[EdgeKey{skey, mk_of(m)}];
+                all_with_p.emplace_back(m, p);
+            }
+            std::sort(all_with_p.begin(), all_with_p.end(), [&](const auto &a, const auto &b)
+                      {
+                          if (a.second != b.second)
+                              return a.second > b.second;
+                          return move_less(a.first, b.first); });
+
+            std::vector<Move> new_moves;
+            new_moves.reserve(moves.size());
+            for (auto &pr : all_with_p)
+            {
+                if (pr.first.t != 'P')
+                    new_moves.push_back(pr.first);
+            }
+            for (auto &pr : all_with_p)
+            {
+                if (pr.first.t == 'P')
+                    new_moves.push_back(pr.first);
+            }
+            moves.swap(new_moves);
+
+            apply_dirichlet_noise(skey, moves);
+            return;  // Done — skip the value-child path below.
+        }
+
+        // ---- Value-child fallback path (no policy model available) ----
+        py::list probs_list;
+
+        // Build move feature list and used move vector for the policy path.
+        // We'll collect legal `used` moves and their features first, then
+        // construct the Python `cand_list` from `used` so instrumentation
+        // preserves the exact ordering/mapping sent to the NN.
+        py::list move_feats;
+        for (auto &m : filtered)
+        {
+            if (!g.is_move_legal(m, g.current_player))
+                continue;
+            used.push_back(m);
+
+            const double x = (double)m.x;
+            const double y = (double)m.y;
+            const double is_p = (m.t == 'P') ? 1.0 : 0.0;
+            const double is_r = (m.t == 'R') ? 1.0 : 0.0;
+
+            int dir_idx = -1;
+            double dx = 0.0;
+            double dy = 0.0;
+            double end_x = x;
+            double end_y = y;
+            std::array<double, 8> onehot{};
+            onehot.fill(0.0);
+
+            if (!is_p && !is_r)
+            {
+                dir_idx = GameState::dir_from_name(m.t);
+                if (dir_idx >= 0 && dir_idx < 8)
+                {
+                    dx = (double)DIR_DELTAS[dir_idx][0];
+                    dy = (double)DIR_DELTAS[dir_idx][1];
+                    end_x = x + dx;
+                    end_y = y + dy;
+                    onehot[(size_t)dir_idx] = 1.0;
+                }
+            }
+
+            move_feats.append(py::make_tuple(
+                x,
+                y,
+                is_p,
+                is_r,
+                end_x,
+                end_y,
+                dx,
+                dy,
+                onehot[0],
+                onehot[1],
+                onehot[2],
+                onehot[3],
+                onehot[4],
+                onehot[5],
+                onehot[6],
+                onehot[7]));
+        }
+
+        // Build candidate instrumentation list from the actual `used` moves
+        // (legal and ordered) so offline comparisons index correctly.
+        py::list cand_list;
+        try
+        {
+            for (const auto &cm : used)
+            {
+                cand_list.append(py::make_tuple(cm.x, cm.y, std::string(1, cm.t)));
             }
         }
         catch (const std::exception &e)
         {
-            if (verbose)
-                std::cerr << "MCTS prior eval error: " << e.what() << std::endl;
+            if (verbose_level >= 1)
+                std::cerr << "Policy candidate instrumentation error: " << e.what() << std::endl;
         }
+
+        if (used.empty())
+        {
+            if (verbose_level >= 2)
+                std::cerr << "MCTS prior eval: no usable moves after filtering (used.empty())." << std::endl;
+            return;
+        }
+
+        prior_model_calls += 1;
+        prior_model_batch_items += used.size();
+
+        py::list eval_encs;
+        for (const auto &m : used)
+        {
+            g.do_move(m, g.current_player);
+            eval_encs.append(players_ext_internal::encode_state_common(g, py_mods, enc_cache, ENC_CACHE_MAX, &total_encode_time));
+            g.undo_move();
+        }
+
+        try
+        {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            probs_list = players_ext_internal::eval_probs_common(
+                py_mods,
+                model_override,
+                model_device,
+                eval_encs,
+                &total_model_time,
+                &value_model_calls,
+                &value_model_batch_items,
+                verbose_level);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            policy_total_time += std::chrono::duration<double>(t1 - t0).count();
+
+            const size_t m = (size_t)py::len(probs_list);
+            if (m != used.size())
+                return;
+
+            priors.reserve(m);
+            for (size_t i = 0; i < m; ++i)
+            {
+                double p = py::cast<double>(probs_list[i]);
+                if (!std::isfinite(p))
+                    p = 0.0;
+                p = std::max(0.0, std::min(1.0, p));
+                // Flip: NN returns P(opponent wins | child_state) since the
+                // child's current_player is the opponent of the mover.
+                // We want the prior to reflect P(mover wins | this move).
+                p = 1.0 - p;
+                // Apply rock prior bonus similar to Python MCTS for evaluated moves.
+                if (used[i].t == 'R')
+                {
+                    Coord cc{used[i].x, used[i].y};
+                    auto itnode = g.points.find(GameState::key_from_coord(cc));
+                    double bonus = rock_prior_bonus_disconnected;
+                    if (itnode != g.points.end())
+                    {
+                        Node *n = itnode->second.get();
+                        bool connected = false;
+                        for (auto *cn : g.connected_points)
+                        {
+                            if (cn == n)
+                            {
+                                connected = true;
+                                break;
+                            }
+                        }
+                        if (connected)
+                            bonus = rock_prior_bonus_connected;
+                    }
+                    p = std::min(0.999, p + bonus);
+                }
+                else if (g.stick_between_opp_rocks_public(g.current_player, used[i]))
+                {
+                    p = std::min(0.999, p + stick_between_opp_rocks_bonus);
+                }
+                priors.push_back(p);
+            }
+            if (verbose_level >= 2)
+            {
+                std::cerr << "MCTS prior eval: evaluated priors:";
+                for (size_t i = 0; i < priors.size(); ++i)
+                {
+                    const Move &um = used[i];
+                    std::cerr << " (" << um.x << "," << um.y << "," << um.t << ")=" << priors[i];
+                }
+                std::cerr << std::endl;
+            }
+        }
+        catch (const std::exception &e)
+        {
+            if (verbose_level >= 1)
+                std::cerr << "MCTS prior eval error (value path): " << e.what() << std::endl;
+            throw;
+        }
+
+        const size_t n = used.size();
+        if (n == 0 || priors.size() != n)
+            return;
+
+        // Adjust pass probability (reduce pass relative to others), matching Python.
+        if (moves.size() > 1)
+        {
+            double min_p_local = std::numeric_limits<double>::infinity();
+            for (double p : priors)
+                min_p_local = std::min(min_p_local, p);
+            if (!std::isfinite(min_p_local) || min_p_local <= 0.0)
+                min_p_local = 0.01;
+            double pass_p = std::max(1e-6, 0.05 * min_p_local);
+            for (size_t i = 0; i < n; ++i)
+            {
+                if (used[i].t == 'P')
+                    priors[i] = pass_p;
+            }
+        }
+
+        // Build full raw prior scores across all legal moves (Python-style):
+        // - use NN policy probs for evaluated `used` moves (already adjusted for rocks),
+        // - assign a small floor to unevaluated moves (with rock bonus where applicable),
+        // - reduce `pass` probability relative to min prior, then normalize.
+        std::unordered_map<MoveKey, double, MoveKeyHash> raw_map;
+        raw_map.reserve(moves.size() * 2);
+
+        // Map evaluated moves
+        for (size_t i = 0; i < n; ++i)
+            raw_map[mk_of(used[i])] = priors[i];
+
+        // Determine baseline floor from evaluated priors
+        double min_prior = std::numeric_limits<double>::infinity();
+        for (double p : priors)
+            min_prior = std::min(min_prior, p);
+        if (!std::isfinite(min_prior) || min_prior <= 0.0)
+            min_prior = 0.01;
+        const double floor_p = std::max(0.005, 0.25 * min_prior);
+
+        // Assign baseline to unevaluated moves (apply rock bonus if applicable)
+        for (const auto &m : moves)
+        {
+            MoveKey k = mk_of(m);
+            if (raw_map.find(k) != raw_map.end())
+                continue;
+            double p = floor_p;
+            if (m.t == 'R')
+            {
+                Coord cc{m.x, m.y};
+                auto itnode = g.points.find(GameState::key_from_coord(cc));
+                double bonus = rock_prior_bonus_disconnected;
+                if (itnode != g.points.end())
+                {
+                    Node *nnode = itnode->second.get();
+                    bool connected = false;
+                    for (auto *cn : g.connected_points)
+                    {
+                        if (cn == nnode)
+                        {
+                            connected = true;
+                            break;
+                        }
+                    }
+                    if (connected)
+                        bonus = rock_prior_bonus_connected;
+                }
+                p = std::min(0.999, p + bonus);
+            }
+            else if (g.stick_between_opp_rocks_public(g.current_player, m))
+            {
+                p = std::min(0.999, p + stick_between_opp_rocks_bonus);
+            }
+            raw_map[k] = p;
+        }
+
+        // Pass adjustment: reduce pass probability relative to min prior
+        if (moves.size() > 1)
+        {
+            double min_p_all = std::numeric_limits<double>::infinity();
+            for (const auto &m : moves)
+            {
+                double rp = raw_map[mk_of(m)];
+                min_p_all = std::min(min_p_all, rp);
+            }
+            if (!std::isfinite(min_p_all) || min_p_all <= 0.0)
+                min_p_all = 0.01;
+            double pass_p = std::max(1e-6, 0.05 * min_p_all);
+            for (const auto &m : moves)
+            {
+                if (m.t == 'P')
+                    raw_map[mk_of(m)] = pass_p;
+            }
+        }
+
+        // Normalize and store into Psa
+        double total_score = 0.0;
+        for (const auto &m : moves)
+            total_score += raw_map[mk_of(m)];
+        if (total_score <= 0.0)
+            total_score = (double)moves.size();
+
+        std::vector<std::pair<Move, double>> all_with_p;
+        all_with_p.reserve(moves.size());
+        for (const auto &m : moves)
+        {
+            double p = raw_map[mk_of(m)] / total_score;
+            EdgeKey ek{skey, mk_of(m)};
+            Psa[ek] = p;
+            all_with_p.emplace_back(m, p);
+        }
+
+        // Instrumentation: also dump the full raw_map and final normalized Psa
+        // so we can compare C++ post-policy processing with Python.
+        try
+        {
+            py::dict rec2;
+            rec2["ts"] = py::module::import("time").attr("time")();
+            rec2["turn"] = g.turn_number;
+            py::list raw_list;
+            py::list psa_list;
+            for (const auto &m : moves)
+            {
+                MoveKey k = mk_of(m);
+                double rawv = 0.0;
+                auto itrm = raw_map.find(k);
+                if (itrm != raw_map.end())
+                    rawv = itrm->second;
+                double normv = Psa[EdgeKey{skey, k}];
+                py::tuple tup = py::make_tuple(m.x, m.y, std::string(1, m.t), rawv, normv);
+                raw_list.append(tup);
+                psa_list.append(normv);
+            }
+            rec2["raw_map"] = raw_list;
+            rec2["Psa"] = psa_list;
+            // Also include the candidate list in the post-process dump to aid
+            // offline analysis linking `raw_map`/`Psa` to the original candidates.
+            rec2["candidates"] = cand_list;
+            // Disabled: this logging grows very large
+            // py::object json = py::module::import("json");
+            // std::string s2 = py::cast<std::string>(json.attr("dumps")(rec2, py::arg("ensure_ascii")=false));
+            // std::ofstream ofs2("logs/cpp_policy_calls.jsonl", std::ios::app);
+            // if (ofs2)
+            //     ofs2 << s2 << std::endl;
+        }
+        catch (const std::exception &e)
+        {
+            if (verbose_level >= 1)
+                std::cerr << "Policy post-process instrumentation error: " << e.what() << std::endl;
+        }
+
+        std::sort(all_with_p.begin(), all_with_p.end(), [&](const auto &a, const auto &b)
+                  {
+                          if (a.second != b.second)
+                              return a.second > b.second;
+                          return move_less(a.first, b.first); });
+
+        std::vector<Move> new_moves;
+        new_moves.reserve(moves.size());
+        for (auto &pr : all_with_p)
+        {
+            if (pr.first.t != 'P')
+                new_moves.push_back(pr.first);
+        }
+        for (auto &pr : all_with_p)
+        {
+            if (pr.first.t == 'P')
+                new_moves.push_back(pr.first);
+        }
+        moves.swap(new_moves);
 
         apply_dirichlet_noise(skey, moves);
     };
@@ -435,27 +916,57 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
         if (it == legal_moves.end() || it->second.empty())
             return Move{0, 0, 'P'};
         auto &moves = it->second;
-        random_shuffle_moves(moves);
+
+        // progressive widening
+        size_t k = moves.size();
+        auto itNs = Ns.find(skey);
+        const int ns = (itNs == Ns.end()) ? 0 : itNs->second;
+        if (progressive_widening_c > 0.0 && progressive_widening_alpha > 0.0)
+        {
+            double kk = progressive_widening_c * std::pow((double)(ns + 1), progressive_widening_alpha);
+            size_t k2 = (size_t)std::ceil(kk);
+            size_t min_k = 1;
+            if (skey == root_key && moves.size() > 1)
+                min_k = 6;
+            k = std::min(moves.size(), std::max(min_k, k2));
+        }
 
         Move best = moves[0];
         double best_score = -1e300;
-        int tie_count = 0;
         constexpr double SCORE_TIE_EPS = 1e-12;
-        for (const auto &m : moves)
+        for (size_t i = 0; i < k; ++i)
         {
-            double score = Q(skey, m) + U(skey, m);
+            const auto &m = moves[i];
+            EdgeKey ek{skey, mk_of(m)};
+            int nsa = 0;
+            auto itNsa = Nsa.find(ek);
+            if (itNsa != Nsa.end())
+                nsa = itNsa->second;
+
+            double q_ucb = Q(skey, m);
+            double q = q_ucb;
+            if (rave_k > 0.0 && skey == root_key)
+            {
+                auto itNa = N_amaf.find(ek);
+                auto itWa = W_amaf.find(ek);
+                if (itNa != N_amaf.end() && itWa != W_amaf.end() && itNa->second > 0)
+                {
+                    double q_amaf = itWa->second / (double)itNa->second;
+                    double beta = rave_k / (rave_k + (double)nsa);
+                    q = (1.0 - beta) * q_ucb + beta * q_amaf;
+                }
+            }
+
+            double score = q + U(skey, m);
             if (score > best_score + SCORE_TIE_EPS)
             {
                 best_score = score;
                 best = m;
-                tie_count = 1;
             }
             else if (std::fabs(score - best_score) <= SCORE_TIE_EPS)
             {
-                // Random tie-break (uniform among tied best) to avoid systematic drift on symmetric boards.
-                tie_count += 1;
-                std::uniform_int_distribution<int> uid(0, tie_count - 1);
-                if (uid(rng) == 0)
+                // Deterministic tie-break: choose smallest move_key (match Python).
+                if (move_less(m, best))
                     best = m;
             }
         }
@@ -468,13 +979,32 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
         EdgeKey ek{s, mk_of(m)};
         Nsa[ek] += 1;
         Wsa[ek] += value;
-
-        // AMAF/RAVE
-        N_amaf[ek] += 1;
-        W_amaf[ek] += value;
     };
 
-    auto simulate_one = [&](GameState &g, int root_player)
+    auto backup_path = [&](const std::vector<std::pair<TTKey, Move>> &path, double leaf_value)
+    {
+        // leaf_value is from the perspective of the player to move at the leaf.
+        // The last entry in the path was made by the OPPONENT of leaf_player,
+        // so we must flip before the first update.
+        double value = leaf_value;
+        for (auto it = path.rbegin(); it != path.rend(); ++it)
+        {
+            value = 1.0 - value;
+            update(it->first, it->second, value);
+        }
+    };
+
+    struct PendingValueEval
+    {
+        TTKey leaf_key;
+        py::object enc;
+        std::vector<std::pair<TTKey, Move>> path;
+        int leaf_player = 0;
+    };
+
+    constexpr size_t VALUE_BATCH_TARGET = 16;
+
+    auto simulate_one = [&](GameState &g, int root_player, PendingValueEval *pending_out) -> bool
     {
         std::vector<std::pair<TTKey, Move>> path;
         path.reserve(64);
@@ -484,15 +1014,10 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
             TTKey skey = g.tt_key();
             ensure_state_initialized(skey, g);
 
-            auto itNs = Ns.find(skey);
-            const int ns = (itNs == Ns.end()) ? 0 : itNs->second;
-            if (ns == 0)
-                break;
-
             Move m = select(skey, g);
             if (!g.is_move_legal(m, g.current_player))
             {
-                if (verbose)
+                if (verbose_level >= 2)
                     std::cerr << "Illegal cached move: " << explain_illegal(m, g.current_player) << std::endl;
                 // regenerate legal moves and try again
                 legal_moves[skey] = g.get_possible_moves_for_player(g.current_player);
@@ -504,6 +1029,11 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
             path.emplace_back(skey, m);
             int mover = g.current_player;
             g.do_move(m, mover);
+
+            EdgeKey ek{skey, mk_of(m)};
+            auto itNsa = Nsa.find(ek);
+            if (itNsa == Nsa.end() || itNsa->second == 0)
+                break;
         }
 
         // leaf: expand + rollout
@@ -511,26 +1041,229 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
         ensure_state_initialized(leaf_key, g);
         maybe_eval_priors(leaf_key, g);
 
-        int winner = rollout(g, root_player);
-        double value = (winner == -1) ? 0.0 : ((winner == root_player) ? 1.0 : -1.0);
+        // Leaf value from the perspective of the player to move at the leaf.
+        const int leaf_player = g.current_player;
+        double value = 0.0;
 
-        for (auto it = path.rbegin(); it != path.rend(); ++it)
+        if (g.winner != -1)
         {
-            update(it->first, it->second, value);
-            value = -value;
+            value = (g.winner == leaf_player) ? 1.0 : 0.0;
         }
+        else if (use_nn_value)
+        {
+            auto itV = V.find(leaf_key);
+            if (itV != V.end())
+            {
+                // V stores P(player-to-move wins) = leaf_player's perspective.
+                value = itV->second;
+            }
+            else
+            {
+                if (model_override.is_none())
+                {
+                    throw std::runtime_error("MCTS value eval error: use_nn_value enabled but no value model loaded; call set_model_checkpoint(path, device)");
+                }
+
+                if (pending_out)
+                {
+                    // Defer NN value evaluation so we can batch multiple leaf requests.
+                    pending_out->leaf_key = leaf_key;
+                    pending_out->enc = players_ext_internal::encode_state_common(g, py_mods, enc_cache, ENC_CACHE_MAX, &total_encode_time);
+                    pending_out->path = std::move(path);
+                    pending_out->leaf_player = leaf_player;
+                    return true;
+                }
+                else
+                {
+                    // Fallback: immediate (unbatched) value evaluation.
+                    double v_leaf = 0.0;
+                    try
+                    {
+                        py::list encs;
+                        encs.append(players_ext_internal::encode_state_common(g, py_mods, enc_cache, ENC_CACHE_MAX, &total_encode_time));
+                        py::list probs_list = players_ext_internal::eval_probs_common(
+                            py_mods,
+                            model_override,
+                            model_device,
+                            encs,
+                            &total_model_time,
+                            &value_model_calls,
+                            &value_model_batch_items,
+                            verbose_level);
+                        if ((size_t)py::len(probs_list) == 1)
+                        {
+                            double p = py::cast<double>(probs_list[0]);
+                            p = std::max(0.0, std::min(1.0, p));
+                            v_leaf = temper_prob(p);
+                        }
+                    }
+                    catch (const std::exception &e)
+                    {
+                        if (verbose_level >= 1)
+                            std::cerr << "MCTS value eval error: " << e.what() << std::endl;
+                        throw;
+                    }
+                    if (value_calibration_enabled)
+                    {
+                        v_leaf = value_calibration_a * v_leaf + value_calibration_b;
+                        v_leaf = std::max(0.0, std::min(1.0, v_leaf));
+                    }
+                    V[leaf_key] = v_leaf;
+                    // v_leaf is P(leaf_player wins) — pass leaf perspective to backup.
+                    value = v_leaf;
+                }
+            }
+        }
+        else
+        {
+            int winner = rollout(g, root_player);
+            value = (winner == -1) ? 0.5 : ((winner == leaf_player) ? 1.0 : 0.0);
+        }
+
+        // AMAF/RAVE update for root moves (match Python behavior).
+        if (!path.empty())
+        {
+            double root_reward = (leaf_player == root_player) ? value : (1.0 - value);
+            for (const auto &pm : path)
+            {
+                const TTKey &ps = pm.first;
+                if (ps.current_player != root_player)
+                    continue;
+                EdgeKey ek{root_key, mk_of(pm.second)};
+                N_amaf[ek] += 1;
+                W_amaf[ek] += root_reward;
+            }
+        }
+
+        backup_path(path, value);
+        return false;
     };
 
     // Main rollout loop
     ensure_state_initialized(root_key, game);
     maybe_eval_priors(root_key, game);
 
+    std::vector<PendingValueEval> pending_vals;
+    pending_vals.reserve(VALUE_BATCH_TARGET * 2);
+
+    auto flush_pending_values = [&]()
+    {
+        if (pending_vals.empty())
+            return;
+        try
+        {
+            py::list encs;
+            for (auto &pv : pending_vals)
+                encs.append(pv.enc);
+
+            py::list probs_list = players_ext_internal::eval_probs_common(
+                py_mods,
+                model_override,
+                model_device,
+                encs,
+                &total_model_time,
+                &value_model_calls,
+                &value_model_batch_items,
+                verbose_level);
+
+            // Instrumentation: compute basic stats on returned probabilities
+            // to help diagnose value-model issues (ordering, collapse to const,
+            // device-mismatch, etc.). This prints a compact summary to stderr.
+            if (verbose_level >= 2)
+            {
+                try
+                {
+                    const size_t n = (size_t)py::len(probs_list);
+                    if (n > 0)
+                    {
+                        double sum = 0.0, sumsq = 0.0;
+                        double minp = 1.0, maxp = 0.0;
+                        size_t sample_n = std::min<size_t>(n, 8);
+                        std::vector<double> samples;
+                        samples.reserve(sample_n);
+                        for (size_t i = 0; i < n; ++i)
+                        {
+                            double p = py::cast<double>(probs_list[i]);
+                            if (!std::isfinite(p))
+                                p = 0.0;
+                            p = std::max(0.0, std::min(1.0, p));
+                            sum += p;
+                            sumsq += p * p;
+                            minp = std::min(minp, p);
+                            maxp = std::max(maxp, p);
+                            if (i < sample_n)
+                                samples.push_back(p);
+                        }
+                        double mean = sum / (double)n;
+                        double var = std::max(0.0, sumsq / (double)n - mean * mean);
+                        std::ostringstream os;
+                        os << "MCTS value-batch: n=" << n << " min=" << minp << " max=" << maxp << " mean=" << mean << " var=" << var << " samples=[";
+                        for (size_t i = 0; i < samples.size(); ++i)
+                        {
+                            if (i)
+                                os << ",";
+                            os << samples[i];
+                        }
+                        os << "]";
+                        std::cerr << os.str() << std::endl;
+                    }
+                }
+                catch (const std::exception &)
+                {
+                    // Non-fatal: continue even if logging fails.
+                }
+            }
+
+            const size_t n = (size_t)py::len(probs_list);
+            if (n == pending_vals.size())
+            {
+                for (size_t i = 0; i < n; ++i)
+                {
+                    double p = py::cast<double>(probs_list[i]);
+                    if (!std::isfinite(p))
+                        p = 0.0;
+                    p = std::max(0.0, std::min(1.0, p));
+                    double v_leaf = temper_prob(p);
+                    if (value_calibration_enabled)
+                    {
+                        v_leaf = value_calibration_a * v_leaf + value_calibration_b;
+                        v_leaf = std::max(0.0, std::min(1.0, v_leaf));
+                    }
+                    const TTKey leaf_key = pending_vals[i].leaf_key;
+                    V[leaf_key] = v_leaf;
+                    // v_leaf is P(leaf_player wins) — pass leaf perspective to backup.
+                    backup_path(pending_vals[i].path, v_leaf);
+                }
+            }
+            else
+            {
+                throw std::runtime_error("MCTS value batch eval error: model returned unexpected number of results");
+            }
+        }
+        catch (const std::exception &e)
+        {
+            if (verbose_level >= 1)
+                std::cerr << "MCTS value batch eval error: " << e.what() << std::endl;
+            throw;
+        }
+        pending_vals.clear();
+    };
+
     for (int i = 0; i < n_rollouts; ++i)
     {
         GameState g_copy = game;
-        simulate_one(g_copy, game.current_player);
+        PendingValueEval pv;
+        const bool pending = simulate_one(g_copy, root_player, use_nn_value ? &pv : nullptr);
+        if (pending)
+        {
+            pending_vals.push_back(std::move(pv));
+            if (pending_vals.size() >= VALUE_BATCH_TARGET)
+                flush_pending_values();
+        }
         log_rollout("rollout", i, (int)Ns.size(), (int)Nsa.size(), (int)legal_moves.size(), enc_cache.size());
     }
+
+    flush_pending_values();
 
     auto it_moves = legal_moves.find(root_key);
     if (it_moves == legal_moves.end() || it_moves->second.empty())
@@ -640,7 +1373,16 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
 }
 
 void MCTSEngine::set_c_puct(double v) { c_puct = v; }
-void MCTSEngine::set_verbose(bool v) { verbose = v; }
+void MCTSEngine::set_verbose(bool v) { verbose_level = v ? 1 : 0; }
+void MCTSEngine::set_verbose_level(int v) { verbose_level = std::max(0, v); }
+void MCTSEngine::set_use_nn_value(bool v) { use_nn_value = v; }
+
+void MCTSEngine::py_set_value_calibration(double a, double b, bool enabled)
+{
+    value_calibration_a = a;
+    value_calibration_b = b;
+    value_calibration_enabled = enabled;
+}
 
 void MCTSEngine::set_progressive_widening(double c, double alpha)
 {
@@ -649,6 +1391,11 @@ void MCTSEngine::set_progressive_widening(double c, double alpha)
 }
 
 void MCTSEngine::set_rave_k(double v) { rave_k = v; }
+
+void MCTSEngine::py_set_prior_params(double mix_uniform, double scale)
+{
+    set_prior_params(mix_uniform, scale);
+}
 void MCTSEngine::set_prior_eval_cap(int v) { prior_eval_cap = v; }
 void MCTSEngine::set_max_sim_depth(int v) { max_sim_depth = v; }
 void MCTSEngine::clear_root_priors() { root_priors.clear(); }
@@ -680,6 +1427,22 @@ void MCTSEngine::set_model_checkpoint(const std::string &path, const std::string
 
     model_override = model;
     model_device = device;
+
+    // Search caches are model-dependent.
+    clear_stats();
+}
+
+void MCTSEngine::set_policy_checkpoint(const std::string &path, const std::string &device)
+{
+    py::gil_scoped_acquire gil;
+
+    players_ext_internal::ensure_py_gnn_modules(py_mods);
+
+    py::object policy_infer = py::module::import("rl.policy_infer");
+    py::object model = policy_infer.attr("load_policy_model")(py::cast(path), py::cast(device));
+
+    policy_model_override = model;
+    policy_model_device = device;
 
     // Search caches are model-dependent.
     clear_stats();
@@ -729,6 +1492,123 @@ py::list MCTSEngine::get_root_visit_stats_py(const GameState &root)
     return out;
 }
 
+py::list MCTSEngine::get_root_priors_py(const GameState &root)
+{
+    auto &game = const_cast<GameState &>(root);
+    TTKey root_key = game.tt_key();
+
+    const std::vector<Move> *moves_ptr = nullptr;
+    std::vector<Move> tmp;
+    auto it = legal_moves.find(root_key);
+    if (it != legal_moves.end())
+    {
+        moves_ptr = &it->second;
+    }
+    else
+    {
+        tmp = game.get_possible_moves_for_player(game.current_player);
+        moves_ptr = &tmp;
+    }
+
+    py::list out;
+    for (const auto &m : *moves_ptr)
+    {
+        EdgeKey ek{root_key, MoveKey{m.x, m.y, m.t}};
+        double p = 0.0;
+        auto itp = Psa.find(ek);
+        if (itp != Psa.end())
+            p = itp->second;
+        auto itr = root_priors.find(MoveKey{m.x, m.y, m.t});
+        if (itr != root_priors.end())
+            p = itr->second;
+
+        py::dict d;
+        d["x"] = m.x;
+        d["y"] = m.y;
+        d["t"] = py::cast(std::string(1, m.t));
+        d["prior"] = p;
+        out.append(d);
+    }
+    return out;
+}
+
+py::list MCTSEngine::get_root_values_py(const GameState &root)
+{
+    auto &game = const_cast<GameState &>(root);
+    TTKey root_key = game.tt_key();
+
+    std::vector<GameState> copies;
+    std::vector<Move> moves_list;
+
+    auto it = legal_moves.find(root_key);
+    if (it == legal_moves.end())
+    {
+        // fallback: get possible moves
+        std::vector<Move> tmp = game.get_possible_moves_for_player(game.current_player);
+        for (const auto &m : tmp)
+        {
+            GameState gcopy = game;
+            gcopy.do_move(m, gcopy.current_player);
+            copies.push_back(std::move(gcopy));
+            moves_list.push_back(m);
+        }
+    }
+    else
+    {
+        for (const auto &m : it->second)
+        {
+            GameState gcopy = game;
+            gcopy.do_move(m, gcopy.current_player);
+            copies.push_back(std::move(gcopy));
+            moves_list.push_back(m);
+        }
+    }
+
+    py::list out;
+    if (copies.empty())
+        return out;
+
+    try
+    {
+        py::gil_scoped_acquire gil;
+        players_ext_internal::ensure_py_gnn_modules(py_mods);
+        py::list encs;
+        for (auto &gc : copies)
+            encs.append(players_ext_internal::encode_state_common(gc, py_mods, enc_cache, ENC_CACHE_MAX, &total_encode_time));
+
+        py::list probs_list = players_ext_internal::eval_probs_common(
+            py_mods,
+            model_override,
+            model_device,
+            encs,
+            &total_model_time,
+            &value_model_calls,
+            &value_model_batch_items,
+            verbose_level);
+
+        const size_t n = (size_t)py::len(probs_list);
+        for (size_t i = 0; i < n && i < moves_list.size(); ++i)
+        {
+            double p = py::cast<double>(probs_list[i]);
+            if (!std::isfinite(p))
+                p = 0.0;
+            p = std::max(0.0, std::min(1.0, p));
+            py::dict d;
+            d["x"] = moves_list[i].x;
+            d["y"] = moves_list[i].y;
+            d["t"] = py::cast(std::string(1, moves_list[i].t));
+            d["prob"] = p;
+            out.append(d);
+        }
+    }
+    catch (const std::exception &e)
+    {
+        if (verbose_level >= 1)
+            std::cerr << "get_root_values error: " << e.what() << std::endl;
+    }
+    return out;
+}
+
 void MCTSEngine::set_root_priors_py(py::iterable priors)
 {
     root_priors.clear();
@@ -756,11 +1636,22 @@ void MCTSEngine::clear_stats()
     W_amaf.clear();
     legal_moves.clear();
     expanded_count.clear();
+    V.clear();
     enc_cache.clear();
     _root_key = 0;
 
     total_encode_time = 0.0;
     total_model_time = 0.0;
+
+    policy_total_time = 0.0;
+
+    prior_model_calls = 0;
+    prior_model_batch_items = 0;
+    value_model_calls = 0;
+    value_model_batch_items = 0;
+
+    policy_prior_calls = 0;
+    policy_prior_items = 0;
 }
 
 py::dict MCTSEngine::get_profile_stats()
@@ -768,12 +1659,24 @@ py::dict MCTSEngine::get_profile_stats()
     py::dict d;
     d["total_encode_time"] = total_encode_time;
     d["total_model_time"] = total_model_time;
+    d["prior_model_calls"] = prior_model_calls;
+    d["prior_model_batch_items"] = prior_model_batch_items;
+    d["value_model_calls"] = value_model_calls;
+    d["value_model_batch_items"] = value_model_batch_items;
+    d["policy_priors_enabled"] = !policy_model_override.is_none();
+    d["policy_prior_calls"] = policy_prior_calls;
+    d["policy_prior_items"] = policy_prior_items;
+    d["policy_total_time"] = policy_total_time;
+    d["use_nn_value"] = use_nn_value;
     return d;
 }
 
 void MCTSEngine::advance_root(const GameState &game)
 {
     _root_key = ttkey_digest(game.tt_key());
+    // Clear old root priors since they're invalid for the new position.
+    // This prevents stale policy estimates from polluting the new search.
+    root_priors.clear();
 }
 
 void MCTSEngine::prune_tables(int max_states)
