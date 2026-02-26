@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gnn_helpers.hpp"
+#include "heuristic_eval.hpp"
 
 class MCTSEngine
 {
@@ -35,6 +36,15 @@ public:
     // instead of relying purely on random rollouts.
     void set_use_nn_value(bool v);
 
+    // If true, use heuristic_evaluate at leaf nodes instead of random rollouts.
+    // This is faster than NN and FAR better than random rollouts.
+    // When both use_nn_value and use_heuristic_rollout are set, NN takes priority.
+    void set_use_heuristic_rollout(bool v);
+
+    // Set the sigmoid temperature for converting heuristic scores to probabilities.
+    // Higher = more uncertain (closer to 0.5). Default = 6.0.
+    void set_heuristic_temperature(double t);
+
     // Set linear calibration parameters (a,b) and enable/disable calibration.
     void py_set_value_calibration(double a, double b, bool enabled);
 
@@ -65,6 +75,8 @@ private:
     // Verbosity level: 0 = silent, 1 = summaries (choose_move), 2 = detailed (prior eval, encodings)
     int verbose_level = 0;
     bool use_nn_value = true;
+    bool use_heuristic_rollout = false;
+    double heuristic_temperature = 6.0;
     double progressive_widening_c;
     double progressive_widening_alpha;
     double rave_k;

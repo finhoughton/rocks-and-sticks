@@ -58,8 +58,8 @@ def main() -> None:
         "--game-type",
         type=str,
         default="ab-vs-random",
-        choices=["ab-vs-random", "mcts-vs-random", "mcts-vs-mcts", "greedy-vs-greedy", "random-vs-random"],
-        help="game type to generate (ab-vs-random [default], mcts-vs-random, mcts-vs-mcts, greedy-vs-greedy, random-vs-random)",
+        choices=["ab-vs-random", "ab-vs-ab", "mcts-vs-random", "mcts-vs-mcts", "greedy-vs-greedy", "random-vs-random"],
+        help="game type to generate (ab-vs-random [default], ab-vs-ab, mcts-vs-random, mcts-vs-mcts, greedy-vs-greedy, random-vs-random)",
     )
     parser.add_argument(
         "--ab-depth",
@@ -118,6 +118,24 @@ def main() -> None:
         help="Optional RNG seed for balancing resampling",
     )
     parser.add_argument(
+        "--soft-labels",
+        action="store_true",
+        default=False,
+        help="Use AB handcrafted eval as soft labels (knowledge distillation)",
+    )
+    parser.add_argument(
+        "--soft-label-blend",
+        type=float,
+        default=0.7,
+        help="Blend factor for soft labels: (1-b)*outcome + b*soft_eval (default: 0.7)",
+    )
+    parser.add_argument(
+        "--soft-label-temperature",
+        type=float,
+        default=3.0,
+        help="Temperature for sigmoid(score/T) conversion of AB eval to probability (default: 3.0)",
+    )
+    parser.add_argument(
         "--plot-loss",
         action="store_true",
         help="save a PNG of train/val loss curves",
@@ -165,6 +183,8 @@ def main() -> None:
 
     if args.game_type == "ab-vs-random":
         player_factories: list[Callable[[int], Player]] = [ab_factory, randomish_factory]
+    elif args.game_type == "ab-vs-ab":
+        player_factories = [ab_factory, ab_factory]
     elif args.game_type == "mcts-vs-random":
         player_factories = [mcts_factory, randomish_factory]
     elif args.game_type == "mcts-vs-mcts":
@@ -187,7 +207,8 @@ def main() -> None:
         val_dataset = []
     else:
         # Only training, not generating new games
-        print("Loading balanced dataset from saved_games_ab2, saved_games_mcts, saved_games_human...")
+        extra_dirs = ["saved_games_ab_vs_ab"]
+        print("Loading balanced dataset from saved_games_ab2, saved_games_mcts, saved_games_human + extras...")
         samples = load_balanced_saved_game_samples(
             "saved_games_ab2",
             "saved_games_mcts",
@@ -195,6 +216,10 @@ def main() -> None:
             balance_classes=args.balance_classes,
             balance_strategy=args.balance_strategy,
             balance_seed=args.balance_seed,
+            soft_labels=args.soft_labels,
+            soft_label_blend=args.soft_label_blend,
+            soft_label_temperature=args.soft_label_temperature,
+            extra_dirs=extra_dirs,
         )
         idx = list(range(len(samples)))
         random.shuffle(idx)

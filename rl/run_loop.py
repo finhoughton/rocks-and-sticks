@@ -747,6 +747,7 @@ def main():
     p.add_argument('--train-steps-per-epoch', type=int, default=0, help='If >0, cap training batches per epoch in subprocess (stability on MPS)')
     p.add_argument('--out-dir', default='checkpoints')
     p.add_argument('--init-eval-model', type=str, default=None, help='Evaluator checkpoint to use for iteration 1 self-play, If not provided, a random-initialized GNNEval checkpoint is created/used in --out-dir.')
+    p.add_argument('--init-policy-from', type=str, default=None, help='Checkpoint to warm-start the PolicyValueNet from at iteration 1. Accepts a GNNEval or PolicyValueNet checkpoint (GNNEval value head keys are remapped automatically).')
     p.add_argument(
         '--auto-init-policy',
         action='store_true',
@@ -1040,6 +1041,12 @@ def main():
             prev_ckpt = out_dir / f'gnn_az_iter_{i-1}.pt'
             if prev_ckpt.exists():
                 init_from = str(prev_ckpt)
+        elif i == 1 and args.init_policy_from is not None:
+            cand = Path(str(args.init_policy_from))
+            if not cand.exists():
+                raise FileNotFoundError(f"--init-policy-from not found: {cand}")
+            init_from = str(cand)
+            print(f"Iteration 1: warm-starting PolicyValueNet from {init_from}")
 
         # Run training in a fresh process so macOS/MPS cached memory is released when training finishes.
         gc.collect()
@@ -1068,6 +1075,8 @@ def main():
             '--init-from',
             str(init_from) if init_from is not None else '',
         ]
+
+        dev = str(args.device)
 
         # Short smoke diagnostic run: 1 epoch, capped steps (100), small batch,
         # write per-batch diagnostics to logs/run_loop_diagnostics.json. Run this
@@ -1116,7 +1125,6 @@ def main():
             # remove the last two items: ['--init-from', '']
             train_cmd = train_cmd[:-2]
         # Speed: enable AMP automatically on mps/cuda.
-        dev = str(args.device)
         if dev == 'mps' or dev.startswith('cuda'):
             train_cmd.append('--amp')
         # Speed: allow DataLoader workers for faster collation.

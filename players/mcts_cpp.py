@@ -26,6 +26,8 @@ class MCTSPlayerCPP(AIPlayer):
         *,
         verbose: bool = False,
         use_nn_value: bool = True,
+        use_heuristic_rollout: bool = False,
+        heuristic_temperature: float = 6.0,
     ) -> None:
 
         super().__init__(player_number, True)
@@ -38,6 +40,14 @@ class MCTSPlayerCPP(AIPlayer):
         self.engine.set_verbose_level(vlevel)
         # AlphaZero-style: use NN value at leaves (in addition to priors).
         self.engine.set_use_nn_value(bool(use_nn_value))
+        # Heuristic rollout: use handcrafted eval at leaf nodes instead of random rollouts.
+        # Much stronger than random rollouts when no NN is available.
+        if use_heuristic_rollout:
+            self.engine.set_use_heuristic_rollout(True)
+            self.engine.set_heuristic_temperature(float(heuristic_temperature))
+            if not use_nn_value:
+                # No NN at all — use uniform priors
+                self.engine.set_prior_eval_cap(0)
         self.n_rollouts = int(n_rollouts)
 
     @property

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <stdexcept>
 #include <unordered_set>
@@ -10,6 +11,148 @@ AlphaBetaEngine::AlphaBetaEngine(int seed, double pass_penalty)
     : rng((seed == 0) ? std::mt19937(std::random_device{}()) : std::mt19937((std::uint32_t)seed)),
       pass_penalty(pass_penalty)
 {
+    // Zero-initialize killer moves and history tables
+    for (int p = 0; p < MAX_PLY; ++p)
+    {
+        killers[p][0] = Move{0, 0, 'P'};
+        killers[p][1] = Move{0, 0, 'P'};
+    }
+    std::memset(history, 0, sizeof(history));
+}
+
+// ---- Search enhancement helpers ----
+
+bool AlphaBetaEngine::is_time_up() const
+{
+    if (search_time_limit_ms <= 0) return false;
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - search_start).count();
+    return elapsed >= search_time_limit_ms;
+}
+
+std::uint32_t AlphaBetaEngine::move_hash(const Move &m)
+{
+    // Simple hash for indexing into the history table
+    std::uint32_t h = (std::uint32_t)(m.x + 50) * 101 + (std::uint32_t)(m.y + 50);
+    h = h * 257 + (std::uint32_t)(unsigned char)m.t;
+    return h & (HISTORY_MAX - 1);
+}
+
+void AlphaBetaEngine::update_killers(int ply, const Move &m)
+{
+    if (ply >= MAX_PLY) return;
+    // Don't store pass as killer
+    if (m.t == 'P') return;
+    // Don't store if already killer[0]
+    if (killers[ply][0].x == m.x && killers[ply][0].y == m.y && killers[ply][0].t == m.t)
+        return;
+    killers[ply][1] = killers[ply][0];
+    killers[ply][0] = m;
+}
+
+bool AlphaBetaEngine::is_killer(int ply, const Move &m) const
+{
+    if (ply >= MAX_PLY) return false;
+    return (killers[ply][0].x == m.x && killers[ply][0].y == m.y && killers[ply][0].t == m.t) ||
+           (killers[ply][1].x == m.x && killers[ply][1].y == m.y && killers[ply][1].t == m.t);
+}
+
+void AlphaBetaEngine::update_history(int player, const Move &m, int depth)
+{
+    if (m.t == 'P') return;
+    std::uint32_t idx = move_hash(m);
+    history[player][idx] += depth * depth;
+    // Prevent overflow
+    if (history[player][idx] > 1000000)
+    {
+        for (int i = 0; i < HISTORY_MAX; ++i)
+            history[player][i] >>= 1;
+    }
+}
+
+bool AlphaBetaEngine::has_scoring_move(GameState &g, int player)
+{
+    // Quick check: does the given player have a move that scores immediately.
+    int before_score = g.players_scores[player];
+    for (Node *cp : g.connected_points)
+    {
+        if (!can_place(cp, player)) continue;
+        if (g.coord_in_claimed_region_cached(cp->c())) continue;
+        for (int d = 0; d < 8; ++d)
+        {
+            if (cp->neighbours[d] != nullptr) continue;
+            if (g.intersects_stick(cp->c(), d)) continue;
+            Coord end_c = calc_end(cp->c(), d);
+            if (g.coord_in_claimed_region_cached(end_c)) continue;
+            Move mv{cp->x, cp->y, GameState::dir_name_char(d)};
+            if (!g.is_move_legal(mv, player)) continue;
+            g.do_move(mv, player);
+            bool scored = (g.players_scores[player] > before_score) || (g.winner == player);
+            g.undo_move();
+            if (scored) return true;
+        }
+    }
+    return false;
+}
+
+void AlphaBetaEngine::order_moves_enhanced(std::vector<Move> &moves, GameState &g, int ply, bool maximising)
+{
+    // Enhanced move ordering:
+    // 1. TT best move (highest priority)
+    // 2. Killer moves
+    // 3. Remaining sorted by: type rank, then history score
+    TTKey key = g.tt_key();
+    Move tt_move{0, 0, '\0'};  // sentinel
+    auto tt_it = tt.find(key);
+    if (tt_it != tt.end())
+        tt_move = tt_it->second.best;
+
+    int current_player = g.current_player;
+
+    // Assign a sort score to each move
+    struct ScoredMove
+    {
+        Move m;
+        int priority;  // higher = searched first
+    };
+    std::vector<ScoredMove> scored;
+    scored.reserve(moves.size());
+
+    for (auto &m : moves)
+    {
+        int pri = 0;
+        if (tt_move.t != '\0' && m.x == tt_move.x && m.y == tt_move.y && m.t == tt_move.t)
+        {
+            pri = 1000000000; // TT best move — always first
+        }
+        else if (is_killer(ply, m))
+        {
+            pri = 500000000; // Killers second
+        }
+        else
+        {
+            // Base priority by type
+            if (m.t == 'P')
+                pri = -100000000;
+            else if (m.t == 'R')
+                pri = 0;
+            else
+                pri = 100000; // sticks
+
+            // Add history bonus
+            std::uint32_t idx = move_hash(m);
+            pri += history[current_player][idx];
+        }
+        scored.push_back({m, pri});
+    }
+
+    std::stable_sort(scored.begin(), scored.end(), [](const ScoredMove &a, const ScoredMove &b)
+    {
+        return a.priority > b.priority;
+    });
+
+    for (size_t i = 0; i < moves.size(); ++i)
+        moves[i] = scored[i].m;
 }
 
 Move AlphaBetaEngine::choose_move(const GameState &root, int depth, int move_cap)
@@ -99,6 +242,226 @@ Move AlphaBetaEngine::choose_move(const GameState &root, int depth, int move_cap
     return best_move;
 }
 
+std::vector<std::pair<Move, double>> AlphaBetaEngine::choose_move_with_values(
+    const GameState &root, int depth, int move_cap)
+{
+    auto &game = const_cast<GameState &>(root);
+
+    struct RngGuard
+    {
+        GameState &g;
+        std::mt19937 snapshot;
+        explicit RngGuard(GameState &gs) : g(gs), snapshot(gs.rng_snapshot()) {}
+        ~RngGuard() { g.rng_restore(snapshot); }
+    } rng_guard(game);
+
+    root_player = game.current_player;
+    if (last_root_player != -1 && root_player != last_root_player)
+    {
+        tt.clear();
+        eval_cache.clear();
+    }
+    last_root_player = root_player;
+    this->move_cap = std::max(1, move_cap);
+
+    auto moves = game.get_possible_moves_for_player(game.current_player);
+    if (!moves.empty())
+        moves = filter_search_moves(moves, game, game.current_player);
+    order_moves_inplace(moves);
+    if ((int)moves.size() > this->move_cap)
+        moves.resize((size_t)this->move_cap);
+
+    std::vector<std::pair<Move, double>> results;
+    for (auto &m : moves)
+    {
+        if (!game.is_move_legal(m, game.current_player))
+            continue;
+        int mover = game.current_player;
+        game.do_move(m, mover);
+        double v = alpha_beta(game, depth - 1, -1e300, 1e300);
+        game.undo_move();
+        if (m.t == 'P')
+            v -= pass_penalty;
+        results.push_back({m, v});
+    }
+    // Sort by descending value
+    std::sort(results.begin(), results.end(),
+              [](const auto &a, const auto &b) { return a.second > b.second; });
+    return results;
+}
+
+Move AlphaBetaEngine::choose_move_iterative(const GameState &root, int max_depth, int time_limit_ms, int move_cap)
+{
+    auto &game = const_cast<GameState &>(root);
+
+    struct RngGuard
+    {
+        GameState &g;
+        std::mt19937 snapshot;
+        explicit RngGuard(GameState &gs) : g(gs), snapshot(gs.rng_snapshot()) {}
+        ~RngGuard() { g.rng_restore(snapshot); }
+    } rng_guard(game);
+
+    if (max_depth <= 0)
+    {
+        auto moves = game.get_possible_moves_for_player(game.current_player);
+        if (moves.empty())
+            return Move{0, 0, 'P'};
+        return moves[0];
+    }
+
+    root_player = game.current_player;
+    if (last_root_player != -1 && root_player != last_root_player)
+    {
+        tt.clear();
+        eval_cache.clear();
+    }
+    last_root_player = root_player;
+    this->move_cap = std::max(1, move_cap);
+
+    nodes_searched = 0;
+    search_aborted = false;
+    search_start = std::chrono::steady_clock::now();
+    search_time_limit_ms = time_limit_ms;
+
+    for (int p = 0; p < MAX_PLY; ++p)
+    {
+        killers[p][0] = Move{0, 0, 'P'};
+        killers[p][1] = Move{0, 0, 'P'};
+    }
+
+    {
+        auto moves = game.get_possible_moves_for_player(game.current_player);
+        order_moves_inplace(moves);
+        for (auto &m : moves)
+        {
+            game.do_move(m, game.current_player);
+            if (game.winner == root_player)
+            {
+                game.undo_move();
+                last_depth_completed = 1;
+                last_nodes_searched = 1;
+                return m;
+            }
+            game.undo_move();
+        }
+    }
+
+    auto moves = game.get_possible_moves_for_player(game.current_player);
+    if (!moves.empty())
+        moves = filter_search_moves(moves, game, game.current_player);
+    if (moves.empty())
+        return Move{0, 0, 'P'};
+
+    order_moves_inplace(moves);
+    if ((int)moves.size() > this->move_cap)
+        moves.resize((size_t)this->move_cap);
+
+    // NN ordering at root level for better initial move ordering
+    if (native_nn_.is_loaded())
+    {
+        bool root_maximising = (game.current_player == root_player);
+        order_moves_by_native_nn(moves, game, root_maximising);
+    }
+
+    Move best_move_overall = moves[0];
+    int depth_completed = 0;
+
+    // Iterative deepening
+    for (int depth = 1; depth <= max_depth; ++depth)
+    {
+        if (is_time_up())
+            break;
+
+        Move best_move_this_depth = moves[0];
+        double best_value = -1e300;
+        double alpha = -1e300;
+        double beta = 1e300;
+        bool completed_this_depth = true;
+
+        for (size_t i = 0; i < moves.size(); ++i)
+        {
+            auto &m = moves[i];
+            if (!game.is_move_legal(m, game.current_player))
+                continue;
+
+            int mover = game.current_player;
+            game.do_move(m, mover);
+
+            double v;
+            if (i == 0)
+            {
+                // First move: full window PVS search
+                v = alpha_beta_pvs(game, depth - 1, 1, alpha, beta, true, 0);
+            }
+            else
+            {
+                // PVS: null-window search for subsequent moves
+                v = alpha_beta_pvs(game, depth - 1, 1, alpha, alpha + 0.01, true, 0);
+                if (v > alpha && v < beta && !search_aborted)
+                {
+                    // Re-search with full window
+                    v = alpha_beta_pvs(game, depth - 1, 1, alpha, beta, true, 0);
+                }
+            }
+            game.undo_move();
+
+            if (search_aborted)
+            {
+                completed_this_depth = false;
+                break;
+            }
+
+            if (m.t == 'P')
+                v -= pass_penalty;
+
+            if (v > best_value || (v == best_value && move_less(m, best_move_this_depth)))
+            {
+                best_value = v;
+                best_move_this_depth = m;
+            }
+            alpha = std::max(alpha, best_value);
+
+            // If we found a winning move, no need to search deeper
+            if (best_value > 900.0)
+                break;
+        }
+
+        if (completed_this_depth || best_value > 900.0)
+        {
+            best_move_overall = best_move_this_depth;
+            depth_completed = depth;
+
+            // Re-order moves: put best move first for next iteration
+            // This is the key benefit of iterative deepening
+            if (moves.size() > 1)
+            {
+                for (size_t i = 0; i < moves.size(); ++i)
+                {
+                    if (moves[i].x == best_move_this_depth.x &&
+                        moves[i].y == best_move_this_depth.y &&
+                        moves[i].t == best_move_this_depth.t)
+                    {
+                        std::swap(moves[0], moves[i]);
+                        break;
+                    }
+                }
+            }
+
+            if (best_value > 900.0)
+                break;
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    last_depth_completed = depth_completed;
+    last_nodes_searched = nodes_searched;
+    return best_move_overall;
+}
+
 void AlphaBetaEngine::set_model_checkpoint(const std::string &path, const std::string &device)
 {
     py::gil_scoped_acquire gil;
@@ -119,7 +482,6 @@ void AlphaBetaEngine::set_model_checkpoint(const std::string &path, const std::s
     model_override = model;
     model_device = device;
 
-    // Caches depend on the model.
     clear_stats();
 }
 
@@ -235,7 +597,6 @@ double AlphaBetaEngine::clamp_prob(double p)
 
 double AlphaBetaEngine::prob_to_value(double prob)
 {
-    // Match players/ai.py::_evaluate_with_gnn scaling.
     prob = clamp_prob(prob);
     double logit = std::log(prob / (1.0 - prob));
     logit /= 2.0;
@@ -314,13 +675,576 @@ std::vector<double> AlphaBetaEngine::gnn_probs_root_for_encodings(const py::list
 
     if (probs.size() != (size_t)py::len(encs))
     {
-        // Defensive: fall back to 0.5 for missing outputs.
         probs.resize((size_t)py::len(encs), 0.5);
     }
     for (auto &p : probs)
         p = clamp_prob(p);
     return probs;
 }
+
+void AlphaBetaEngine::set_use_heuristic(bool v)
+{
+    if (v != use_heuristic_eval)
+    {
+        use_heuristic_eval = v;
+        tt.clear();
+        eval_cache.clear();
+    }
+}
+
+bool AlphaBetaEngine::load_native_model(const std::string &path)
+{
+    bool ok = native_nn_.load_weights(path);
+    if (ok)
+    {
+        // Clear caches since eval function changed
+        tt.clear();
+        eval_cache.clear();
+    }
+    return ok;
+}
+
+void AlphaBetaEngine::set_nn_ordering_depth(int min_depth)
+{
+    nn_ordering_min_depth_ = std::max(1, min_depth);
+}
+
+NNInput AlphaBetaEngine::encode_for_native_nn(GameState &g) const
+{
+    NNInput input;
+
+    // Build node list (same logic as gnn_helpers.cpp::encode_state_common)
+    g.scratch_nodes.clear();
+    g.scratch_nodes.reserve(g.connected_points.size() + g.rocks.size());
+    for (auto *p : g.connected_points)
+        g.scratch_nodes.push_back(p);
+    for (auto *p : g.rocks)
+        g.scratch_nodes.push_back(p);
+    std::sort(g.scratch_nodes.begin(), g.scratch_nodes.end(), [](Node *a, Node *b)
+              {
+                  if (a == b) return false;
+                  if (a->x != b->x) return a->x < b->x;
+                  return a->y < b->y; });
+    g.scratch_nodes.erase(std::unique(g.scratch_nodes.begin(), g.scratch_nodes.end(),
+                                      [](Node *a, Node *b)
+                                      { return a == b || (a->x == b->x && a->y == b->y); }),
+                          g.scratch_nodes.end());
+
+    g.scratch_idx_map.clear();
+    if (!g.scratch_nodes.empty())
+        g.scratch_idx_map.reserve(g.scratch_nodes.size() * 2);
+    for (size_t i = 0; i < g.scratch_nodes.size(); ++i)
+        g.scratch_idx_map[g.scratch_nodes[i]] = (int)i;
+
+    int N = (int)g.scratch_nodes.size();
+    input.num_nodes = N;
+
+    // Node features: [owner_one_hot(3), deg, is_leaf, x, y, r2] = 8
+    int nfd = GameState::num_players + 1 + 5; // 3 + 5 = 8
+    input.node_feats.resize(N * nfd, 0.0f);
+    for (int i = 0; i < N; ++i)
+    {
+        Node *n = g.scratch_nodes[i];
+        float *f = &input.node_feats[i * nfd];
+
+        // Owner one-hot: [none, P0, P1]
+        int owner_idx = (n->rocked_by >= 0) ? (n->rocked_by + 1) : 0;
+        if (owner_idx >= 0 && owner_idx < GameState::num_players + 1)
+            f[owner_idx] = 1.0f;
+
+        // Degree
+        int nc = 0;
+        for (int d = 0; d < 8; ++d)
+            if (n->neighbours[d])
+                nc++;
+        f[3] = (float)nc / 8.0f;
+        f[4] = (nc == 1) ? 1.0f : 0.0f;
+        f[5] = (float)n->x;
+        f[6] = (float)n->y;
+        f[7] = (float)(n->x * n->x + n->y * n->y);
+    }
+
+    // Edges
+    for (int i = 0; i < N; ++i)
+    {
+        Node *p = g.scratch_nodes[i];
+        for (int d = 0; d < 8; ++d)
+        {
+            Node *q = p->neighbours[d];
+            if (!q)
+                continue;
+            auto it = g.scratch_idx_map.find(q);
+            if (it == g.scratch_idx_map.end())
+                continue;
+            int j = it->second;
+
+            float dx = (float)(q->x - p->x);
+            float dy = (float)(q->y - p->y);
+            float is_diag = (std::abs(dx) == 1.0f && std::abs(dy) == 1.0f) ? 1.0f : 0.0f;
+            float orth = 1.0f - is_diag;
+
+            input.edge_src.push_back(i);
+            input.edge_dst.push_back(j);
+            input.edge_attr.push_back(orth);
+            input.edge_attr.push_back(is_diag);
+        }
+    }
+    input.num_edges = (int)input.edge_src.size();
+
+    // Global features: [turn, cur_one_hot(2), scores(2), rocks_left(2), rocks_placed(2), max_r2]
+    input.global_feats.clear();
+    input.global_feats.push_back((float)g.turn_number);
+    for (int i = 0; i < GameState::num_players; ++i)
+        input.global_feats.push_back(g.current_player == i ? 1.0f : 0.0f);
+    for (auto s : g.players_scores)
+        input.global_feats.push_back((float)s);
+    for (auto r : g.num_rocks)
+        input.global_feats.push_back((float)r);
+
+    // Rocks placed per player
+    std::vector<float> rp(GameState::num_players, 0.0f);
+    for (auto *n : g.scratch_nodes)
+        if (n->rocked_by != -1)
+            rp[n->rocked_by] += 1.0f;
+    for (auto v : rp)
+        input.global_feats.push_back(v);
+
+    // max_r2
+    float max_r2 = 0.0f;
+    for (auto *n : g.scratch_nodes)
+    {
+        float r2 = (float)(n->x * n->x + n->y * n->y);
+        max_r2 = std::max(max_r2, r2);
+    }
+    input.global_feats.push_back(max_r2);
+
+    return input;
+}
+
+double AlphaBetaEngine::native_nn_evaluate(GameState &g)
+{
+    // Returns value from root_player's perspective using native C++ NN
+    if (g.winner != -1)
+        return (g.winner == root_player) ? 1000.0 : -1000.0;
+
+    if (g.connected_points.empty() && g.rocks.empty())
+        return 0.0;
+
+    NNInput input = encode_for_native_nn(g);
+    float logit = native_nn_.evaluate(input);
+    float prob = 1.0f / (1.0f + std::exp(-logit));
+
+    // Model outputs P(current_player wins)
+    // We need P(root_player wins)
+    if (g.current_player != root_player)
+        prob = 1.0f - prob;
+
+    return prob_to_value(clamp_prob((double)prob));
+}
+
+void AlphaBetaEngine::order_moves_by_native_nn(std::vector<Move> &moves, GameState &g, bool maximising)
+{
+    if (moves.size() <= 1 || !native_nn_.is_loaded())
+        return;
+
+    std::vector<double> scores(moves.size(), 0.0);
+
+    for (size_t i = 0; i < moves.size(); ++i)
+    {
+        const auto &m = moves[i];
+        int mover = g.current_player;
+        g.do_move(m, mover);
+
+        // Check eval cache first
+        TTKey key = g.tt_key();
+        auto it = eval_cache.find(key);
+        if (it != eval_cache.end())
+        {
+            scores[i] = it->second;
+        }
+        else if (g.winner != -1)
+        {
+            double v = (g.winner == root_player) ? 1000.0 : -1000.0;
+            eval_cache[key] = v;
+            scores[i] = v;
+        }
+        else if (g.connected_points.empty() && g.rocks.empty())
+        {
+            double v = prob_to_value(0.5);
+            eval_cache[key] = v;
+            scores[i] = v;
+        }
+        else
+        {
+            NNInput input = encode_for_native_nn(g);
+            float logit = native_nn_.evaluate(input);
+            float prob = 1.0f / (1.0f + std::exp(-logit));
+            if (g.current_player != root_player)
+                prob = 1.0f - prob;
+            double v = prob_to_value(clamp_prob((double)prob));
+            eval_cache[key] = v;
+            scores[i] = v;
+        }
+
+        g.undo_move();
+
+        if (moves[i].t == 'P')
+        {
+            if (maximising)
+                scores[i] -= pass_penalty;
+            else
+                scores[i] += pass_penalty;
+        }
+    }
+
+    // Sort by score
+    std::vector<size_t> idx(moves.size());
+    for (size_t i = 0; i < idx.size(); ++i)
+        idx[i] = i;
+    std::stable_sort(idx.begin(), idx.end(), [&](size_t ia, size_t ib)
+                     {
+                         double a = scores[ia];
+                         double b = scores[ib];
+                         if (a != b)
+                             return maximising ? (a > b) : (a < b);
+                         int ra = move_type_rank(moves[ia]);
+                         int rb = move_type_rank(moves[ib]);
+                         if (ra != rb)
+                             return ra < rb;
+                         return move_less(moves[ia], moves[ib]); });
+
+    std::vector<Move> reordered;
+    reordered.reserve(moves.size());
+    for (size_t i : idx)
+        reordered.push_back(moves[i]);
+    moves.swap(reordered);
+}
+
+// ---- Handcrafted heuristic eval (same as players/ai.py) ----
+
+bool AlphaBetaEngine::can_place(const Node *n, int player_number) const
+{
+    return n->rocked_by == -1 || n->rocked_by == player_number;
+}
+
+double AlphaBetaEngine::scored_gain_from_area(int area2)
+{
+    // area2 is 2x the actual area
+    // HALF_AREA_COUNTS is false, so area=1 (area2=2) scores 0.
+    int area = area2 / 2;
+    if (area <= 0)
+        return 0.0;
+    if (area == 1)
+        return 0.0; // HALF_AREA_COUNTS = false
+    return (double)area;
+}
+
+int AlphaBetaEngine::closure_area2_for_stick(GameState &g, const Move &m)
+{
+    // Check if placing this stick would create a cycle, and return 2*area.
+    auto it = g.points.find(GameState::key_from_coord({m.x, m.y}));
+    if (it == g.points.end())
+        return 0;
+    Node *start = it->second.get();
+    int d = GameState::dir_from_name(m.t);
+    if (d < 0)
+        return 0;
+    Node *end = start->neighbours[d];
+    if (end != nullptr)
+        return 0; // stick already exists
+    Coord end_c = calc_end({m.x, m.y}, d);
+    auto it2 = g.points.find(GameState::key_from_coord(end_c));
+    if (it2 == g.points.end())
+        return 0; // end node doesn't exist, can't form cycle
+    end = it2->second.get();
+    if (!end->in_connected_points)
+        return 0;
+
+    std::uint64_t edge_key = 0;
+    int area2 = g.best_new_cycle_area2(start, end, edge_key);
+    return area2;
+}
+
+AlphaBetaEngine::TacticalInfo AlphaBetaEngine::compute_tactical(GameState &g, int player_number)
+{
+    TacticalInfo info;
+
+    // Gather stick moves for this player
+    std::vector<Move> stick_moves;
+    stick_moves.reserve(48);
+    for (Node *cp : g.connected_points)
+    {
+        if (!can_place(cp, player_number))
+            continue;
+        if (g.coord_in_claimed_region_cached(cp->c()))
+            continue;
+        for (int d = 0; d < 8; ++d)
+        {
+            if (cp->neighbours[d] != nullptr)
+                continue; // stick already placed
+            if (g.intersects_stick(cp->c(), d))
+                continue;
+            Coord end_c = calc_end(cp->c(), d);
+            if (g.coord_in_claimed_region_cached(end_c))
+                continue;
+            stick_moves.push_back(Move{cp->x, cp->y, GameState::dir_name_char(d)});
+        }
+    }
+
+    info.stick_move_count = (int)stick_moves.size();
+    if (stick_moves.empty())
+    {
+        // potential_area, blocking, rock_value still computed below
+    }
+    else
+    {
+        int before_score = g.players_scores[player_number];
+        std::vector<double> gains;
+        gains.reserve(stick_moves.size());
+
+        int cap = std::min((int)stick_moves.size(), 32);
+        // Sort for determinism
+        std::sort(stick_moves.begin(), stick_moves.end(), [](const Move &a, const Move &b)
+                  {
+                      if (a.x != b.x) return a.x < b.x;
+                      if (a.y != b.y) return a.y < b.y;
+                      return a.t < b.t;
+                  });
+
+        for (int i = 0; i < cap; ++i)
+        {
+            const Move &mv = stick_moves[i];
+            if (!g.is_move_legal(mv, player_number))
+                continue;
+            g.do_move(mv, player_number);
+            if (g.winner == player_number)
+            {
+                info.max_immediate_gain = std::max(info.max_immediate_gain, 999.0);
+                info.scoring_move_count++;
+                gains.push_back(999.0);
+                g.undo_move();
+                continue;
+            }
+            double gain = (double)(g.players_scores[player_number] - before_score);
+            g.undo_move();
+
+            if (gain > 0)
+            {
+                info.scoring_move_count++;
+                info.max_immediate_gain = std::max(info.max_immediate_gain, gain);
+                gains.push_back(gain);
+            }
+            else
+            {
+                // Check for bad closure (area == 1)
+                int a2 = closure_area2_for_stick(g, mv);
+                if (a2 == 2) // area2==2 means area==1
+                    info.bad_closure_count++;
+            }
+        }
+
+        std::sort(gains.begin(), gains.end(), std::greater<double>());
+        for (int i = 0; i < std::min((int)gains.size(), 3); ++i)
+            info.top3_gain_sum += gains[i];
+
+        // best_reply_gain: for the best scoring move, check opponent's best reply gain
+        // Find top scoring move, play it, check opp's best score gain, undo
+        if (info.scoring_move_count > 0 && info.max_immediate_gain < 999.0)
+        {
+            // Find the actual best scoring stick move
+            Move best_scoring_move{0, 0, 'P'};
+            double best_gain = 0.0;
+            int before = g.players_scores[player_number];
+            int reply_cap = std::min((int)stick_moves.size(), 4);
+            for (int i = 0; i < reply_cap; ++i)
+            {
+                const Move &mv = stick_moves[i];
+                if (!g.is_move_legal(mv, player_number)) continue;
+                g.do_move(mv, player_number);
+                double gain_val = (double)(g.players_scores[player_number] - before);
+                if (gain_val > best_gain)
+                {
+                    best_gain = gain_val;
+                    best_scoring_move = mv;
+                }
+                g.undo_move();
+            }
+            if (best_gain > 0.0)
+            {
+                // Play the best scoring move and check opp's reply
+                g.do_move(best_scoring_move, player_number);
+                int opp = 1 - player_number;
+                int opp_before = g.players_scores[opp];
+                double opp_best_reply = 0.0;
+                // Check opponent's stick moves for scoring replies
+                for (Node *cp : g.connected_points)
+                {
+                    if (!can_place(cp, opp)) continue;
+                    if (g.coord_in_claimed_region_cached(cp->c())) continue;
+                    for (int d = 0; d < 8; ++d)
+                    {
+                        if (cp->neighbours[d] != nullptr) continue;
+                        if (g.intersects_stick(cp->c(), d)) continue;
+                        Coord end_c = calc_end(cp->c(), d);
+                        if (g.coord_in_claimed_region_cached(end_c)) continue;
+                        Move rmv{cp->x, cp->y, GameState::dir_name_char(d)};
+                        if (!g.is_move_legal(rmv, opp)) continue;
+                        g.do_move(rmv, opp);
+                        double rgain = (double)(g.players_scores[opp] - opp_before);
+                        opp_best_reply = std::max(opp_best_reply, rgain);
+                        g.undo_move();
+                        if (opp_best_reply > 0.0) break; // found one, that's enough
+                    }
+                    if (opp_best_reply > 0.0) break;
+                }
+                g.undo_move();
+                info.best_reply_gain = opp_best_reply;
+            }
+        }
+    }
+
+    // potential_area: count (connected point, empty direction) pairs where both ends are placeable
+    {
+        double pa = 0.0;
+        for (Node *cp : g.connected_points)
+        {
+            if (!can_place(cp, player_number))
+                continue;
+            for (int d = 0; d < 8; ++d)
+            {
+                if (cp->neighbours[d] != nullptr)
+                    continue; // stick exists
+                Coord end_c = calc_end(cp->c(), d);
+                auto it = g.points.find(GameState::key_from_coord(end_c));
+                if (it != g.points.end() && can_place(it->second.get(), player_number))
+                    pa += 1.0;
+            }
+        }
+        info.potential_area = pa;
+    }
+
+    // blocking_power: count empty directions from our rocks that block opponent
+    {
+        double blocked = 0.0;
+        for (Node *rock : g.rocks)
+        {
+            if (rock->rocked_by != player_number)
+                continue;
+            if (!rock->in_connected_points)
+                continue;
+            if (g.coord_in_claimed_region_cached(rock->c()))
+                continue;
+            for (int d = 0; d < 8; ++d)
+            {
+                if (rock->neighbours[d] != nullptr)
+                    continue;
+                if (g.intersects_stick(rock->c(), d))
+                    continue;
+                Coord end_c = calc_end(rock->c(), d);
+                if (g.coord_in_claimed_region_cached(end_c))
+                    continue;
+                blocked += 1.0;
+                int a2 = closure_area2_for_stick(g, Move{rock->x, rock->y, GameState::dir_name_char(d)});
+                if (a2 > 0)
+                    blocked += 0.25 * scored_gain_from_area(a2);
+            }
+        }
+        info.blocking_power = blocked;
+    }
+
+    // rock_value: estimate value of rock placement opportunities
+    {
+        int rocks_remaining = g.num_rocks[player_number];
+        if (rocks_remaining <= 0)
+        {
+            info.rock_value = 0.0;
+        }
+        else
+        {
+            int opp = 1 - player_number;
+            double best_impact = 0.0;
+            int rock_count = 0;
+            auto all_moves = g.get_possible_moves_for_player(player_number);
+            for (const auto &m : all_moves)
+            {
+                if (m.t != 'R')
+                    continue;
+                auto it = g.points.find(GameState::key_from_coord({m.x, m.y}));
+                if (it == g.points.end())
+                    continue;
+                Node *p = it->second.get();
+                if (!p->in_connected_points)
+                    continue;
+                // Only matters if opponent could place here
+                if (!can_place(p, opp))
+                    continue;
+
+                double impact = 0.0;
+                for (int d = 0; d < 8; ++d)
+                {
+                    if (p->neighbours[d] != nullptr)
+                        continue;
+                    if (g.intersects_stick(p->c(), d))
+                        continue;
+                    impact += 1.0;
+                    int a2 = closure_area2_for_stick(g, Move{p->x, p->y, GameState::dir_name_char(d)});
+                    if (a2 > 0)
+                        impact += 0.30 * scored_gain_from_area(a2);
+                }
+                best_impact = std::max(best_impact, impact);
+                if (++rock_count >= 24)
+                    break;
+            }
+            double opportunity = std::min(3.0, best_impact / 4.0);
+            info.rock_value = (double)rocks_remaining * opportunity;
+        }
+    }
+
+    return info;
+}
+
+double AlphaBetaEngine::heuristic_evaluate(GameState &g)
+{
+    if (g.winner != -1)
+        return (g.winner == root_player) ? 1000.0 : -1000.0;
+
+    if (g.connected_points.empty() && g.rocks.empty())
+        return 0.0;
+
+    int me = root_player;
+    int opp = 1 - me;
+
+    TacticalInfo my_ts = compute_tactical(g, me);
+    TacticalInfo opp_ts = compute_tactical(g, opp);
+
+    bool my_turn = (g.current_player == me);
+    double w_me  = my_turn ? 1.0 : 0.4;
+    double w_opp = my_turn ? 0.4 : 1.0;
+
+    double v =
+        1.2 * my_ts.blocking_power +
+        0.7 * (double)my_ts.stick_move_count +
+        1.3 * my_ts.potential_area -
+        2.0 * opp_ts.potential_area +
+        1.8 * (my_ts.rock_value - opp_ts.rock_value) +
+        1.2 * (my_ts.max_immediate_gain - opp_ts.max_immediate_gain) +
+        0.3 * (my_ts.top3_gain_sum - opp_ts.top3_gain_sum) +
+        0.3 * (double)(my_ts.scoring_move_count - opp_ts.scoring_move_count) +
+        0.1 * (double)(my_ts.stick_move_count - opp_ts.stick_move_count) -
+        0.1 * (double)(my_ts.bad_closure_count - opp_ts.bad_closure_count);
+
+    // Best-reply gain: how much the opponent scores after our best scoring move
+    // (matches Python _evaluate_position_handcrafted)
+    v -= 0.5 * w_me  * my_ts.best_reply_gain;
+    v += 0.5 * w_opp * opp_ts.best_reply_gain;
+
+    // Add score difference (very important in endgame)
+    v += 10.0 * (double)(g.players_scores[me] - g.players_scores[opp]);
+
+    return v;
+}
+
+// ---- End heuristic eval ----
 
 double AlphaBetaEngine::evaluate(GameState &g)
 {
@@ -329,8 +1253,16 @@ double AlphaBetaEngine::evaluate(GameState &g)
     if (it != eval_cache.end())
         return it->second;
 
-    double p = gnn_prob_root(g);
-    double v = prob_to_value(p);
+    double v;
+    if (use_heuristic_eval)
+        v = heuristic_evaluate(g);
+    else if (native_nn_.is_loaded())
+        v = native_nn_evaluate(g);
+    else
+    {
+        double p = gnn_prob_root(g);
+        v = prob_to_value(p);
+    }
     eval_cache[key] = v;
     return v;
 }
@@ -339,7 +1271,30 @@ std::vector<double> AlphaBetaEngine::evaluate_children_depth1_batched(
     GameState &g, const std::vector<Move> &moves, bool parent_maximising)
 {
     // For depth==1, children are evaluated at depth 0.
-    // We batch all uncached leaf evals into a single model call.
+    // In heuristic mode, evaluate each child directly (no GNN batching needed).
+    if (use_heuristic_eval)
+    {
+        std::vector<double> values;
+        values.resize(moves.size(), 0.0);
+        for (size_t i = 0; i < moves.size(); ++i)
+        {
+            const auto &m = moves[i];
+            int mover = g.current_player;
+            g.do_move(m, mover);
+            values[i] = evaluate(g);
+            g.undo_move();
+            if (m.t == 'P')
+            {
+                if (parent_maximising)
+                    values[i] -= pass_penalty;
+                else
+                    values[i] += pass_penalty;
+            }
+        }
+        return values;
+    }
+
+    // GNN batched evaluation path
     std::vector<double> values;
     values.resize(moves.size(), 0.0);
 
@@ -433,6 +1388,47 @@ void AlphaBetaEngine::order_moves_by_child_eval_inplace(std::vector<Move> &moves
 {
     if (moves.size() <= 1)
         return;
+
+    // In heuristic mode, evaluate children directly and sort.
+    if (use_heuristic_eval)
+    {
+        std::vector<double> scores(moves.size(), 0.0);
+        for (size_t i = 0; i < moves.size(); ++i)
+        {
+            int mover = g.current_player;
+            g.do_move(moves[i], mover);
+            scores[i] = evaluate(g);
+            g.undo_move();
+            if (moves[i].t == 'P')
+            {
+                if (parent_maximising)
+                    scores[i] -= pass_penalty;
+                else
+                    scores[i] += pass_penalty;
+            }
+        }
+        std::vector<size_t> idx(moves.size());
+        for (size_t i = 0; i < idx.size(); ++i)
+            idx[i] = i;
+        std::stable_sort(idx.begin(), idx.end(), [&](size_t ia, size_t ib)
+                         {
+                             double a = scores[ia];
+                             double b = scores[ib];
+                             if (a != b)
+                                 return parent_maximising ? (a > b) : (a < b);
+                             int ra = move_type_rank(moves[ia]);
+                             int rb = move_type_rank(moves[ib]);
+                             if (ra != rb)
+                                 return ra < rb;
+                             return move_less(moves[ia], moves[ib]);
+                         });
+        std::vector<Move> reordered;
+        reordered.reserve(moves.size());
+        for (size_t i : idx)
+            reordered.push_back(moves[i]);
+        moves.swap(reordered);
+        return;
+    }
 
     std::vector<double> scores;
     scores.resize(moves.size(), 0.0);
@@ -539,8 +1535,265 @@ void AlphaBetaEngine::order_moves_by_child_eval_inplace(std::vector<Move> &moves
     moves.swap(reordered);
 }
 
+// ---- Enhanced alpha-beta with PVS, null-move, killers, history, quiescence extensions ----
+// Uses minimax convention: all values from root_player's perspective.
+// alpha = best value root_player can guarantee;  beta = worst value root_player allows.
+
+double AlphaBetaEngine::alpha_beta_pvs(GameState &g, int depth, int ply,
+                                        double alpha, double beta,
+                                        bool allow_null_move, int extensions_left)
+{
+    nodes_searched++;
+
+    // Time check every 256 nodes
+    if ((nodes_searched & 255) == 0 && is_time_up())
+    {
+        search_aborted = true;
+        return 0.0;
+    }
+
+    // Bug fix: save original alpha/beta BEFORE TT adjustment for correct flag determination
+    double a0 = alpha;
+    double b0 = beta;
+
+    TTKey key = g.tt_key();
+    auto tt_it = tt.find(key);
+    Move tt_best{0, 0, '\0'}; // sentinel for "no TT move"
+
+    if (tt_it != tt.end())
+    {
+        const TTEntry &e = tt_it->second;
+        tt_best = e.best;
+        if (e.depth >= depth)
+        {
+            if (e.flag == 0) return e.value;              // exact
+            if (e.flag == 1) alpha = std::max(alpha, e.value); // lower
+            else if (e.flag == 2) beta = std::min(beta, e.value); // upper
+            if (alpha >= beta) return e.value;
+        }
+    }
+
+    // Terminal positions
+    if (g.winner != -1)
+    {
+        if (use_heuristic_eval)
+            return (g.winner == root_player) ? (1000.0 + depth) : (-1000.0 - depth);
+        else
+            return (g.winner == root_player) ? prob_to_value(1.0) + depth : prob_to_value(0.0) - depth;
+    }
+
+    // Leaf evaluation
+    if (depth <= 0)
+    {
+        return evaluate(g);
+    }
+
+    bool maximising = (g.current_player == root_player);
+
+    // ---- Null-move pruning (heuristic mode only) ----
+    // Disabled in narrow PVS windows to avoid false cutoffs (Bug #3 fix)
+    bool wide_window = (beta - alpha) > 1.0;
+    if (allow_null_move && wide_window && depth >= 5 && use_heuristic_eval && ply > 0)
+    {
+        // Safety: only try null-move if pass is legal
+        Move null_move{0, 0, 'P'};
+        if (g.is_move_legal(null_move, g.current_player))
+        {
+            int mover = g.current_player;
+            g.do_move(null_move, mover);
+            int R = NULL_MOVE_R;
+            int reduced = std::max(0, depth - 1 - R);
+            double null_val = alpha_beta_pvs(g, reduced, ply + 1, alpha, beta, false, 0);
+            g.undo_move();
+
+            if (search_aborted) return 0.0;
+
+            if (maximising && null_val >= beta)
+                return beta;
+            if (!maximising && null_val <= alpha)
+                return alpha;
+        }
+    }
+
+    double best = maximising ? -1e300 : 1e300;
+    Move best_move{0, 0, 'P'};
+
+    auto moves = g.get_possible_moves_for_player(g.current_player);
+    moves = filter_search_moves(moves, g, g.current_player);
+
+    if ((int)moves.size() > move_cap)
+    {
+        order_moves_inplace(moves);
+        moves.resize((size_t)move_cap);
+    }
+
+    // Enhanced move ordering: TT best move → killers → history
+    order_moves_enhanced(moves, g, ply, maximising);
+
+    // NN-based move ordering: evaluate all children with native NN and sort
+    if (native_nn_.is_loaded() && depth >= nn_ordering_min_depth_)
+    {
+        order_moves_by_native_nn(moves, g, maximising);
+    }
+    else if (depth == 2)
+    {
+        order_moves_by_child_eval_inplace(moves, g, maximising);
+    }
+
+    if (moves.empty())
+        return evaluate(g);
+
+    if (depth == 1)
+    {
+        auto vals = evaluate_children_depth1_batched(g, moves, maximising);
+        for (size_t i = 0; i < moves.size(); ++i)
+        {
+            const auto &m = moves[i];
+            double v = vals[i];
+
+            if (maximising)
+            {
+                if (v > best || (v == best && move_less(m, best_move)))
+                {
+                    best = v;
+                    best_move = m;
+                }
+                alpha = std::max(alpha, best);
+                if (alpha >= beta) break;
+            }
+            else
+            {
+                if (v < best || (v == best && move_less(m, best_move)))
+                {
+                    best = v;
+                    best_move = m;
+                }
+                beta = std::min(beta, best);
+                if (alpha >= beta) break;
+            }
+        }
+        // Store in TT
+        TTEntry e;
+        e.depth = depth;
+        e.value = best;
+        e.best = best_move;
+        if (best <= a0) e.flag = 2;
+        else if (best >= b0) e.flag = 1;
+        else e.flag = 0;
+        tt[key] = e;
+        return best;
+    }
+
+    int move_count = 0;
+
+    for (auto &m : moves)
+    {
+        if (!g.is_move_legal(m, g.current_player))
+            continue;
+
+        int mover = g.current_player;
+        g.do_move(m, mover);
+
+        double v;
+        if (move_count == 0)
+        {
+            // First move: full window search
+            v = alpha_beta_pvs(g, depth - 1, ply + 1, alpha, beta, true, extensions_left);
+        }
+        else
+        {
+            // PVS: null-window search
+            if (maximising)
+            {
+                v = alpha_beta_pvs(g, depth - 1, ply + 1, alpha, alpha + 0.01, true, extensions_left);
+                if (v > alpha && v < beta && !search_aborted)
+                    v = alpha_beta_pvs(g, depth - 1, ply + 1, alpha, beta, true, extensions_left);
+            }
+            else
+            {
+                v = alpha_beta_pvs(g, depth - 1, ply + 1, beta - 0.01, beta, true, extensions_left);
+                if (v < beta && v > alpha && !search_aborted)
+                    v = alpha_beta_pvs(g, depth - 1, ply + 1, alpha, beta, true, extensions_left);
+            }
+        }
+        g.undo_move();
+        move_count++;
+
+        if (search_aborted) return 0.0;
+
+        // Apply pass penalty
+        if (m.t == 'P')
+        {
+            if (maximising)
+                v -= pass_penalty;
+            else
+                v += pass_penalty;
+        }
+
+        if (maximising)
+        {
+            if (v > best || (v == best && move_less(m, best_move)))
+            {
+                best = v;
+                best_move = m;
+            }
+            alpha = std::max(alpha, best);
+            if (alpha >= beta)
+            {
+                update_killers(ply, m);
+                update_history(mover, m, depth);
+                break;
+            }
+        }
+        else
+        {
+            if (v < best || (v == best && move_less(m, best_move)))
+            {
+                best = v;
+                best_move = m;
+            }
+            beta = std::min(beta, best);
+            if (alpha >= beta)
+            {
+                update_killers(ply, m);
+                update_history(mover, m, depth);
+                break;
+            }
+        }
+    }
+
+    // Store in TT
+    TTEntry e;
+    e.depth = depth;
+    e.value = best;
+    e.best = best_move;
+    if (best <= a0)
+        e.flag = 2; // upper
+    else if (best >= b0)
+        e.flag = 1; // lower
+    else
+        e.flag = 0; // exact
+    tt[key] = e;
+    return best;
+}
+
+// ---- Original alpha_beta (kept for choose_move and choose_move_with_values backward compat) ----
+
 double AlphaBetaEngine::alpha_beta(GameState &g, int depth, double alpha, double beta)
 {
+    nodes_searched++;
+
+    // Time check every 256 nodes (for iterative deepening)
+    if (search_time_limit_ms > 0 && (nodes_searched & 255) == 0 && is_time_up())
+    {
+        search_aborted = true;
+        return 0.0;
+    }
+
+    // Save original alpha/beta BEFORE TT adjustment for correct flag determination
+    double a0 = alpha;
+    double b0 = beta;
+
     TTKey key = g.tt_key();
     auto it = tt.find(key);
     if (it != tt.end() && it->second.depth >= depth)
@@ -556,14 +1809,21 @@ double AlphaBetaEngine::alpha_beta(GameState &g, int depth, double alpha, double
             return e.value;
     }
 
-    if (depth <= 0 || g.winner != -1)
+    // Terminal positions: use depth-adjusted values so the engine
+    // prefers quick wins and delayed losses (doesn't "give up").
+    if (g.winner != -1)
+    {
+        if (use_heuristic_eval)
+            return (g.winner == root_player) ? (1000.0 + depth) : (-1000.0 - depth);
+        else
+            return (g.winner == root_player) ? prob_to_value(1.0) + depth : prob_to_value(0.0) - depth;
+    }
+    if (depth <= 0)
         return evaluate(g);
 
     bool maximising = (g.current_player == root_player);
     double best = maximising ? -1e300 : 1e300;
     Move best_move{0, 0, 'P'};
-    double a0 = alpha;
-    double b0 = beta;
 
     auto moves = g.get_possible_moves_for_player(g.current_player);
     moves = filter_search_moves(moves, g, g.current_player);
@@ -621,6 +1881,8 @@ double AlphaBetaEngine::alpha_beta(GameState &g, int depth, double alpha, double
             g.do_move(m, mover);
             double v = alpha_beta(g, depth - 1, alpha, beta);
             g.undo_move();
+
+            if (search_aborted) return 0.0;
 
             if (m.t == 'P')
             {

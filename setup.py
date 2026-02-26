@@ -33,10 +33,12 @@ ext_modules = [
             "players_ext_src/gnn_helpers.cpp",
             "players_ext_src/mcts.cpp",
             "players_ext_src/alphabeta.cpp",
+            "players_ext_src/heuristic_eval.cpp",
+            "players_ext_src/nn_eval.cpp",
         ],
         include_dirs=["players_ext_src"],
         extra_compile_args=extra_compile_args,
-        extra_link_args=extra_link_args,
+        extra_link_args=extra_link_args + (["-framework", "Accelerate"] if sys.platform == "darwin" else []),
     ),
 ]
 

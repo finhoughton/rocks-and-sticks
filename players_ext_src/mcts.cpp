@@ -1114,6 +1114,14 @@ Move MCTSEngine::choose_move(const GameState &root, int n_rollouts)
                 }
             }
         }
+        else if (use_heuristic_rollout)
+        {
+            // Use heuristic evaluation instead of random rollout.
+            // Returns P(leaf_player wins) via sigmoid of heuristic score.
+            double score = heval_evaluate(g, leaf_player);
+            value = heval_score_to_prob(score, heuristic_temperature);
+            V[leaf_key] = value;
+        }
         else
         {
             int winner = rollout(g, root_player);
@@ -1376,6 +1384,8 @@ void MCTSEngine::set_c_puct(double v) { c_puct = v; }
 void MCTSEngine::set_verbose(bool v) { verbose_level = v ? 1 : 0; }
 void MCTSEngine::set_verbose_level(int v) { verbose_level = std::max(0, v); }
 void MCTSEngine::set_use_nn_value(bool v) { use_nn_value = v; }
+void MCTSEngine::set_use_heuristic_rollout(bool v) { use_heuristic_rollout = v; }
+void MCTSEngine::set_heuristic_temperature(double t) { heuristic_temperature = t; }
 
 void MCTSEngine::py_set_value_calibration(double a, double b, bool enabled)
 {

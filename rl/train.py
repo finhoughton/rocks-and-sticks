@@ -455,6 +455,24 @@ def train(
             ck = torch.load(str(init_from), map_location=device_t)
             state = ck if isinstance(ck, dict) and 'state_dict' not in ck else ck.get('state_dict', ck)
             if isinstance(state, dict):
+                # If this is a GNNEval checkpoint (has 'head.*' but no 'value_mlp.*'),
+                # remap the value head keys so they load into PolicyValueNet.
+                has_head = any(str(k).startswith('head.') for k in state)
+                has_value_mlp = any(str(k).startswith('value_mlp.') for k in state)
+                if has_head and not has_value_mlp:
+                    # GNNEval head: [Linear(0), ReLU(1), Dropout(2), Linear(3)]
+                    # PolicyValueNet value_mlp: [Linear(0), ReLU(1), Linear(2)]
+                    remap = {
+                        'head.0.weight': 'value_mlp.0.weight',
+                        'head.0.bias': 'value_mlp.0.bias',
+                        'head.3.weight': 'value_mlp.2.weight',
+                        'head.3.bias': 'value_mlp.2.bias',
+                    }
+                    for old_key, new_key in remap.items():
+                        if old_key in state:
+                            state[new_key] = state.pop(old_key)
+                    print(f"Remapped GNNEval head → value_mlp ({len(remap)} keys)")
+
                 missing, unexpected = model.load_state_dict(state, strict=False)
                 print(
                     f"Warm-started from {init_from} "
