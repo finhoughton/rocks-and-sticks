@@ -78,6 +78,14 @@ private:
     // Matrix multiply: C = A @ B^T, A:[M,K], B:[N,K], C:[M,N]
     static void matmul(const float *A, const float *B, float *C,
                        int M, int N, int K);
+
+    // Pre-allocated working buffers — reused each evaluate() call to avoid
+    // repeated heap allocation. Mutable so evaluate() can stay logically const.
+    mutable std::vector<float> buf_h_, buf_h_in_;
+    mutable std::vector<float> buf_edge_proj_, buf_msg_, buf_agg_;
+    mutable std::vector<float> buf_combined_, buf_temp_;
+    mutable std::vector<float> buf_mean_, buf_var_;
+    mutable std::vector<float> buf_pooled_, buf_cat_, buf_head_out_;
     // C += bias broadcast over rows
     static void add_bias(float *data, const float *bias, int rows, int cols);
     // In-place ReLU

@@ -654,7 +654,6 @@ void GameState::do_move(const Move &m, int player_number)
     if (m.t == 'P')
     {
         history.push_back({m, player_number, current_player, players_scores, num_rocks, turn_number, winner, claimed_cycle_stack.size()});
-        num_rocks[player_number] = 2;
     }
     else if (m.t == 'R')
     {

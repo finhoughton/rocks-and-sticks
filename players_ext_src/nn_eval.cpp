@@ -176,9 +176,11 @@ float NativeNNEval::evaluate(const NNInput &input) const
     if (N == 0)
         return 0.0f; // empty graph -> 0.5 prob (logit=0)
 
-    // Working buffers
-    std::vector<float> h(N * hidden_, 0.0f);
-    std::vector<float> h_in(N * hidden_, 0.0f);
+    // Working buffers — reuse pre-allocated storage to avoid per-call malloc.
+    buf_h_.assign(N * hidden_, 0.0f);
+    buf_h_in_.resize(N * hidden_);
+    auto &h = buf_h_;
+    auto &h_in = buf_h_in_;
 
     for (int layer = 0; layer < num_layers_; ++layer)
     {
@@ -195,7 +197,8 @@ float NativeNNEval::evaluate(const NNInput &input) const
             std::copy(x, x + N * in_ch, h_in.begin());
 
         // 1. Project edge attributes: edge_proj[E, in_ch] = edge_attr[E, edge_dim] @ lin_w^T + lin_b
-        std::vector<float> edge_proj(E * in_ch, 0.0f);
+        buf_edge_proj_.assign(E * in_ch, 0.0f);
+        auto &edge_proj = buf_edge_proj_;
         if (E > 0)
         {
             matmul(input.edge_attr.data(), cw.lin_w.data(), edge_proj.data(),
@@ -205,7 +208,8 @@ float NativeNNEval::evaluate(const NNInput &input) const
 
         // 2. Messages: msg[e] = relu(x_j[e] + edge_proj[e])
         //    x_j = x[edge_src[e]]
-        std::vector<float> msg(E * in_ch, 0.0f);
+        buf_msg_.assign(E * in_ch, 0.0f);
+        auto &msg = buf_msg_;
         for (int e = 0; e < E; ++e)
         {
             int src = input.edge_src[e];
@@ -217,7 +221,8 @@ float NativeNNEval::evaluate(const NNInput &input) const
         }
 
         // 3. Scatter add: agg[dst] += msg
-        std::vector<float> agg(N * in_ch, 0.0f);
+        buf_agg_.assign(N * in_ch, 0.0f);
+        auto &agg = buf_agg_;
         for (int e = 0; e < E; ++e)
         {
             int dst = input.edge_dst[e];
@@ -226,14 +231,16 @@ float NativeNNEval::evaluate(const NNInput &input) const
         }
 
         // 4. Combined = agg + (1 + eps) * x
-        std::vector<float> combined(N * in_ch, 0.0f);
+        buf_combined_.resize(N * in_ch);
+        auto &combined = buf_combined_;
         float eps_factor = 1.0f + cw.eps;
         for (int i = 0; i < N * in_ch; ++i)
             combined[i] = agg[i] + eps_factor * x[i];
 
         // 5. MLP: nn.0 (Linear + ReLU) + nn.2 (Linear)
         //    temp = combined @ nn0_w^T + nn0_b → [N, out_ch]
-        std::vector<float> temp(N * out_ch, 0.0f);
+        buf_temp_.assign(N * out_ch, 0.0f);
+        auto &temp = buf_temp_;
         matmul(combined.data(), cw.nn0_w.data(), temp.data(),
                N, out_ch, in_ch);
         add_bias(temp.data(), cw.nn0_b.data(), N, out_ch);
@@ -247,7 +254,8 @@ float NativeNNEval::evaluate(const NNInput &input) const
 
         // 6. GraphNorm (single graph, batch_size=1)
         //    mean = mean(h, dim=0) → [out_ch]
-        std::vector<float> mean(out_ch, 0.0f);
+        buf_mean_.assign(out_ch, 0.0f);
+        auto &mean = buf_mean_;
         float inv_N = 1.0f / static_cast<float>(N);
         for (int i = 0; i < N; ++i)
             for (int c = 0; c < out_ch; ++c)
@@ -261,20 +269,21 @@ float NativeNNEval::evaluate(const NNInput &input) const
                 h[i * out_ch + c] -= nw.mean_scale[c] * mean[c];
 
         //    var = mean(h^2, dim=0) → [out_ch]
-        std::vector<float> var(out_ch, 0.0f);
+        buf_var_.assign(out_ch, 0.0f);
+        auto &var_ = buf_var_;
         for (int i = 0; i < N; ++i)
             for (int c = 0; c < out_ch; ++c)
             {
                 float v = h[i * out_ch + c];
-                var[c] += v * v;
+                var_[c] += v * v;
             }
         for (int c = 0; c < out_ch; ++c)
-            var[c] *= inv_N;
+            var_[c] *= inv_N;
 
         //    h = weight * h / sqrt(var + eps) + bias
         for (int c = 0; c < out_ch; ++c)
         {
-            float std_inv = 1.0f / std::sqrt(var[c] + 1e-5f);
+            float std_inv = 1.0f / std::sqrt(buf_var_[c] + 1e-5f);
             for (int i = 0; i < N; ++i)
                 h[i * out_ch + c] = nw.weight[c] * h[i * out_ch + c] * std_inv + nw.bias[c];
         }
@@ -291,7 +300,8 @@ float NativeNNEval::evaluate(const NNInput &input) const
     }
 
     // 9. Global mean pool → [hidden_]
-    std::vector<float> pooled(hidden_, 0.0f);
+    buf_pooled_.assign(hidden_, 0.0f);
+    auto &pooled = buf_pooled_;
     float inv_N2 = 1.0f / static_cast<float>(N);
     for (int i = 0; i < N; ++i)
         for (int c = 0; c < hidden_; ++c)
@@ -301,12 +311,14 @@ float NativeNNEval::evaluate(const NNInput &input) const
 
     // 10. Concatenate [pooled, global_feats] → [hidden_ + global_feat_dim_]
     int cat_dim = hidden_ + global_feat_dim_;
-    std::vector<float> cat(cat_dim, 0.0f);
+    buf_cat_.resize(cat_dim);
+    auto &cat = buf_cat_;
     std::copy(pooled.begin(), pooled.end(), cat.begin());
     std::copy(input.global_feats.begin(), input.global_feats.end(), cat.begin() + hidden_);
 
     // 11. Head: Linear(hidden+gfd, hidden) → ReLU → Linear(hidden, 1)
-    std::vector<float> head_out(hidden_, 0.0f);
+    buf_head_out_.assign(hidden_, 0.0f);
+    auto &head_out = buf_head_out_;
     matmul(cat.data(), head0_w_.data(), head_out.data(),
            1, hidden_, cat_dim);
     add_bias(head_out.data(), head0_b_.data(), 1, hidden_);

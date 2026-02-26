@@ -415,7 +415,7 @@ class Game:
             )
         )
         if m is PASS:
-            self.num_rocks[player_number] = N_ROCKS
+            pass
 
         elif m.t == "R":
             if not self.valid_move(m, player_number):

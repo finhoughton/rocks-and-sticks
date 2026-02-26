@@ -366,17 +366,39 @@ Move AlphaBetaEngine::choose_move_iterative(const GameState &root, int max_depth
 
     Move best_move_overall = moves[0];
     int depth_completed = 0;
+    double prev_best_value = 0.0;   // for aspiration windows
 
-    // Iterative deepening
+    // Iterative deepening with aspiration windows
     for (int depth = 1; depth <= max_depth; ++depth)
     {
         if (is_time_up())
             break;
 
+        // Aspiration window: use narrow window around previous depth's value
+        double asp_alpha, asp_beta;
+        static constexpr double ASP_DELTA = 1.5;  // initial aspiration half-width
+        if (depth >= 3 && prev_best_value > -900.0 && prev_best_value < 900.0)
+        {
+            asp_alpha = prev_best_value - ASP_DELTA;
+            asp_beta  = prev_best_value + ASP_DELTA;
+        }
+        else
+        {
+            asp_alpha = -1e300;
+            asp_beta  = 1e300;
+        }
+
+        // Aspiration re-search loop: widen window if search fails high/low
+        int asp_retries = 0;
+        static constexpr int ASP_MAX_RETRIES = 2;
+        double alpha, beta;
+
+asp_retry:
+        alpha = asp_alpha;
+        beta  = asp_beta;
+
         Move best_move_this_depth = moves[0];
         double best_value = -1e300;
-        double alpha = -1e300;
-        double beta = 1e300;
         bool completed_this_depth = true;
 
         for (size_t i = 0; i < moves.size(); ++i)
@@ -427,10 +449,25 @@ Move AlphaBetaEngine::choose_move_iterative(const GameState &root, int max_depth
                 break;
         }
 
+        // Handle aspiration window failures: widen and re-search
+        if (completed_this_depth && best_value <= asp_alpha && asp_retries < ASP_MAX_RETRIES)
+        {
+            asp_alpha = -1e300;  // fail low: widen downward
+            asp_retries++;
+            goto asp_retry;
+        }
+        if (completed_this_depth && best_value >= asp_beta && asp_retries < ASP_MAX_RETRIES)
+        {
+            asp_beta = 1e300;  // fail high: widen upward
+            asp_retries++;
+            goto asp_retry;
+        }
+
         if (completed_this_depth || best_value > 900.0)
         {
             best_move_overall = best_move_this_depth;
             depth_completed = depth;
+            prev_best_value = best_value;
 
             // Re-order moves: put best move first for next iteration
             // This is the key benefit of iterative deepening
@@ -865,12 +902,14 @@ void AlphaBetaEngine::order_moves_by_native_nn(std::vector<Move> &moves, GameSta
         else if (g.winner != -1)
         {
             double v = (g.winner == root_player) ? 1000.0 : -1000.0;
+            // Terminal values are scale-independent, safe to cache
             eval_cache[key] = v;
             scores[i] = v;
         }
         else if (g.connected_points.empty() && g.rocks.empty())
         {
             double v = prob_to_value(0.5);
+            // Empty-board values are also scale-independent
             eval_cache[key] = v;
             scores[i] = v;
         }
@@ -882,7 +921,11 @@ void AlphaBetaEngine::order_moves_by_native_nn(std::vector<Move> &moves, GameSta
             if (g.current_player != root_player)
                 prob = 1.0f - prob;
             double v = prob_to_value(clamp_prob((double)prob));
-            eval_cache[key] = v;
+            // IMPORTANT: only write to eval_cache when NOT in heuristic mode.
+            // In heuristic mode, eval_cache stores heuristic values (scale ~±20).
+            // NN values (scale ~±6) must not pollute the shared cache.
+            if (!use_heuristic_eval)
+                eval_cache[key] = v;
             scores[i] = v;
         }
 
@@ -992,54 +1035,30 @@ AlphaBetaEngine::TacticalInfo AlphaBetaEngine::compute_tactical(GameState &g, in
     }
 
     info.stick_move_count = (int)stick_moves.size();
-    if (stick_moves.empty())
+    if (!stick_moves.empty())
     {
-        // potential_area, blocking, rock_value still computed below
-    }
-    else
-    {
-        int before_score = g.players_scores[player_number];
+        // Use closure_area2_for_stick to compute gains WITHOUT state mutation.
+        // This is ~10x faster than do_move/undo_move.
         std::vector<double> gains;
         gains.reserve(stick_moves.size());
 
         int cap = std::min((int)stick_moves.size(), 32);
-        // Sort for determinism
-        std::sort(stick_moves.begin(), stick_moves.end(), [](const Move &a, const Move &b)
-                  {
-                      if (a.x != b.x) return a.x < b.x;
-                      if (a.y != b.y) return a.y < b.y;
-                      return a.t < b.t;
-                  });
 
         for (int i = 0; i < cap; ++i)
         {
             const Move &mv = stick_moves[i];
-            if (!g.is_move_legal(mv, player_number))
-                continue;
-            g.do_move(mv, player_number);
-            if (g.winner == player_number)
-            {
-                info.max_immediate_gain = std::max(info.max_immediate_gain, 999.0);
-                info.scoring_move_count++;
-                gains.push_back(999.0);
-                g.undo_move();
-                continue;
-            }
-            double gain = (double)(g.players_scores[player_number] - before_score);
-            g.undo_move();
+            int a2 = closure_area2_for_stick(g, mv);
+            double gain = scored_gain_from_area(a2);
 
-            if (gain > 0)
+            if (a2 == 2) // area==1: bad closure
+            {
+                info.bad_closure_count++;
+            }
+            else if (gain > 0.0)
             {
                 info.scoring_move_count++;
                 info.max_immediate_gain = std::max(info.max_immediate_gain, gain);
                 gains.push_back(gain);
-            }
-            else
-            {
-                // Check for bad closure (area == 1)
-                int a2 = closure_area2_for_stick(g, mv);
-                if (a2 == 2) // area2==2 means area==1
-                    info.bad_closure_count++;
             }
         }
 
@@ -1047,36 +1066,29 @@ AlphaBetaEngine::TacticalInfo AlphaBetaEngine::compute_tactical(GameState &g, in
         for (int i = 0; i < std::min((int)gains.size(), 3); ++i)
             info.top3_gain_sum += gains[i];
 
-        // best_reply_gain: for the best scoring move, check opponent's best reply gain
-        // Find top scoring move, play it, check opp's best score gain, undo
-        if (info.scoring_move_count > 0 && info.max_immediate_gain < 999.0)
+        // best_reply_gain: find our best scoring move via closure, play it once,
+        // then check opponent replies with closure (1 do_move/undo_move total).
+        if (info.scoring_move_count > 0)
         {
-            // Find the actual best scoring stick move
             Move best_scoring_move{0, 0, 'P'};
             double best_gain = 0.0;
-            int before = g.players_scores[player_number];
-            int reply_cap = std::min((int)stick_moves.size(), 4);
-            for (int i = 0; i < reply_cap; ++i)
+            for (int i = 0; i < cap; ++i)
             {
                 const Move &mv = stick_moves[i];
-                if (!g.is_move_legal(mv, player_number)) continue;
-                g.do_move(mv, player_number);
-                double gain_val = (double)(g.players_scores[player_number] - before);
-                if (gain_val > best_gain)
+                int a2 = closure_area2_for_stick(g, mv);
+                double gain = scored_gain_from_area(a2);
+                if (gain > best_gain)
                 {
-                    best_gain = gain_val;
+                    best_gain = gain;
                     best_scoring_move = mv;
                 }
-                g.undo_move();
             }
-            if (best_gain > 0.0)
+            if (best_gain > 0.0 && g.is_move_legal(best_scoring_move, player_number))
             {
-                // Play the best scoring move and check opp's reply
+                // Play the best scoring move, then estimate opponent's best reply via closure
                 g.do_move(best_scoring_move, player_number);
                 int opp = 1 - player_number;
-                int opp_before = g.players_scores[opp];
                 double opp_best_reply = 0.0;
-                // Check opponent's stick moves for scoring replies
                 for (Node *cp : g.connected_points)
                 {
                     if (!can_place(cp, opp)) continue;
@@ -1088,15 +1100,16 @@ AlphaBetaEngine::TacticalInfo AlphaBetaEngine::compute_tactical(GameState &g, in
                         Coord end_c = calc_end(cp->c(), d);
                         if (g.coord_in_claimed_region_cached(end_c)) continue;
                         Move rmv{cp->x, cp->y, GameState::dir_name_char(d)};
-                        if (!g.is_move_legal(rmv, opp)) continue;
-                        g.do_move(rmv, opp);
-                        double rgain = (double)(g.players_scores[opp] - opp_before);
-                        opp_best_reply = std::max(opp_best_reply, rgain);
-                        g.undo_move();
-                        if (opp_best_reply > 0.0) break; // found one, that's enough
+                        int ra2 = closure_area2_for_stick(g, rmv);
+                        double rgain = scored_gain_from_area(ra2);
+                        if (rgain > opp_best_reply)
+                        {
+                            opp_best_reply = rgain;
+                            if (opp_best_reply > 0.0) goto opp_done; // found a reply, stop
+                        }
                     }
-                    if (opp_best_reply > 0.0) break;
                 }
+                opp_done:
                 g.undo_move();
                 info.best_reply_gain = opp_best_reply;
             }
@@ -1222,16 +1235,14 @@ double AlphaBetaEngine::heuristic_evaluate(GameState &g)
     double w_opp = my_turn ? 0.4 : 1.0;
 
     double v =
-        1.2 * my_ts.blocking_power +
-        0.7 * (double)my_ts.stick_move_count +
-        1.3 * my_ts.potential_area -
-        2.0 * opp_ts.potential_area +
+        1.2 * (my_ts.blocking_power - opp_ts.blocking_power) +
+        1.5 * (my_ts.potential_area - opp_ts.potential_area) +
         1.8 * (my_ts.rock_value - opp_ts.rock_value) +
-        1.2 * (my_ts.max_immediate_gain - opp_ts.max_immediate_gain) +
-        0.3 * (my_ts.top3_gain_sum - opp_ts.top3_gain_sum) +
-        0.3 * (double)(my_ts.scoring_move_count - opp_ts.scoring_move_count) +
-        0.1 * (double)(my_ts.stick_move_count - opp_ts.stick_move_count) -
-        0.1 * (double)(my_ts.bad_closure_count - opp_ts.bad_closure_count);
+        1.5 * (my_ts.max_immediate_gain - opp_ts.max_immediate_gain) +
+        0.5 * (my_ts.top3_gain_sum - opp_ts.top3_gain_sum) +
+        0.4 * (double)(my_ts.scoring_move_count - opp_ts.scoring_move_count) +
+        0.2 * (double)(my_ts.stick_move_count - opp_ts.stick_move_count) -
+        0.2 * (double)(my_ts.bad_closure_count - opp_ts.bad_closure_count);
 
     // Best-reply gain: how much the opponent scores after our best scoring move
     // (matches Python _evaluate_position_handcrafted)
@@ -1535,7 +1546,87 @@ void AlphaBetaEngine::order_moves_by_child_eval_inplace(std::vector<Move> &moves
     moves.swap(reordered);
 }
 
-// ---- Enhanced alpha-beta with PVS, null-move, killers, history, quiescence extensions ----
+// ---- Quiescence search ----
+// Called from depth=0 leaf nodes to resolve immediate scoring chains.
+// Only explores moves that immediately score (area > 1), preventing horizon effect.
+// qd = remaining quiescence depth (starts at QSEARCH_MAX, decrements each level).
+double AlphaBetaEngine::quiescence(GameState &g, double alpha, double beta, int ply, int qd)
+{
+    if (search_aborted) return 0.0;
+    if (ply >= MAX_PLY - 2 || qd <= 0)
+        return evaluate(g);
+
+    // Handle terminal positions
+    if (g.winner != -1)
+        return evaluate(g);
+
+    bool maximising = (g.current_player == root_player);
+
+    // Stand-pat: the static eval (we can always choose to stop searching)
+    double stand_pat = evaluate(g);
+
+    if (maximising)
+    {
+        if (stand_pat >= beta) return stand_pat;
+        if (stand_pat > alpha) alpha = stand_pat;
+    }
+    else
+    {
+        if (stand_pat <= alpha) return stand_pat;
+        if (stand_pat < beta) beta = stand_pat;
+    }
+
+    // Collect scoring moves BEFORE any do_move (do_move may modify connected_points)
+    int mover = g.current_player;
+    std::vector<Move> scoring_moves;
+    scoring_moves.reserve(8);
+    for (Node *cp : g.connected_points)
+    {
+        if (!can_place(cp, mover)) continue;
+        if (g.coord_in_claimed_region_cached(cp->c())) continue;
+        for (int d = 0; d < 8; ++d)
+        {
+            if (cp->neighbours[d] != nullptr) continue;
+            if (g.intersects_stick(cp->c(), d)) continue;
+            Coord end_c = calc_end(cp->c(), d);
+            if (g.coord_in_claimed_region_cached(end_c)) continue;
+
+            // Only explore scoring moves (area > 1, i.e. a2 > 2)
+            int a2 = closure_area2_for_stick(g, Move{cp->x, cp->y, GameState::dir_name_char(d)});
+            if (a2 <= 2) continue;
+
+            scoring_moves.push_back(Move{cp->x, cp->y, GameState::dir_name_char(d)});
+            if ((int)scoring_moves.size() >= 6) goto scoring_done; // cap to limit branching
+        }
+    }
+    scoring_done:
+
+    for (const Move &mv : scoring_moves)
+    {
+        g.do_move(mv, mover);
+        double v = quiescence(g, alpha, beta, ply + 1, qd - 1);
+        g.undo_move();
+
+        if (search_aborted) return 0.0;
+
+        if (maximising)
+        {
+            if (v > stand_pat) stand_pat = v;
+            if (v >= beta) return v;
+            if (v > alpha) alpha = v;
+        }
+        else
+        {
+            if (v < stand_pat) stand_pat = v;
+            if (v <= alpha) return v;
+            if (v < beta) beta = v;
+        }
+    }
+
+    return stand_pat;
+}
+
+// ---- Enhanced alpha-beta with PVS, null-move, killers, history ----
 // Uses minimax convention: all values from root_player's perspective.
 // alpha = best value root_player can guarantee;  beta = worst value root_player allows.
 
@@ -1582,10 +1673,10 @@ double AlphaBetaEngine::alpha_beta_pvs(GameState &g, int depth, int ply,
             return (g.winner == root_player) ? prob_to_value(1.0) + depth : prob_to_value(0.0) - depth;
     }
 
-    // Leaf evaluation
+    // Leaf evaluation: call quiescence to resolve immediate scoring chains
     if (depth <= 0)
     {
-        return evaluate(g);
+        return quiescence(g, alpha, beta, ply, 2);
     }
 
     bool maximising = (g.current_player == root_player);
@@ -1621,11 +1712,14 @@ double AlphaBetaEngine::alpha_beta_pvs(GameState &g, int depth, int ply,
     auto moves = g.get_possible_moves_for_player(g.current_player);
     moves = filter_search_moves(moves, g, g.current_player);
 
-    if ((int)moves.size() > move_cap)
-    {
-        order_moves_inplace(moves);
-        moves.resize((size_t)move_cap);
-    }
+    // Depth-adaptive move cap: cut branching at deep plies to enable depth 7+.
+    // NN ordering puts the best moves first, so the tail is safe to cut.
+    // Keep ply 0-3 wide (48) to not miss important root/near-root moves.
+    int effective_cap = move_cap;
+    if (ply >= 4)
+        effective_cap = std::min(effective_cap, 20);
+    if (ply >= 6)
+        effective_cap = std::min(effective_cap, 14);
 
     // Enhanced move ordering: TT best move → killers → history
     order_moves_enhanced(moves, g, ply, maximising);
@@ -1638,6 +1732,13 @@ double AlphaBetaEngine::alpha_beta_pvs(GameState &g, int depth, int ply,
     else if (depth == 2)
     {
         order_moves_by_child_eval_inplace(moves, g, maximising);
+    }
+
+    // Cap AFTER ordering so we keep the strongest candidates rather than
+    // truncating by simple type/coordinate order.
+    if ((int)moves.size() > effective_cap)
+    {
+        moves.resize((size_t)effective_cap);
     }
 
     if (moves.empty())
@@ -1684,6 +1785,21 @@ double AlphaBetaEngine::alpha_beta_pvs(GameState &g, int depth, int ply,
         return best;
     }
 
+    // ---- Futility pruning: skip this node if static eval is far from alpha/beta ----
+    // Only at shallow depth, not in PV nodes (wide window)
+    static constexpr double FUTILITY_MARGIN_D1 = 3.0;
+    static constexpr double FUTILITY_MARGIN_D2 = 6.0;
+    bool futility_prune = false;
+    if (depth <= 2 && !wide_window && ply > 0)
+    {
+        double static_eval = evaluate(g);
+        double margin = (depth == 1) ? FUTILITY_MARGIN_D1 : FUTILITY_MARGIN_D2;
+        if (maximising && static_eval + margin <= alpha)
+            futility_prune = true;
+        if (!maximising && static_eval - margin >= beta)
+            futility_prune = true;
+    }
+
     int move_count = 0;
 
     for (auto &m : moves)
@@ -1691,8 +1807,18 @@ double AlphaBetaEngine::alpha_beta_pvs(GameState &g, int depth, int ply,
         if (!g.is_move_legal(m, g.current_player))
             continue;
 
+        // Futility pruning: skip non-first moves at shallow depth
+        if (futility_prune && move_count > 0 && m.t != 'R')
+        {
+            // Still search scoring-potential moves (rocks can create/block area)
+            continue;
+        }
+
         int mover = g.current_player;
         g.do_move(m, mover);
+
+        // Check for immediate win — never reduce/prune these
+        bool gives_win = (g.winner != -1);
 
         double v;
         if (move_count == 0)
@@ -1702,16 +1828,37 @@ double AlphaBetaEngine::alpha_beta_pvs(GameState &g, int depth, int ply,
         }
         else
         {
+            // ---- Late Move Reductions (LMR) ----
+            // Reduce search depth for late quiet moves that are unlikely to be best
+            int lmr_reduction = 0;
+            if (depth >= 3 && move_count >= 4 && !gives_win && m.t != 'R')
+            {
+                // Reduce more for later moves
+                lmr_reduction = 1;
+                if (move_count >= 8)
+                    lmr_reduction = 2;
+                // Don't reduce below depth 1
+                if (depth - 1 - lmr_reduction < 1)
+                    lmr_reduction = std::max(0, depth - 2);
+            }
+
+            int search_depth = depth - 1 - lmr_reduction;
+
             // PVS: null-window search
             if (maximising)
             {
-                v = alpha_beta_pvs(g, depth - 1, ply + 1, alpha, alpha + 0.01, true, extensions_left);
+                v = alpha_beta_pvs(g, search_depth, ply + 1, alpha, alpha + 0.01, true, extensions_left);
+                // Re-search at full depth if reduced search improved alpha
+                if (lmr_reduction > 0 && v > alpha && !search_aborted)
+                    v = alpha_beta_pvs(g, depth - 1, ply + 1, alpha, alpha + 0.01, true, extensions_left);
                 if (v > alpha && v < beta && !search_aborted)
                     v = alpha_beta_pvs(g, depth - 1, ply + 1, alpha, beta, true, extensions_left);
             }
             else
             {
-                v = alpha_beta_pvs(g, depth - 1, ply + 1, beta - 0.01, beta, true, extensions_left);
+                v = alpha_beta_pvs(g, search_depth, ply + 1, beta - 0.01, beta, true, extensions_left);
+                if (lmr_reduction > 0 && v < beta && !search_aborted)
+                    v = alpha_beta_pvs(g, depth - 1, ply + 1, beta - 0.01, beta, true, extensions_left);
                 if (v < beta && v > alpha && !search_aborted)
                     v = alpha_beta_pvs(g, depth - 1, ply + 1, alpha, beta, true, extensions_left);
             }
@@ -1828,8 +1975,6 @@ double AlphaBetaEngine::alpha_beta(GameState &g, int depth, double alpha, double
     auto moves = g.get_possible_moves_for_player(g.current_player);
     moves = filter_search_moves(moves, g, g.current_player);
     order_moves_inplace(moves);
-    if ((int)moves.size() > move_cap)
-        moves.resize((size_t)move_cap);
 
     // Use a one-shot batched child evaluation for move ordering at depth==2.
     // This adds one model call but can improve pruning significantly.
@@ -1837,6 +1982,10 @@ double AlphaBetaEngine::alpha_beta(GameState &g, int depth, double alpha, double
     {
         order_moves_by_child_eval_inplace(moves, g, maximising);
     }
+
+    // Cap after ordering, mirroring the PVS pipeline redesign.
+    if ((int)moves.size() > move_cap)
+        moves.resize((size_t)move_cap);
 
     if (moves.empty())
         return evaluate(g);

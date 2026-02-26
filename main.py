@@ -156,6 +156,10 @@ if __name__ == "__main__":
             # Only print timing for non-human players (bots).
             if player.__class__.__name__ != "HumanPlayer":
                 print(f"Player {player.number + 1} ({player.__class__.__name__}) move time: {dt:.3f}s")
+            if player.__class__.__name__ == "AlphaBetaPlayerCPP":
+                depth = int(getattr(player.engine, "last_depth_completed", -1)) # type: ignore
+                nodes = int(getattr(player.engine, "last_nodes_searched", -1)) # type: ignore
+                print(f"Player {player.number + 1} AlphaBeta stats: depth={depth}, nodes={nodes}")
             print(f"Player {player.number + 1} plays {m}")
             game.do_move(player.number, m)
             game.render(block=False)

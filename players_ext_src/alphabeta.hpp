@@ -92,6 +92,7 @@ private:
 
     double alpha_beta_pvs(GameState &g, int depth, int ply, double alpha, double beta,
                           bool allow_null_move, int extensions_left);
+    double quiescence(GameState &g, double alpha, double beta, int ply, int qd);
     // ---- End search enhancements ----
 
     static bool move_less(const Move &a, const Move &b);

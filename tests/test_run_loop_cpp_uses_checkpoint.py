@@ -55,7 +55,12 @@ def test_run_loop_cpp_eval_records_nn_usage(tmp_path):
     )
 
     cpp_prof = res.get("cpp_profile") or {}
-    assert float(cpp_prof.get("prior_model_calls", 0.0)) > 0.0, cpp_prof
+    # Newer C++ profiling reports policy-prior activity under
+    # `policy_prior_calls`; keep backward compatibility with
+    # legacy `prior_model_calls`.
+    prior_calls = float(cpp_prof.get("prior_model_calls", 0.0))
+    policy_prior_calls = float(cpp_prof.get("policy_prior_calls", 0.0))
+    assert (prior_calls + policy_prior_calls) > 0.0, cpp_prof
 
     assert float(cpp_prof.get("value_model_calls", 0.0)) > 0.0, cpp_prof
 
