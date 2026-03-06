@@ -32,7 +32,8 @@ PYBIND11_MODULE(players_ext, m)
         .def("undo_move", &GameState::undo_move)
         .def("state_key", &GameState::state_key)
         .def("set_current_player0", &GameState::set_current_player0)
-        .def_readwrite("current_player", &GameState::current_player);
+        .def_readwrite("current_player", &GameState::current_player)
+        .def_readonly("winner", &GameState::winner);
 
     py::class_<MCTSEngine>(m, "MCTSEngine")
         .def(py::init<int, double>(), py::arg("seed") = 0, py::arg("c_puct") = 1.41421356)

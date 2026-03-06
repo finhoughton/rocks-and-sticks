@@ -11,11 +11,11 @@ additionally:
 - sticks can only be placed from a vertex connected to an existing stick
 - starting position is one vertical stick
 - only one rock per vertex
+- cannot place three rocks successively, i.e. if you placed rocks on both of your last two turns you cannot place a rock this turn
 - passing your turn is allowed
 - passing does not refill rocks
 - rocks are refilled to only after placing a stick
 - cannot cross sticks diagonally 
-- cannot place three rocks successively, i.e. if you placed rocks on both of your last two turns you cannot place a rock this turn
 - the three sided polygon with area 0.5 does not count. it does not give you any area
 - you cannot place a rock on your first move
 - if the player who went first is the first to get area, the second player gets one additional move to match or exceed the area. if they match the area the game continues, otherwise the player with more area wins.

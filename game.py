@@ -533,7 +533,7 @@ class Game:
                     continue
                 yield Move(p.x, p.y, d.name)
 
-        can_rock = (self.turn_number != 0) and (self.num_rocks[player.number] > 0)
+        can_rock = (self.turn_number != 0) and (self.num_rocks[player_number] > 0)
 
         if can_rock:
             anchors = list(self.connected_points) + list(self.rocks)

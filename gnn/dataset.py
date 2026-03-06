@@ -86,11 +86,12 @@ def load_balanced_saved_game_samples(
                 trajectory.append((enc, soft_val))
                 mv = Move(int(mv_dict["x"]), int(mv_dict["y"]), str(mv_dict["t"])) if mv_dict["t"] != "P" else PASS
                 try:
-                    player = game.current_player
-                    game.do_move(player, mv)
+                    mover_raw = mv_dict.get("p", None)
+                    mover = int(mover_raw) if mover_raw is not None else int(game.current_player)
+                    game.do_move(mover, mv)
                     if cpp_state is not None:
                         cpp_mv = to_cpp_move(mv)
-                        cpp_state.do_move(cpp_mv, player)
+                        cpp_state.do_move(cpp_mv, mover)
                 except Exception:
                     os.remove(path)
                     print(f"Removed corrupted game file: {path}")

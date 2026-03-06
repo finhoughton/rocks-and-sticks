@@ -15,6 +15,7 @@ def train(
     lr: float = 1e-3,
     device: str = "cpu",
     best_model_out: Optional[str] = None,
+    init_from: Optional[str] = None,
 ) -> tuple[GNNEval, list[float], list[float]]:
 
     if not train_dataset:
@@ -24,6 +25,15 @@ def train(
     node_feat_dim = sample.x.size(1) # type: ignore
     global_feat_dim = sample.global_feats.size(1)
     model = GNNEval(node_feat_dim=node_feat_dim, global_feat_dim=global_feat_dim).to(device_t)
+    if init_from:
+        try:
+            ckpt = torch.load(init_from, map_location=device_t)
+            if isinstance(ckpt, dict) and 'state_dict' in ckpt:
+                ckpt = ckpt['state_dict']
+            model.load_state_dict(ckpt, strict=False)
+            print(f"Warm-started model from {init_from}")
+        except Exception as e:
+            print(f"Warning: failed to warm-start from {init_from}: {e}")
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)

@@ -180,7 +180,6 @@ def _grouped_log_softmax(logits: torch.Tensor, group: torch.Tensor) -> torch.Ten
     # logits: [M], group: [M] with values in 0..B-1
     if logits.numel() == 0:
         return logits
-    device = logits.device
     num_groups = int(group.max().item()) + 1 if group.numel() else 0
     out = torch.empty_like(logits)
     for g in range(num_groups):
@@ -537,281 +536,257 @@ def train(
         return 0.5 * (1.0 + math.cos(math.pi * progress))
     scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
-    try:
-        for epoch in range(epochs):
-            if manifest is None:
-                if grouped_policy:
-                    train_loader = TorchDataLoader(train_s, batch_size=batch_size, shuffle=True, collate_fn=_collate_grouped, **loader_kwargs)
-                    val_loader = TorchDataLoader(val_s, batch_size=batch_size, shuffle=False, collate_fn=_collate_grouped, **loader_kwargs) if val_s else None
-                else:
-                    train_loader = PyGDataLoader(train_s, batch_size=batch_size, shuffle=True, **loader_kwargs)
-                    val_loader = PyGDataLoader(val_s, batch_size=batch_size, shuffle=False, **loader_kwargs) if val_s else None
+    for epoch in range(epochs):
+        if manifest is None:
+            if grouped_policy:
+                train_loader = TorchDataLoader(train_s, batch_size=batch_size, shuffle=True, collate_fn=_collate_grouped, **loader_kwargs)
+                val_loader = TorchDataLoader(val_s, batch_size=batch_size, shuffle=False, collate_fn=_collate_grouped, **loader_kwargs) if val_s else None
             else:
-                train_shards, train_counts = train_s
-                val_shards, val_counts = val_s
-                if val_shards:
-                    train_ds = _ShardIterableDataset(train_shards, train_counts, shuffle=True, seed=1234 + epoch)
-                    if grouped_policy:
-                        train_loader = TorchDataLoader(train_ds, batch_size=batch_size, shuffle=False, collate_fn=_collate_grouped, **loader_kwargs)  # type: ignore
-                    else:
-                        train_loader = PyGDataLoader(train_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)  # type: ignore
-                    val_ds = _ShardIterableDataset(val_shards, val_counts, shuffle=False, seed=4242)
-                    if grouped_policy:
-                        val_loader = TorchDataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=_collate_grouped, **loader_kwargs)  # type: ignore
-                    else:
-                        val_loader = PyGDataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)  # type: ignore
+                train_loader = PyGDataLoader(train_s, batch_size=batch_size, shuffle=True, **loader_kwargs)
+                val_loader = PyGDataLoader(val_s, batch_size=batch_size, shuffle=False, **loader_kwargs) if val_s else None
+        else:
+            train_shards, train_counts = train_s
+            val_shards, val_counts = val_s
+            if val_shards:
+                train_ds = _ShardIterableDataset(train_shards, train_counts, shuffle=True, seed=1234 + epoch)
+                if grouped_policy:
+                    train_loader = TorchDataLoader(train_ds, batch_size=batch_size, shuffle=False, collate_fn=_collate_grouped, **loader_kwargs)  # type: ignore
                 else:
-                    # If the shard-level split produced no validation shards (common when there's only one shard),
-                    # fall back to a deterministic per-state split based on state_id.
-                    split_mod = 20  # 5% validation (state_id % 20 == 0)
-                    train_ds = _ShardIterableDataset(
-                        train_shards,
-                        train_counts,
-                        shuffle=True,
-                        seed=1234 + epoch,
-                        state_id_mod=split_mod,
-                        state_id_rem=0,
-                        state_id_keep_equal=False,
-                    )
-                    if grouped_policy:
-                        train_loader = TorchDataLoader(train_ds, batch_size=batch_size, shuffle=False, collate_fn=_collate_grouped, **loader_kwargs)  # type: ignore
-                    else:
-                        train_loader = PyGDataLoader(train_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)  # type: ignore
-                    val_ds = _ShardIterableDataset(
-                        train_shards,
-                        train_counts,
-                        shuffle=False,
-                        seed=4242,
-                        state_id_mod=split_mod,
-                        state_id_rem=0,
-                        state_id_keep_equal=True,
-                    )
-                    if grouped_policy:
-                        val_loader = TorchDataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=_collate_grouped, **loader_kwargs)  # type: ignore
-                    else:
-                        val_loader = PyGDataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)  # type: ignore
+                    train_loader = PyGDataLoader(train_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)  # type: ignore
+                val_ds = _ShardIterableDataset(val_shards, val_counts, shuffle=False, seed=4242)
+                if grouped_policy:
+                    val_loader = TorchDataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=_collate_grouped, **loader_kwargs)  # type: ignore
+                else:
+                    val_loader = PyGDataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)  # type: ignore
+            else:
+                # If the shard-level split produced no validation shards (common when there's only one shard),
+                # fall back to a deterministic per-state split based on state_id.
+                split_mod = 20  # 5% validation (state_id % 20 == 0)
+                train_ds = _ShardIterableDataset(
+                    train_shards,
+                    train_counts,
+                    shuffle=True,
+                    seed=1234 + epoch,
+                    state_id_mod=split_mod,
+                    state_id_rem=0,
+                    state_id_keep_equal=False,
+                )
+                if grouped_policy:
+                    train_loader = TorchDataLoader(train_ds, batch_size=batch_size, shuffle=False, collate_fn=_collate_grouped, **loader_kwargs)  # type: ignore
+                else:
+                    train_loader = PyGDataLoader(train_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)  # type: ignore
+                val_ds = _ShardIterableDataset(
+                    train_shards,
+                    train_counts,
+                    shuffle=False,
+                    seed=4242,
+                    state_id_mod=split_mod,
+                    state_id_rem=0,
+                    state_id_keep_equal=True,
+                )
+                if grouped_policy:
+                    val_loader = TorchDataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=_collate_grouped, **loader_kwargs)  # type: ignore
+                else:
+                    val_loader = PyGDataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)  # type: ignore
 
-            model.train()
-            tot_loss = 0.0
-            n_batches = 0
-            # diagnostics writer (jsonl)
-            diag_fh = None
-            if diagnostics_out:
+        model.train()
+        tot_loss = 0.0
+        n_batches = 0
+        # diagnostics writer (jsonl)
+        diag_fh = None
+        if diagnostics_out:
+            try:
+                PathDir = os.path.dirname(diagnostics_out) or "."
+                os.makedirs(PathDir, exist_ok=True)
+            except Exception:
+                pass
+            try:
+                diag_fh = open(diagnostics_out, "a", encoding="utf-8")
+            except Exception:
+                diag_fh = None
+        for batch in train_loader:
+            if grouped_policy:
+                graph = batch["graph"].to(device_t)
+                move_feat = batch["move_feat"].to(device_t)
+                move_owner = batch["move_owner"].to(device_t)
+                p_targets = batch["policy"].to(device_t)
+                v_target = batch["value"].to(device_t)
+                with amp_ctx:
+                    pooled, g_flat = model.encode_graph(graph)
+                    v_in = torch.cat([pooled, g_flat], dim=-1)
+                    v = model.value_mlp(v_in).squeeze(-1)
+
+                    p_logit = model.policy_logits_grouped(pooled, move_feat, move_owner)
+                    logp = _grouped_log_softmax(p_logit, move_owner)
+                    bsz = int(pooled.size(0))
+                    loss_p = -(p_targets * logp).sum() / max(1, bsz)
+                    loss_v = value_crit(torch.sigmoid(v), v_target.view(-1))
+                    loss = loss_p + float(value_weight) * loss_v
+            else:
+                batch = batch.to(device_t)
+                with amp_ctx:
+                    p_logit, v = model(batch)
+                    state_id = batch.state_id.view(-1)
+                    p_targets = batch.y.view(-1)
+                    _, inv = torch.unique(state_id, return_inverse=True)
+                    num_groups = int(inv.max().item()) + 1 if inv.numel() else 0
+
+                    ones = torch.ones_like(p_targets)
+                    denom = torch.zeros(num_groups, device=device_t).scatter_add_(0, inv, p_targets)
+                    counts = torch.zeros(num_groups, device=device_t).scatter_add_(0, inv, ones)
+
+                    denom_safe = denom.clamp(min=1e-12)
+                    tgt_norm = p_targets / denom_safe[inv]
+                    zero_mask = denom[inv] <= 0
+                    tgt = torch.where(zero_mask, 1.0 / counts[inv].clamp(min=1.0), tgt_norm)
+
+                    p = pyg_softmax(p_logit, inv)
+                    logp = torch.log(p.clamp(min=1e-12))
+                    loss_p = -(tgt * logp).sum() / max(1, num_groups)
+
+                    v_target = batch.value.view(-1)
+                    loss_v = value_crit(torch.sigmoid(v), v_target)
+                    loss = loss_p + float(value_weight) * loss_v
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            scheduler.step()
+            tot_loss += float(loss.item())
+            n_batches += 1
+
+            # write per-batch diagnostics if requested
+            if diag_fh is not None:
                 try:
-                    PathDir = os.path.dirname(diagnostics_out) or "."
-                    os.makedirs(PathDir, exist_ok=True)
+                    lr_now = float(opt.param_groups[0]["lr"]) if opt.param_groups else float(lr)
+                    v_pred = torch.sigmoid(v.detach())
+                    v_tgt = v_target.detach().view(-1)
+                    v_diff = v_pred - v_tgt
+                    v_mae = float(v_diff.abs().mean().item()) if v_diff.numel() else 0.0
+                    v_mse = float((v_diff * v_diff).mean().item()) if v_diff.numel() else 0.0
+                    v_rmse = float(math.sqrt(v_mse))
+                    v_pred_mean = float(v_pred.mean().item()) if v_pred.numel() else 0.0
+                    v_tgt_mean = float(v_tgt.mean().item()) if v_tgt.numel() else 0.0
+                    v_pred_min = float(v_pred.min().item()) if v_pred.numel() else 0.0
+                    v_pred_max = float(v_pred.max().item()) if v_pred.numel() else 0.0
+                    v_tgt_min = float(v_tgt.min().item()) if v_tgt.numel() else 0.0
+                    v_tgt_max = float(v_tgt.max().item()) if v_tgt.numel() else 0.0
+                    # compute grad norm
+                    gn = 0.0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            try:
+                                gn += float(p.grad.data.float().norm().item() ** 2)
+                            except Exception:
+                                pass
+                    grad_norm = float(math.sqrt(max(0.0, gn)))
+                    rec = {
+                        "ts": time.time(),
+                        "epoch": int(epoch),
+                        "batch": int(n_batches),
+                        "loss": float(loss.item()),
+                        "loss_p": float(loss_p) if 'loss_p' in locals() else None,
+                        "loss_v": float(loss_v) if 'loss_v' in locals() else None,
+                        "lr": lr_now,
+                        "grad_norm": grad_norm,
+                        "value_pred_mean": v_pred_mean,
+                        "value_target_mean": v_tgt_mean,
+                        "value_pred_min": v_pred_min,
+                        "value_pred_max": v_pred_max,
+                        "value_target_min": v_tgt_min,
+                        "value_target_max": v_tgt_max,
+                        "value_mae": v_mae,
+                        "value_rmse": v_rmse,
+                        "value_mse": v_mse,
+                    }
+                    diag_fh.write(json.dumps(rec) + "\n")
+                    if n_batches % 50 == 0:
+                        diag_fh.flush()
                 except Exception:
                     pass
-                try:
-                    diag_fh = open(diagnostics_out, "a", encoding="utf-8")
-                except Exception:
-                    diag_fh = None
-            for batch in train_loader:
-                if grouped_policy:
-                    graph = batch["graph"].to(device_t)
-                    move_feat = batch["move_feat"].to(device_t)
-                    move_owner = batch["move_owner"].to(device_t)
-                    p_targets = batch["policy"].to(device_t)
-                    v_target = batch["value"].to(device_t)
-                    with amp_ctx:
-                        pooled, g_flat = model.encode_graph(graph)
-                        v_in = torch.cat([pooled, g_flat], dim=-1)
-                        v = model.value_mlp(v_in).squeeze(-1)
 
-                        p_logit = model.policy_logits_grouped(pooled, move_feat, move_owner)
-                        logp = _grouped_log_softmax(p_logit, move_owner)
-                        bsz = int(pooled.size(0))
-                        loss_p = -(p_targets * logp).sum() / max(1, bsz)
-                        loss_v = value_crit(torch.sigmoid(v), v_target.view(-1))
-                        loss = loss_p + float(value_weight) * loss_v
-                else:
-                    batch = batch.to(device_t)
-                    with amp_ctx:
-                        p_logit, v = model(batch)
-                        state_id = batch.state_id.view(-1)
-                        p_targets = batch.y.view(-1)
-                        _, inv = torch.unique(state_id, return_inverse=True)
-                        num_groups = int(inv.max().item()) + 1 if inv.numel() else 0
+            if effective_steps_per_epoch > 0 and n_batches >= effective_steps_per_epoch:
+                break
 
-                        ones = torch.ones_like(p_targets)
-                        denom = torch.zeros(num_groups, device=device_t).scatter_add_(0, inv, p_targets)
-                        counts = torch.zeros(num_groups, device=device_t).scatter_add_(0, inv, ones)
-
-                        denom_safe = denom.clamp(min=1e-12)
-                        tgt_norm = p_targets / denom_safe[inv]
-                        zero_mask = denom[inv] <= 0
-                        tgt = torch.where(zero_mask, 1.0 / counts[inv].clamp(min=1.0), tgt_norm)
-
-                        p = pyg_softmax(p_logit, inv)
-                        logp = torch.log(p.clamp(min=1e-12))
-                        loss_p = -(tgt * logp).sum() / max(1, num_groups)
-
-                        v_target = batch.value.view(-1)
-                        loss_v = value_crit(torch.sigmoid(v), v_target)
-                        loss = loss_p + float(value_weight) * loss_v
-
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                opt.step()
-                scheduler.step()
-                tot_loss += float(loss.item())
-                n_batches += 1
-
-                # write per-batch diagnostics if requested
-                if diag_fh is not None:
+            if device_t.type == "mps" and hasattr(torch, "mps"):
+                if n_batches % 50 == 0:
+                    cur = torch.mps.current_allocated_memory()
+                    driver = None
                     try:
-                        lr_now = float(opt.param_groups[0]["lr"]) if opt.param_groups else float(lr)
-                        v_pred = torch.sigmoid(v.detach())
-                        v_tgt = v_target.detach().view(-1)
-                        v_diff = v_pred - v_tgt
-                        v_mae = float(v_diff.abs().mean().item()) if v_diff.numel() else 0.0
-                        v_mse = float((v_diff * v_diff).mean().item()) if v_diff.numel() else 0.0
-                        v_rmse = float(math.sqrt(v_mse))
-                        v_pred_mean = float(v_pred.mean().item()) if v_pred.numel() else 0.0
-                        v_tgt_mean = float(v_tgt.mean().item()) if v_tgt.numel() else 0.0
-                        v_pred_min = float(v_pred.min().item()) if v_pred.numel() else 0.0
-                        v_pred_max = float(v_pred.max().item()) if v_pred.numel() else 0.0
-                        v_tgt_min = float(v_tgt.min().item()) if v_tgt.numel() else 0.0
-                        v_tgt_max = float(v_tgt.max().item()) if v_tgt.numel() else 0.0
-                        # compute grad norm
-                        gn = 0.0
-                        for p in model.parameters():
-                            if p.grad is not None:
-                                try:
-                                    gn += float(p.grad.data.float().norm().item() ** 2)
-                                except Exception:
-                                    pass
-                        grad_norm = float(math.sqrt(max(0.0, gn)))
-                        rec = {
-                            "ts": time.time(),
-                            "epoch": int(epoch),
-                            "batch": int(n_batches),
-                            "loss": float(loss.item()),
-                            "loss_p": float(loss_p) if 'loss_p' in locals() else None,
-                            "loss_v": float(loss_v) if 'loss_v' in locals() else None,
-                            "lr": lr_now,
-                            "grad_norm": grad_norm,
-                            "value_pred_mean": v_pred_mean,
-                            "value_target_mean": v_tgt_mean,
-                            "value_pred_min": v_pred_min,
-                            "value_pred_max": v_pred_max,
-                            "value_target_min": v_tgt_min,
-                            "value_target_max": v_tgt_max,
-                            "value_mae": v_mae,
-                            "value_rmse": v_rmse,
-                            "value_mse": v_mse,
-                        }
-                        diag_fh.write(json.dumps(rec) + "\n")
-                        if n_batches % 50 == 0:
-                            diag_fh.flush()
+                        driver = torch.mps.driver_allocated_memory()
                     except Exception:
-                        pass
-
-                if effective_steps_per_epoch > 0 and n_batches >= effective_steps_per_epoch:
-                    break
-
-                if device_t.type == "mps" and hasattr(torch, "mps"):
-                    if n_batches % 50 == 0:
-                        cur = torch.mps.current_allocated_memory()
                         driver = None
-                        try:
-                            driver = torch.mps.driver_allocated_memory()
-                        except Exception:
-                            driver = None
-                        if driver is not None:
-                            print(f"[mps memory] batch={n_batches} current={cur/1e6:.2f}MB driver={driver/1e6:.2f}MB")
-                        else:
-                            print(f"[mps memory] batch={n_batches} current={cur/1e6:.2f}MB")
-                    if clear_cache_interval and clear_cache_interval > 0 and n_batches % clear_cache_interval == 0:
-                        _clear_device_cache(device_t)
+                    if driver is not None:
+                        print(f"[mps memory] batch={n_batches} current={cur/1e6:.2f}MB driver={driver/1e6:.2f}MB")
+                    else:
+                        print(f"[mps memory] batch={n_batches} current={cur/1e6:.2f}MB")
+                if clear_cache_interval and clear_cache_interval > 0 and n_batches % clear_cache_interval == 0:
+                    _clear_device_cache(device_t)
 
-                if rss_log_interval and rss_log_interval > 0 and n_batches % rss_log_interval == 0:
-                    try:
-                        ru = resource.getrusage(resource.RUSAGE_SELF)
-                        rss_bytes = float(ru.ru_maxrss if os.name == "posix" and hasattr(os, "uname") and os.uname().sysname == "Darwin" else ru.ru_maxrss * 1024.0)
-                        rss_mb = rss_bytes / (1024.0 * 1024.0)
-                        print(f"[rss] batch={n_batches} rss={rss_mb:.2f}MB (bytes={rss_bytes:.0f})")
-                    except Exception as e:
-                        print(f"[rss] batch={n_batches} failed to read rss: {e}")
+            if rss_log_interval and rss_log_interval > 0 and n_batches % rss_log_interval == 0:
+                try:
+                    ru = resource.getrusage(resource.RUSAGE_SELF)
+                    rss_bytes = float(ru.ru_maxrss if os.name == "posix" and hasattr(os, "uname") and os.uname().sysname == "Darwin" else ru.ru_maxrss * 1024.0)
+                    rss_mb = rss_bytes / (1024.0 * 1024.0)
+                    print(f"[rss] batch={n_batches} rss={rss_mb:.2f}MB (bytes={rss_bytes:.0f})")
+                except Exception as e:
+                    print(f"[rss] batch={n_batches} failed to read rss: {e}")
 
-            avg_loss = tot_loss / max(1, n_batches)
-            val_loss = None
-            if val_loader:
-                model.eval()
-                v_tot = 0.0
-                v_batches = 0
-                with torch.no_grad():
-                    for batch in val_loader:
-                        if grouped_policy:
-                            graph = batch["graph"].to(device_t)
-                            move_feat = batch["move_feat"].to(device_t)
-                            move_owner = batch["move_owner"].to(device_t)
-                            p_targets = batch["policy"].to(device_t)
-                            v_target = batch["value"].to(device_t)
-                            with amp_ctx:
-                                pooled, g_flat = model.encode_graph(graph)
-                                v_in = torch.cat([pooled, g_flat], dim=-1)
-                                v = model.value_mlp(v_in).squeeze(-1)
-                                p_logit = model.policy_logits_grouped(pooled, move_feat, move_owner)
-                                logp = _grouped_log_softmax(p_logit, move_owner)
-                                bsz = int(pooled.size(0))
-                                loss_p = -(p_targets * logp).sum() / max(1, bsz)
-                                loss_v = value_crit(torch.sigmoid(v), v_target.view(-1))
-                                v_tot += float((loss_p + loss_v).item())
-                        else:
-                            batch = batch.to(device_t)
-                            with amp_ctx:
-                                p_logit, v = model(batch)
-                                state_id = batch.state_id.view(-1)
-                                p_targets = batch.y.view(-1)
-                                _, inv = torch.unique(state_id, return_inverse=True)
-                                num_groups = int(inv.max().item()) + 1 if inv.numel() else 0
+        avg_loss = tot_loss / max(1, n_batches)
+        val_loss = None
+        if val_loader:
+            model.eval()
+            v_tot = 0.0
+            v_batches = 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    if grouped_policy:
+                        graph = batch["graph"].to(device_t)
+                        move_feat = batch["move_feat"].to(device_t)
+                        move_owner = batch["move_owner"].to(device_t)
+                        p_targets = batch["policy"].to(device_t)
+                        v_target = batch["value"].to(device_t)
+                        with amp_ctx:
+                            pooled, g_flat = model.encode_graph(graph)
+                            v_in = torch.cat([pooled, g_flat], dim=-1)
+                            v = model.value_mlp(v_in).squeeze(-1)
+                            p_logit = model.policy_logits_grouped(pooled, move_feat, move_owner)
+                            logp = _grouped_log_softmax(p_logit, move_owner)
+                            bsz = int(pooled.size(0))
+                            loss_p = -(p_targets * logp).sum() / max(1, bsz)
+                            loss_v = value_crit(torch.sigmoid(v), v_target.view(-1))
+                            v_tot += float((loss_p + loss_v).item())
+                    else:
+                        batch = batch.to(device_t)
+                        with amp_ctx:
+                            p_logit, v = model(batch)
+                            state_id = batch.state_id.view(-1)
+                            p_targets = batch.y.view(-1)
+                            _, inv = torch.unique(state_id, return_inverse=True)
+                            num_groups = int(inv.max().item()) + 1 if inv.numel() else 0
 
-                                ones = torch.ones_like(p_targets)
-                                denom = torch.zeros(num_groups, device=device_t).scatter_add_(0, inv, p_targets)
-                                counts = torch.zeros(num_groups, device=device_t).scatter_add_(0, inv, ones)
-                                denom_safe = denom.clamp(min=1e-12)
-                                tgt_norm = p_targets / denom_safe[inv]
-                                zero_mask = denom[inv] <= 0
-                                tgt = torch.where(zero_mask, 1.0 / counts[inv].clamp(min=1.0), tgt_norm)
+                            ones = torch.ones_like(p_targets)
+                            denom = torch.zeros(num_groups, device=device_t).scatter_add_(0, inv, p_targets)
+                            counts = torch.zeros(num_groups, device=device_t).scatter_add_(0, inv, ones)
+                            denom_safe = denom.clamp(min=1e-12)
+                            tgt_norm = p_targets / denom_safe[inv]
+                            zero_mask = denom[inv] <= 0
+                            tgt = torch.where(zero_mask, 1.0 / counts[inv].clamp(min=1.0), tgt_norm)
 
-                                p = pyg_softmax(p_logit, inv)
-                                logp = torch.log(p.clamp(min=1e-12))
-                                loss_p = -(tgt * logp).sum() / max(1, num_groups)
-                                loss_v = value_crit(torch.sigmoid(v), batch.value.view(-1))
-                                v_tot += float((loss_p + loss_v).item())
-                        v_batches += 1
-                    val_loss = v_tot / max(1, v_batches)
+                            p = pyg_softmax(p_logit, inv)
+                            logp = torch.log(p.clamp(min=1e-12))
+                            loss_p = -(tgt * logp).sum() / max(1, num_groups)
+                            loss_v = value_crit(torch.sigmoid(v), batch.value.view(-1))
+                            v_tot += float((loss_p + loss_v).item())
+                    v_batches += 1
+                val_loss = v_tot / max(1, v_batches)
 
-            print(f"epoch {epoch+1}/{epochs} train_loss={avg_loss:.4f} val_loss={val_loss if val_loss is not None else 'NA'}")
-        if out_path:
-            torch.save(model.state_dict(), out_path)
-            print(f"Saved final model to {out_path}")
+        print(f"epoch {epoch+1}/{epochs} train_loss={avg_loss:.4f} val_loss={val_loss if val_loss is not None else 'NA'}")
+    if out_path:
+        torch.save(model.state_dict(), out_path)
+        print(f"Saved final model to {out_path}")
 
-        _clear_device_cache(device_t)
-    finally:
-        try:
-            if diag_fh is not None:
-                diag_fh.close()
-        except Exception:
-            pass
-        try:
-            del train_loader
-            del val_loader
-        except Exception:
-            pass
-        try:
-            del train_s
-            del val_s
-        except Exception:
-            pass
-        try:
-            del opt
-            del model
-        except Exception:
-            pass
-        gc.collect()
-        _clear_device_cache(device_t)
+    _clear_device_cache(device_t)
 
 
 def main():

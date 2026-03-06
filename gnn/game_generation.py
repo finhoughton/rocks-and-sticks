@@ -134,16 +134,16 @@ def randomize_start(
         alpha = 0.7
         r_weights = [math.exp(alpha * k) for k in range(0, max_rocks)]
         rocks_each = random.choices(range(0, max_rocks), weights=r_weights, k=1)[0]
-        for p in game.players:
+        for pnum in range(game.num_players):
             for _ in range(rocks_each + (random.random() > 0.3)):
-                rock_moves = [m for m in game.get_possible_moves(p.number) if m.t == "R"]
+                rock_moves = [m for m in game.get_possible_moves(pnum) if m.t == "R"]
                 if not rock_moves:
                     break
                 rock_weights = [12.0 if ((node := game.points.get(m.c)) is not None and node.connected) else 1.0 for m in rock_moves]
                 mv = random.choices(rock_moves, weights=rock_weights, k=1)[0]
-                game.do_move(p.number, mv)
+                game.do_move(pnum, mv)
                 _moves.append(mv)
-                _movers.append(p.number)
+                _movers.append(pnum)
 
         # --- filter check: probe for quick forced wins ---
         if use_filter and probe_fn is not None and _filter_attempt < max_outer - 1:

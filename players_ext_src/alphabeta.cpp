@@ -137,7 +137,12 @@ void AlphaBetaEngine::order_moves_enhanced(std::vector<Move> &moves, GameState &
             else if (m.t == 'R')
                 pri = 0;
             else
-                pri = 100000; // sticks
+            {
+                // Sticks: base + closure area bonus (scoring sticks first)
+                pri = 100000;
+                int a2 = closure_area2_for_stick(g, m);
+                pri += a2 * 10000; // big bonus for sticks that close area
+            }
 
             // Add history bonus
             std::uint32_t idx = move_hash(m);
@@ -185,6 +190,17 @@ Move AlphaBetaEngine::choose_move(const GameState &root, int depth, int move_cap
     last_root_player = root_player;
     this->move_cap = std::max(1, move_cap);
 
+    // Initialize search state for PVS (killers, counters, abort flag)
+    nodes_searched = 0;
+    search_aborted = false;
+    search_start = std::chrono::steady_clock::now();
+    search_time_limit_ms = 0;  // no time limit for fixed-depth
+    for (int p = 0; p < MAX_PLY; ++p)
+    {
+        killers[p][0] = Move{0, 0, 'P'};
+        killers[p][1] = Move{0, 0, 'P'};
+    }
+
     {
         auto moves = game.get_possible_moves_for_player(game.current_player);
         order_moves_inplace(moves);
@@ -217,13 +233,30 @@ Move AlphaBetaEngine::choose_move(const GameState &root, int depth, int move_cap
     double alpha = -1e300;
     double beta = 1e300;
 
-    for (auto &m : moves)
+    for (size_t i = 0; i < moves.size(); ++i)
     {
+        auto &m = moves[i];
         if (!game.is_move_legal(m, game.current_player))
             continue;
         int mover = game.current_player;
         game.do_move(m, mover);
-        double v = alpha_beta(game, depth - 1, alpha, beta);
+
+        double v;
+        if (i == 0)
+        {
+            // First move: full window
+            v = alpha_beta_pvs(game, depth - 1, 1, alpha, beta, true, 2);
+        }
+        else
+        {
+            // PVS: null-window search
+            v = alpha_beta_pvs(game, depth - 1, 1, alpha, alpha + 0.01, true, 2);
+            if (v > alpha && v < beta)
+            {
+                // Re-search with full window
+                v = alpha_beta_pvs(game, depth - 1, 1, alpha, beta, true, 2);
+            }
+        }
         game.undo_move();
 
         if (m.t == 'P')
@@ -264,6 +297,17 @@ std::vector<std::pair<Move, double>> AlphaBetaEngine::choose_move_with_values(
     last_root_player = root_player;
     this->move_cap = std::max(1, move_cap);
 
+    // Initialize search state for PVS
+    nodes_searched = 0;
+    search_aborted = false;
+    search_start = std::chrono::steady_clock::now();
+    search_time_limit_ms = 0;
+    for (int p = 0; p < MAX_PLY; ++p)
+    {
+        killers[p][0] = Move{0, 0, 'P'};
+        killers[p][1] = Move{0, 0, 'P'};
+    }
+
     auto moves = game.get_possible_moves_for_player(game.current_player);
     if (!moves.empty())
         moves = filter_search_moves(moves, game, game.current_player);
@@ -272,17 +316,33 @@ std::vector<std::pair<Move, double>> AlphaBetaEngine::choose_move_with_values(
         moves.resize((size_t)this->move_cap);
 
     std::vector<std::pair<Move, double>> results;
-    for (auto &m : moves)
+    double alpha = -1e300;
+    double beta = 1e300;
+    for (size_t i = 0; i < moves.size(); ++i)
     {
+        auto &m = moves[i];
         if (!game.is_move_legal(m, game.current_player))
             continue;
         int mover = game.current_player;
         game.do_move(m, mover);
-        double v = alpha_beta(game, depth - 1, -1e300, 1e300);
+
+        double v;
+        if (i == 0)
+        {
+            v = alpha_beta_pvs(game, depth - 1, 1, alpha, beta, true, 2);
+        }
+        else
+        {
+            v = alpha_beta_pvs(game, depth - 1, 1, alpha, alpha + 0.01, true, 2);
+            if (v > alpha && v < beta)
+                v = alpha_beta_pvs(game, depth - 1, 1, alpha, beta, true, 2);
+        }
         game.undo_move();
+
         if (m.t == 'P')
             v -= pass_penalty;
         results.push_back({m, v});
+        alpha = std::max(alpha, v);
     }
     // Sort by descending value
     std::sort(results.begin(), results.end(),
@@ -414,16 +474,16 @@ asp_retry:
             if (i == 0)
             {
                 // First move: full window PVS search
-                v = alpha_beta_pvs(game, depth - 1, 1, alpha, beta, true, 0);
+                v = alpha_beta_pvs(game, depth - 1, 1, alpha, beta, true, 2);
             }
             else
             {
                 // PVS: null-window search for subsequent moves
-                v = alpha_beta_pvs(game, depth - 1, 1, alpha, alpha + 0.01, true, 0);
+                v = alpha_beta_pvs(game, depth - 1, 1, alpha, alpha + 0.01, true, 2);
                 if (v > alpha && v < beta && !search_aborted)
                 {
                     // Re-search with full window
-                    v = alpha_beta_pvs(game, depth - 1, 1, alpha, beta, true, 0);
+                    v = alpha_beta_pvs(game, depth - 1, 1, alpha, beta, true, 2);
                 }
             }
             game.undo_move();
@@ -1684,7 +1744,7 @@ double AlphaBetaEngine::alpha_beta_pvs(GameState &g, int depth, int ply,
     // ---- Null-move pruning (heuristic mode only) ----
     // Disabled in narrow PVS windows to avoid false cutoffs (Bug #3 fix)
     bool wide_window = (beta - alpha) > 1.0;
-    if (allow_null_move && wide_window && depth >= 5 && use_heuristic_eval && ply > 0)
+    if (allow_null_move && wide_window && depth >= 3 && use_heuristic_eval && ply > 0)
     {
         // Safety: only try null-move if pass is legal
         Move null_move{0, 0, 'P'};
@@ -1807,10 +1867,10 @@ double AlphaBetaEngine::alpha_beta_pvs(GameState &g, int depth, int ply,
         if (!g.is_move_legal(m, g.current_player))
             continue;
 
-        // Futility pruning: skip non-first moves at shallow depth
-        if (futility_prune && move_count > 0 && m.t != 'R')
+        // Futility pruning: skip non-first quiet moves at shallow depth
+        // Rocks are quiet (positional); sticks are tactical (can score area)
+        if (futility_prune && move_count > 0 && m.t == 'R')
         {
-            // Still search scoring-potential moves (rocks can create/block area)
             continue;
         }
 
@@ -1820,18 +1880,28 @@ double AlphaBetaEngine::alpha_beta_pvs(GameState &g, int depth, int ply,
         // Check for immediate win — never reduce/prune these
         bool gives_win = (g.winner != -1);
 
+        // --- Scoring-move extensions ---
+        // Extend search for moves that win or score area (tactical importance)
+        int ext = 0;
+        if (extensions_left > 0 && gives_win)
+        {
+            ext = 1;
+        }
+        int child_extensions = extensions_left - ext;
+        int child_depth = depth - 1 + ext;
+
         double v;
         if (move_count == 0)
         {
             // First move: full window search
-            v = alpha_beta_pvs(g, depth - 1, ply + 1, alpha, beta, true, extensions_left);
+            v = alpha_beta_pvs(g, child_depth, ply + 1, alpha, beta, true, child_extensions);
         }
         else
         {
             // ---- Late Move Reductions (LMR) ----
             // Reduce search depth for late quiet moves that are unlikely to be best
             int lmr_reduction = 0;
-            if (depth >= 3 && move_count >= 4 && !gives_win && m.t != 'R')
+            if (depth >= 3 && move_count >= 4 && !gives_win && m.t == 'R')
             {
                 // Reduce more for later moves
                 lmr_reduction = 1;
@@ -1842,25 +1912,25 @@ double AlphaBetaEngine::alpha_beta_pvs(GameState &g, int depth, int ply,
                     lmr_reduction = std::max(0, depth - 2);
             }
 
-            int search_depth = depth - 1 - lmr_reduction;
+            int search_depth = child_depth - lmr_reduction;
 
             // PVS: null-window search
             if (maximising)
             {
-                v = alpha_beta_pvs(g, search_depth, ply + 1, alpha, alpha + 0.01, true, extensions_left);
+                v = alpha_beta_pvs(g, search_depth, ply + 1, alpha, alpha + 0.01, true, child_extensions);
                 // Re-search at full depth if reduced search improved alpha
                 if (lmr_reduction > 0 && v > alpha && !search_aborted)
-                    v = alpha_beta_pvs(g, depth - 1, ply + 1, alpha, alpha + 0.01, true, extensions_left);
+                    v = alpha_beta_pvs(g, child_depth, ply + 1, alpha, alpha + 0.01, true, child_extensions);
                 if (v > alpha && v < beta && !search_aborted)
-                    v = alpha_beta_pvs(g, depth - 1, ply + 1, alpha, beta, true, extensions_left);
+                    v = alpha_beta_pvs(g, child_depth, ply + 1, alpha, beta, true, child_extensions);
             }
             else
             {
-                v = alpha_beta_pvs(g, search_depth, ply + 1, beta - 0.01, beta, true, extensions_left);
+                v = alpha_beta_pvs(g, search_depth, ply + 1, beta - 0.01, beta, true, child_extensions);
                 if (lmr_reduction > 0 && v < beta && !search_aborted)
-                    v = alpha_beta_pvs(g, depth - 1, ply + 1, beta - 0.01, beta, true, extensions_left);
+                    v = alpha_beta_pvs(g, child_depth, ply + 1, beta - 0.01, beta, true, child_extensions);
                 if (v < beta && v > alpha && !search_aborted)
-                    v = alpha_beta_pvs(g, depth - 1, ply + 1, alpha, beta, true, extensions_left);
+                    v = alpha_beta_pvs(g, child_depth, ply + 1, alpha, beta, true, child_extensions);
             }
         }
         g.undo_move();

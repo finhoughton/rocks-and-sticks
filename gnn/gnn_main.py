@@ -146,6 +146,24 @@ def main() -> None:
         default="loss_curve.png",
         help="path to save the loss plot when --plot-loss is set",
     )
+    parser.add_argument(
+        "--extra-dirs",
+        nargs="*",
+        default=["saved_games_ab_vs_ab"],
+        help="additional saved game directories to include during training",
+    )
+    parser.add_argument(
+        "--only-extra-dirs",
+        action="store_true",
+        default=False,
+        help="when set, ignore default saved_games_ab2/mcts/human and train only from --extra-dirs",
+    )
+    parser.add_argument(
+        "--init-from",
+        type=str,
+        default=None,
+        help="warm-start training from this GNNEval checkpoint (fine-tune instead of training from scratch)",
+    )
 
     args = parser.parse_args()
     seed_base = args.seed_base
@@ -207,12 +225,22 @@ def main() -> None:
         val_dataset = []
     else:
         # Only training, not generating new games
-        extra_dirs = ["saved_games_ab_vs_ab"]
-        print("Loading balanced dataset from saved_games_ab2, saved_games_mcts, saved_games_human + extras...")
+        extra_dirs = [d for d in args.extra_dirs if isinstance(d, str) and d.strip()]
+        if args.only_extra_dirs:
+            base_ab = "__none__/saved_games_ab2"
+            base_mcts = "__none__/saved_games_mcts"
+            base_human = "__none__/saved_games_human"
+            print("Loading balanced dataset from extras only...")
+        else:
+            base_ab = "saved_games_ab2"
+            base_mcts = "saved_games_mcts"
+            base_human = "saved_games_human"
+            print("Loading balanced dataset from saved_games_ab2, saved_games_mcts, saved_games_human + extras...")
+
         samples = load_balanced_saved_game_samples(
-            "saved_games_ab2",
-            "saved_games_mcts",
-            "saved_games_human",
+            base_ab,
+            base_mcts,
+            base_human,
             balance_classes=args.balance_classes,
             balance_strategy=args.balance_strategy,
             balance_seed=args.balance_seed,
@@ -241,6 +269,7 @@ def main() -> None:
             lr=args.lr,
             device=args.device,
             best_model_out=args.out,
+            init_from=args.init_from,
         )
         # `train` will save the best checkpoint to args.out when validation improves.
         if not args.out:

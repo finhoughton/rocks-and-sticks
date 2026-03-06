@@ -36,10 +36,10 @@ def test_run_loop_cpp_eval_records_nn_usage(tmp_path):
     pol_ckpt = tmp_path / "policy_test.pt"
     torch.save(pol.state_dict(), pol_ckpt)
 
-    from rl.run_loop import _evaluate_vs_random
+    from rl.eval import evaluate_vs_random
 
     # Keep it tiny so it runs fast in unit tests.
-    res = _evaluate_vs_random(
+    res = evaluate_vs_random(
         backend="cpp",
         device="cpu",
         eval_games=1,
@@ -78,9 +78,9 @@ def test_run_loop_cpp_eval_disables_exploration_noise(tmp_path):
     pol_ckpt = tmp_path / "policy_test2.pt"
     torch.save(pol.state_dict(), pol_ckpt)
 
-    from rl.run_loop import _evaluate_vs_random
+    from rl.eval import evaluate_vs_random
 
-    r1 = _evaluate_vs_random(
+    r1 = evaluate_vs_random(
         backend="cpp",
         device="cpu",
         eval_games=2,
@@ -95,7 +95,7 @@ def test_run_loop_cpp_eval_disables_exploration_noise(tmp_path):
         cpp_use_nn_value=False,
     )
 
-    r2 = _evaluate_vs_random(
+    r2 = evaluate_vs_random(
         backend="cpp",
         device="cpu",
         eval_games=2,
