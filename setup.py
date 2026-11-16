@@ -40,6 +40,13 @@ ext_modules = [
         extra_compile_args=extra_compile_args,
         extra_link_args=extra_link_args + (["-framework", "Accelerate"] if sys.platform == "darwin" else []),
     ),
+    # The newer engine (players/rs_player.py). Header-only apart from the bindings.
+    Pybind11Extension(
+        "rs_engine",
+        ["engine_src/rs_bindings.cpp"],
+        include_dirs=["engine_src"],
+        extra_compile_args=["-O3", "-DNDEBUG", "-std=c++17"],
+    ),
 ]
 
 setup(
