@@ -12,7 +12,13 @@ test.txt
 !scripts/rewatch.py
 !tests
 !players_ext_src
+!engine_src
+engine_src/rs_selfplay
+!tools
 *.png
 *.log
 *.so
 gnn_benchmark_output.txt
+nohup.out
+!engine_src/versions
+!engine_src/versions/*/
