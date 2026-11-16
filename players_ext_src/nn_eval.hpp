@@ -34,6 +34,15 @@ public:
     // Evaluate multiple positions, returns logits
     std::vector<float> evaluate_batch(const std::vector<NNInput> &inputs) const;
 
+    // Policy head: run backbone once, then score each move cheaply.
+    // backbone_forward returns cat(pooled, global_feats) vector [hidden + gfd].
+    std::vector<float> backbone_forward(const NNInput &input) const;
+    // policy_score: given backbone output and a move feature vector, return raw logit.
+    float policy_score(const std::vector<float> &backbone_out,
+                       const float *move_feat, int mfd) const;
+    bool has_policy() const { return has_policy_; }
+    int move_feat_dim() const { return move_feat_dim_; }
+
     int node_feat_dim() const { return node_feat_dim_; }
     int global_feat_dim() const { return global_feat_dim_; }
     int hidden_dim() const { return hidden_; }
@@ -74,6 +83,16 @@ private:
     std::vector<float> head0_b_; // [hidden]
     std::vector<float> head3_w_; // [1, hidden] stored as [hidden]
     float head3_b_ = 0.0f;
+
+    // Policy head (optional): Sequential(Linear(policy_in, hidden), ReLU, Linear(hidden, 1))
+    // policy_in = hidden + global_feat_dim + move_feat_dim
+    bool has_policy_ = false;
+    int move_feat_dim_ = 0;
+    std::vector<float> pol0_w_; // [hidden, policy_in]
+    std::vector<float> pol0_b_; // [hidden]
+    std::vector<float> pol2_w_; // [1, hidden] stored as [hidden]
+    float pol2_b_ = 0.0f;
+    mutable std::vector<float> buf_pol_in_, buf_pol_hidden_;
 
     // Matrix multiply: C = A @ B^T, A:[M,K], B:[N,K], C:[M,N]
     static void matmul(const float *A, const float *B, float *C,

@@ -17,6 +17,7 @@ from gnn.encode import EncodedGraph, encode_game_to_graph
 
 INIT_MEAN = 0.0
 INIT_STD = 0.4
+MOVE_FEAT_DIM = 16  # [x, y, is_pass, is_rock, end_x, end_y, dx, dy, dir_onehot(8)]
 
 def _init_parameters(module: nn.Module, mean: float = INIT_MEAN, std: float = INIT_STD) -> None:
     for p in module.parameters():
@@ -33,9 +34,11 @@ class GNNEval(nn.Module):
         hidden: int = 384,
         num_hidden_layers: int = 5,
         dropout: float = 0.1,
+        move_feat_dim: int = MOVE_FEAT_DIM,
     ) -> None:
         super().__init__() # type: ignore
         self.dropout_p = dropout
+        self.move_feat_dim = move_feat_dim
 
         def mlp(in_dim: int, out_dim: int) -> nn.Sequential:
             return nn.Sequential(nn.Linear(in_dim, out_dim), nn.ReLU(), nn.Linear(out_dim, out_dim))
@@ -52,11 +55,21 @@ class GNNEval(nn.Module):
             nn.Linear(hidden, 1),
         )
 
+        # Policy head: scores a single move given the backbone's pooled embedding.
+        # Input: cat([pooled(hidden), global_feats(gfd), move_feat(mfd)])
+        policy_in = hidden + global_feat_dim + move_feat_dim
+        self.policy_mlp = nn.Sequential(
+            nn.Linear(policy_in, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+
         _init_parameters(self)
 
-    def forward(self, data: Data.Data) -> torch.Tensor:
+    def backbone_forward(self, data: Data.Data) -> torch.Tensor:
+        """Run GNN backbone and return cat([pooled, global_feats])."""
         x, edge_index, edge_attr, batch, g = data.x, data.edge_index, data.edge_attr, data.batch, data.global_feats
-        h: torch.Tensor = x # type: ignore
+        h: torch.Tensor = x  # type: ignore
         for i, conv in enumerate(self.convs):
             h_in = h
             h = conv(h, edge_index, edge_attr)
@@ -66,8 +79,29 @@ class GNNEval(nn.Module):
             if h.shape == h_in.shape:
                 h = h + h_in
         pooled = global_mean_pool(h, batch)  # type: ignore
-        logits = self.head(torch.cat([pooled, g], dim=-1))
+        return torch.cat([pooled, g], dim=-1)  # [B, hidden + gfd]
+
+    def forward(self, data: Data.Data) -> torch.Tensor:
+        pooled_cat = self.backbone_forward(data)
+        logits = self.head(pooled_cat)
         return logits.squeeze(-1)
+
+    def policy_forward(self, pooled_cat: torch.Tensor, move_feats: torch.Tensor) -> torch.Tensor:
+        """Score moves given backbone output and per-move features.
+
+        Args:
+            pooled_cat: [B, hidden + gfd] from backbone_forward
+            move_feats: [B, K, move_feat_dim] features for K candidate moves
+
+        Returns:
+            logits: [B, K] raw scores (apply softmax for probabilities)
+        """
+        B, K, _ = move_feats.shape
+        # Expand pooled to match each move: [B, 1, hidden+gfd] -> [B, K, hidden+gfd]
+        expanded = pooled_cat.unsqueeze(1).expand(B, K, -1)
+        # cat along feature dim: [B, K, hidden+gfd+mfd]
+        combined = torch.cat([expanded, move_feats], dim=-1)
+        return self.policy_mlp(combined).squeeze(-1)  # [B, K]
 
 
 _model: GNNEval | None = None

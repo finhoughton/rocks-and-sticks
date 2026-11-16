@@ -115,6 +115,8 @@ private:
     // Native NN helpers
     NNInput encode_for_native_nn(GameState &g) const;
     void order_moves_by_native_nn(std::vector<Move> &moves, GameState &g, bool maximising);
+    void order_moves_by_policy(std::vector<Move> &moves, GameState &g, bool maximising);
+    static void encode_move_features(const Move &m, float *out_16);
 
     std::mt19937 rng;
     double pass_penalty = 1.2;

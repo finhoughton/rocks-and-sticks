@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import shutil
+import struct
 from pathlib import Path
 
 import torch
@@ -90,6 +91,129 @@ def export_gnn_eval_from_policy(policy_ckpt: Path, out_path: Path) -> None:
     model.load_state_dict(model_sd)
     torch.save(model.state_dict(), out_path)
     print(f"Saved GNNEval checkpoint to {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Native binary export (for NativeNNEval in C++)
+# ---------------------------------------------------------------------------
+
+def _write_tensor(f, t: "torch.Tensor") -> None:
+    """Write a tensor as contiguous row-major float32."""
+    data = t.detach().cpu().contiguous().float().numpy()
+    f.write(data.tobytes())
+
+
+def export_native_weights(pt_path: str | Path, bin_path: str | Path) -> None:
+    """Convert a GNNEval .pt state-dict to the C++ NativeNNEval binary format.
+
+    The binary format has magic ``NNWT`` and is read by
+    ``NativeNNEval::load_weights()`` in ``nn_eval.cpp``.
+    """
+    import torch as _torch
+
+    sd = _torch.load(str(pt_path), map_location="cpu")
+    if isinstance(sd, dict) and "state_dict" in sd:
+        sd = sd["state_dict"]
+
+    # Detect architecture from weight shapes.
+    lin0_w = sd["convs.0.lin.weight"]
+    node_feat_dim = int(lin0_w.shape[0])
+    edge_dim = int(lin0_w.shape[1])
+    hidden = int(sd["convs.0.nn.0.weight"].shape[0])
+
+    num_layers = 0
+    while f"convs.{num_layers}.eps" in sd:
+        num_layers += 1
+
+    head0_w = sd["head.0.weight"]
+    global_feat_dim = int(head0_w.shape[1]) - hidden
+
+    print(
+        f"Exporting native weights: nfd={node_feat_dim} gfd={global_feat_dim} "
+        f"hidden={hidden} layers={num_layers} edge_dim={edge_dim}"
+    )
+
+    with open(str(bin_path), "wb") as f:
+        # Magic
+        f.write(b"NNWT")
+        # Header
+        for v in (node_feat_dim, global_feat_dim, hidden, num_layers, edge_dim):
+            f.write(struct.pack("<i", v))
+
+        # Conv layers
+        for i in range(num_layers):
+            lin_w = sd[f"convs.{i}.lin.weight"]
+            lin_b = sd[f"convs.{i}.lin.bias"]
+            nn0_w = sd[f"convs.{i}.nn.0.weight"]
+            nn0_b = sd[f"convs.{i}.nn.0.bias"]
+            nn2_w = sd[f"convs.{i}.nn.2.weight"]
+            nn2_b = sd[f"convs.{i}.nn.2.bias"]
+            eps = sd[f"convs.{i}.eps"]
+
+            in_ch = int(lin_w.shape[0])
+            out_ch = int(nn0_w.shape[0])
+            ed = int(lin_w.shape[1])
+
+            f.write(struct.pack("<i", in_ch))
+            f.write(struct.pack("<i", out_ch))
+            f.write(struct.pack("<i", ed))
+            f.write(struct.pack("<f", float(eps.item())))
+
+            _write_tensor(f, lin_w)
+            _write_tensor(f, lin_b)
+            _write_tensor(f, nn0_w)
+            _write_tensor(f, nn0_b)
+            _write_tensor(f, nn2_w)
+            _write_tensor(f, nn2_b)
+
+        # Norm layers
+        for i in range(num_layers):
+            mean_scale = sd[f"norms.{i}.mean_scale"]
+            weight = sd[f"norms.{i}.weight"]
+            bias = sd[f"norms.{i}.bias"]
+            ch = int(mean_scale.shape[0])
+
+            f.write(struct.pack("<i", ch))
+            _write_tensor(f, mean_scale)
+            _write_tensor(f, weight)
+            _write_tensor(f, bias)
+
+        # Head
+        _write_tensor(f, sd["head.0.weight"])
+        _write_tensor(f, sd["head.0.bias"])
+        _write_tensor(f, sd["head.3.weight"])
+        f.write(struct.pack("<f", float(sd["head.3.bias"].item())))
+
+        # Policy head (optional — write if weights exist in state dict)
+        if "policy_mlp.0.weight" in sd:
+            pol0_w = sd["policy_mlp.0.weight"]
+            pol0_b = sd["policy_mlp.0.bias"]
+            pol2_w = sd["policy_mlp.2.weight"]
+            pol2_b = sd["policy_mlp.2.bias"]
+            policy_in = int(pol0_w.shape[1])
+            move_feat_dim = policy_in - hidden - global_feat_dim
+            f.write(b"PLCY")
+            f.write(struct.pack("<i", move_feat_dim))
+            _write_tensor(f, pol0_w)    # [hidden, policy_in]
+            _write_tensor(f, pol0_b)    # [hidden]
+            _write_tensor(f, pol2_w)    # [1, hidden] — stored as [hidden]
+            f.write(struct.pack("<f", float(pol2_b.item())))
+            print(f"  Policy head exported: move_feat_dim={move_feat_dim}")
+
+    print(f"Exported native binary to {bin_path}")
+
+
+def ensure_native_bin(pt_path: Path) -> Path:
+    """Return the ``.bin`` sibling of *pt_path*, exporting it if necessary.
+
+    If the ``.bin`` file already exists and is at least as new as the
+    ``.pt`` file it is returned immediately.
+    """
+    bin_path = pt_path.with_suffix(".bin")
+    if bin_path.exists() and bin_path.stat().st_mtime >= pt_path.stat().st_mtime:
+        return bin_path
+    export_native_weights(pt_path, bin_path)
+    return bin_path
 
 
 # ---------------------------------------------------------------------------

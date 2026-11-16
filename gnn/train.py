@@ -16,6 +16,7 @@ def train(
     device: str = "cpu",
     best_model_out: Optional[str] = None,
     init_from: Optional[str] = None,
+    policy_weight: float = 0.0,
 ) -> tuple[GNNEval, list[float], list[float]]:
 
     if not train_dataset:
@@ -39,6 +40,7 @@ def train(
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     # Use per-sample loss so we can apply the same weighting on train and val
     criterion = torch.nn.BCEWithLogitsLoss(reduction="none")
+    use_policy = policy_weight > 0.0
 
     train_losses: list[float] = []
     val_losses: list[float] = []
@@ -49,6 +51,8 @@ def train(
         model.train()
         total_loss = 0.0
         total_weight = 0.0
+        total_policy_loss = 0.0
+        n_policy_batches = 0
         train_correct_w = 0.0
         train_pos_prob_sum = 0.0
         train_neg_prob_sum = 0.0
@@ -56,17 +60,48 @@ def train(
         train_neg_w = 0.0
         for batch in train_loader:
             batch = batch.to(device_t)
-            logits = model(batch).view(-1)
             labels = batch.y.view(-1).float()
             weights = batch.weight.view(-1).float()
+
+            if use_policy:
+                pooled_cat = model.backbone_forward(batch)
+                logits = model.head(pooled_cat).squeeze(-1)
+            else:
+                logits = model(batch).view(-1)
+
             per_sample = criterion(logits, labels)
-            # weighted mean loss
-            loss = (per_sample * weights).sum() / max(1e-12, weights.sum())
+            value_loss = (per_sample * weights).sum() / max(1e-12, weights.sum())
+
+            # Policy loss (per-sample, unbatched for variable-length move lists)
+            policy_loss = torch.tensor(0.0, device=device_t)
+            if use_policy and hasattr(batch, 'has_policy'):
+                has_pol = batch.has_policy.view(-1)
+                pol_mask = has_pol > 0.5
+                if pol_mask.any():
+                    p_losses = []
+                    B = int(pooled_cat.shape[0])
+                    # move_feats and policy_target are variable-size; with batch_size=1 this is trivial
+                    if B == 1 and pol_mask[0]:
+                        mf = batch.move_feats  # [K, 16]
+                        pt = batch.policy_target  # [K]
+                        if mf.dim() == 2 and mf.shape[0] > 0 and pt.dim() == 1 and pt.shape[0] > 0:
+                            pc = pooled_cat  # [1, dim]
+                            mf_3d = mf.unsqueeze(0)  # [1, K, 16]
+                            pol_logits = model.policy_forward(pc, mf_3d)  # [1, K]
+                            log_probs = torch.log_softmax(pol_logits, dim=-1)
+                            p_loss = -(pt * log_probs).sum()
+                            p_losses.append(p_loss)
+                    if p_losses:
+                        policy_loss = torch.stack(p_losses).mean()
+                        total_policy_loss += float(policy_loss.item())
+                        n_policy_batches += 1
+
+            loss = value_loss + policy_weight * policy_loss
             opt.zero_grad()
             loss.backward()
             opt.step()  # type: ignore
 
-            total_loss += float(loss.item()) * 1.0
+            total_loss += float(value_loss.item())
             total_weight += float(weights.sum().item())
 
             probs = torch.sigmoid(logits.detach())
@@ -82,6 +117,7 @@ def train(
 
         # epoch-level weighted averages
         avg_loss = total_loss / max(1, len(train_loader))
+        avg_policy = total_policy_loss / max(1, n_policy_batches) if n_policy_batches > 0 else 0.0
         train_acc = train_correct_w / max(1e-12, total_weight)
         train_pos_prob = train_pos_prob_sum / max(1e-12, train_pos_w)
         train_neg_prob = train_neg_prob_sum / max(1e-12, train_neg_w)
@@ -138,9 +174,10 @@ def train(
         train_losses.append(avg_loss)
         val_losses.append(val_loss if val_loss is not None else float("nan"))
 
+        pol_str = f" policy_loss={avg_policy:.4f}" if use_policy else ""
         if val_loss is None:
-            print(f"epoch {epoch+1}/{epochs} train loss={avg_loss:.4f} train_acc={train_acc:.4f} pos_p={train_pos_prob:.4f} neg_p={train_neg_prob:.4f}")
+            print(f"epoch {epoch+1}/{epochs} train loss={avg_loss:.4f} train_acc={train_acc:.4f} pos_p={train_pos_prob:.4f} neg_p={train_neg_prob:.4f}{pol_str}")
         else:
-            print(f"epoch {epoch+1}/{epochs} train loss={avg_loss:.4f} train_acc={train_acc:.4f} test loss={val_loss:.4f} test_acc={val_acc:.4f} pos_p={val_pos_prob:.4f} neg_p={val_neg_prob:.4f}")
+            print(f"epoch {epoch+1}/{epochs} train loss={avg_loss:.4f} train_acc={train_acc:.4f} test loss={val_loss:.4f} test_acc={val_acc:.4f} pos_p={val_pos_prob:.4f} neg_p={val_neg_prob:.4f}{pol_str}")
     model.eval()
     return model, train_losses, val_losses

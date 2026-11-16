@@ -1023,6 +1023,120 @@ void AlphaBetaEngine::order_moves_by_native_nn(std::vector<Move> &moves, GameSta
     moves.swap(reordered);
 }
 
+// ---- Move feature encoding (16 dims, matches Python move_to_feat) ----
+// [x, y, is_pass, is_rock, end_x, end_y, dx, dy, dir_onehot(8)]
+
+static int dir_char_to_index(char t)
+{
+    // C++ direction chars -> index (matching DIR_DELTAS order)
+    switch (t)
+    {
+    case 'N': return 0;
+    case 'E': return 1;
+    case 'A': return 2; // NE
+    case 'B': return 3; // SE
+    case 'C': return 4; // NW
+    case 'D': return 5; // SW
+    case 'W': return 6;
+    case 'S': return 7;
+    default:  return -1;
+    }
+}
+
+void AlphaBetaEngine::encode_move_features(const Move &m, float *out_16)
+{
+    std::fill(out_16, out_16 + 16, 0.0f);
+    out_16[0] = static_cast<float>(m.x);
+    out_16[1] = static_cast<float>(m.y);
+
+    if (m.t == 'P')
+    {
+        out_16[2] = 1.0f; // is_pass
+        out_16[4] = static_cast<float>(m.x); // end_x = x
+        out_16[5] = static_cast<float>(m.y); // end_y = y
+        return;
+    }
+    if (m.t == 'R')
+    {
+        out_16[3] = 1.0f; // is_rock
+        out_16[4] = static_cast<float>(m.x);
+        out_16[5] = static_cast<float>(m.y);
+        return;
+    }
+
+    // Stick: direction
+    int dir_idx = dir_char_to_index(m.t);
+    if (dir_idx < 0)
+    {
+        out_16[4] = static_cast<float>(m.x);
+        out_16[5] = static_cast<float>(m.y);
+        return;
+    }
+
+    float dx = static_cast<float>(DIR_DELTAS[dir_idx][0]);
+    float dy = static_cast<float>(DIR_DELTAS[dir_idx][1]);
+    out_16[4] = static_cast<float>(m.x) + dx; // end_x
+    out_16[5] = static_cast<float>(m.y) + dy; // end_y
+    out_16[6] = dx;
+    out_16[7] = dy;
+    out_16[8 + dir_idx] = 1.0f; // dir_onehot
+}
+
+// ---- Policy-based move ordering (1 backbone pass + N cheap policy scores) ----
+
+void AlphaBetaEngine::order_moves_by_policy(std::vector<Move> &moves, GameState &g, bool maximising)
+{
+    if (moves.size() <= 1 || !native_nn_.has_policy())
+        return;
+
+    // 1. Backbone forward on current position (no do_move/undo_move)
+    NNInput input = encode_for_native_nn(g);
+    auto backbone_out = native_nn_.backbone_forward(input);
+
+    // 2. Score each move with the policy head
+    int mfd = native_nn_.move_feat_dim();
+    std::vector<double> scores(moves.size());
+    float feat_buf[16];
+
+    for (size_t i = 0; i < moves.size(); ++i)
+    {
+        encode_move_features(moves[i], feat_buf);
+        scores[i] = static_cast<double>(native_nn_.policy_score(backbone_out, feat_buf, mfd));
+
+        // Pass penalty
+        if (moves[i].t == 'P')
+        {
+            if (maximising)
+                scores[i] -= pass_penalty;
+            else
+                scores[i] += pass_penalty;
+        }
+    }
+
+    // 3. Sort by score (higher = more promising for maximiser)
+    std::vector<size_t> idx(moves.size());
+    for (size_t i = 0; i < idx.size(); ++i)
+        idx[i] = i;
+    std::stable_sort(idx.begin(), idx.end(), [&](size_t ia, size_t ib)
+                     {
+                         double a = scores[ia];
+                         double b = scores[ib];
+                         if (a != b)
+                             return maximising ? (a > b) : (a < b);
+                         int ra = move_type_rank(moves[ia]);
+                         int rb = move_type_rank(moves[ib]);
+                         if (ra != rb)
+                             return ra < rb;
+                         return move_less(moves[ia], moves[ib]);
+                     });
+
+    std::vector<Move> reordered;
+    reordered.reserve(moves.size());
+    for (size_t i : idx)
+        reordered.push_back(moves[i]);
+    moves.swap(reordered);
+}
+
 // ---- Handcrafted heuristic eval (same as players/ai.py) ----
 
 bool AlphaBetaEngine::can_place(const Node *n, int player_number) const
@@ -1784,8 +1898,13 @@ double AlphaBetaEngine::alpha_beta_pvs(GameState &g, int depth, int ply,
     // Enhanced move ordering: TT best move → killers → history
     order_moves_enhanced(moves, g, ply, maximising);
 
-    // NN-based move ordering: evaluate all children with native NN and sort
-    if (native_nn_.is_loaded() && depth >= nn_ordering_min_depth_)
+    // NN-based move ordering: prefer policy head (1 backbone pass + N cheap MLP)
+    // over full-eval ordering (N separate forward passes).
+    if (native_nn_.has_policy() && depth >= nn_ordering_min_depth_)
+    {
+        order_moves_by_policy(moves, g, maximising);
+    }
+    else if (native_nn_.is_loaded() && depth >= nn_ordering_min_depth_)
     {
         order_moves_by_native_nn(moves, g, maximising);
     }

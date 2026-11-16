@@ -109,6 +109,10 @@ def evaluate_ab_vs_random(
     top_first_moves = sorted(first_agent_move_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:12]
     first_agent_moves_top = [{"move": k, "count": int(v)} for k, v in top_first_moves]
 
+    from rl.utils import sha256_file
+
+    model_sha = sha256_file(Path(native_model)) if native_model else None
+
     return {
         "ts": datetime.now(timezone.utc).isoformat(),
         "iter": int(iteration),
@@ -116,13 +120,158 @@ def evaluate_ab_vs_random(
         "device": "cpu",
         "match": "ab_vs_random",
         "eval_engine": "alphabeta",
-        "model_path": None,
-        "model_sha256": None,
+        "model_path": str(native_model) if native_model else None,
+        "model_sha256": model_sha,
         "ab_time_limit_ms": int(ab_time_limit_ms),
         "ab_depth": int(ab_depth),
         "ab_max_depth": int(ab_max_depth),
         "ab_move_cap": int(ab_move_cap),
         "ab_use_heuristic": bool(ab_use_heuristic),
+        "first_agent_moves_top": first_agent_moves_top,
+        "eval_games": int(eval_games),
+        "eval_max_moves": int(eval_max_moves),
+        "eval_seed": int(eval_seed),
+        "eval_randomize_start": bool(eval_randomize_start),
+        "eval_alternate_roles": True,
+        "wins": int(wins),
+        "losses": int(losses),
+        "draws": int(draws),
+        "win_rate": win_rate,
+        "avg_moves": f"{avg_moves:.3f}",
+        "max_moves_reached": int(max_moves_reached),
+        "seconds": float(dt),
+    }
+
+
+# ---------------------------------------------------------------------------
+# AB engine vs AB engine (different native models)
+# ---------------------------------------------------------------------------
+
+def evaluate_ab_vs_ab(
+    *,
+    eval_games: int,
+    eval_max_moves: int,
+    eval_seed: int,
+    eval_randomize_start: bool,
+    iteration: int,
+    ab_time_limit_ms: int,
+    ab_depth: int,
+    ab_max_depth: int,
+    ab_move_cap: int,
+    ab_use_heuristic: bool,
+    model_a_path: str,
+    model_b_path: str,
+    model_a_label: str = "model_a",
+    model_b_label: str = "model_b",
+    nn_ordering_depth: int = 3,
+    randomize_max_sticks: int = 5,
+) -> dict:
+    """Evaluate two AB engines head-to-head with different native NN models.
+
+    Model A is the 'agent' whose wins/losses are tracked.
+    Roles alternate each game for fairness.
+    """
+    import players_ext
+
+    from players.alphabeta_cpp import AlphaBetaPlayerCPP
+    from players.game_total import GameTotal
+
+    from rl.utils import sha256_file
+
+    t0 = time.time()
+    wins = 0
+    losses = 0
+    draws = 0
+    max_moves_reached = 0
+    move_counts: list[int] = []
+    first_agent_move_counts: dict[str, int] = {}
+
+    for gidx in range(int(eval_games)):
+        random.seed(int(eval_seed) + int(gidx))
+        a_player = 0 if (gidx % 2 == 0) else 1
+        b_player = 1 - a_player
+
+        base_seed = int(eval_seed) + int(gidx) * 17
+
+        ab_a = AlphaBetaPlayerCPP(
+            a_player,
+            seed=base_seed,
+            depth=int(ab_depth),
+            move_cap=int(ab_move_cap),
+            time_limit_ms=int(ab_time_limit_ms),
+            max_depth=int(ab_max_depth),
+            use_heuristic=bool(ab_use_heuristic),
+            native_model=str(model_a_path),
+            nn_ordering_depth=int(nn_ordering_depth),
+        )
+        ab_b = AlphaBetaPlayerCPP(
+            b_player,
+            seed=base_seed + 7,
+            depth=int(ab_depth),
+            move_cap=int(ab_move_cap),
+            time_limit_ms=int(ab_time_limit_ms),
+            max_depth=int(ab_max_depth),
+            use_heuristic=bool(ab_use_heuristic),
+            native_model=str(model_b_path),
+            nn_ordering_depth=int(nn_ordering_depth),
+        )
+
+        players_list: list = [ab_a, ab_b] if a_player == 0 else [ab_b, ab_a]
+
+        from game import Game
+        game = GameTotal(Game(players=players_list), players_ext.GameState())
+
+        if bool(eval_randomize_start):
+            randomize_start(game, max_sticks=int(randomize_max_sticks))
+
+        move_count = 0
+        seen_agent_move = False
+        while game.winner is None and move_count < int(eval_max_moves):
+            cp = game.current_player
+            mv = game.players[cp].get_move(game)
+
+            if (not seen_agent_move) and (cp == a_player):
+                seen_agent_move = True
+                mk = f"{mv.c[0]},{mv.c[1]},{mv.t}"
+                first_agent_move_counts[mk] = first_agent_move_counts.get(mk, 0) + 1
+
+            game.do_move(cp, mv)
+            move_count += 1
+
+        move_counts.append(move_count)
+        if game.winner == a_player:
+            wins += 1
+        elif game.winner == b_player:
+            losses += 1
+        else:
+            draws += 1
+            if move_count >= int(eval_max_moves):
+                max_moves_reached += 1
+
+    dt = time.time() - t0
+    games = max(1, int(eval_games))
+    avg_moves = float(sum(move_counts)) / float(max(1, len(move_counts)))
+    win_rate = float(wins) / float(games)
+
+    top_first_moves = sorted(first_agent_move_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:12]
+    first_agent_moves_top = [{"move": k, "count": int(v)} for k, v in top_first_moves]
+
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "iter": int(iteration),
+        "match": "ab_vs_ab",
+        "model_a_label": str(model_a_label),
+        "model_b_label": str(model_b_label),
+        "model_a_path": str(model_a_path),
+        "model_b_path": str(model_b_path),
+        "model_a_sha256": sha256_file(Path(model_a_path)),
+        "model_b_sha256": sha256_file(Path(model_b_path)),
+        "ab_time_limit_ms": int(ab_time_limit_ms),
+        "ab_depth": int(ab_depth),
+        "ab_max_depth": int(ab_max_depth),
+        "ab_move_cap": int(ab_move_cap),
+        "ab_use_heuristic": bool(ab_use_heuristic),
+        "nn_ordering_depth": int(nn_ordering_depth),
         "first_agent_moves_top": first_agent_moves_top,
         "eval_games": int(eval_games),
         "eval_max_moves": int(eval_max_moves),

@@ -15,6 +15,7 @@ from rl.ab_games import generate_cpp_ab_games
 from rl.cli import build_parser
 from rl.convert import convert_games_to_dataset
 from rl.eval import (
+    evaluate_ab_vs_ab,
     evaluate_ab_vs_random,
     evaluate_cpp_model_vs_model,
     evaluate_vs_random,
@@ -23,6 +24,7 @@ from rl.play_games import play_self_play_games
 from rl.utils import (
     append_jsonl,
     cleanup_old_datasets,
+    ensure_native_bin,
     export_gnn_eval_from_policy,
     scheduled_int,
 )
@@ -137,10 +139,16 @@ def _run_ab_supervised_iteration(
     gnn_eval_ckpt: Path,
     out_dir: Path,
     replay_window: int,
-) -> tuple[list[str], None]:
-    """Generate AB games, retrain GNNEval.  Returns (train_dataset_paths, None)."""
+) -> tuple[list[str], Path]:
+    """Generate AB games, retrain GNNEval.  Returns (train_dataset_paths, gnn_eval_ckpt)."""
+    # AB-scored training requires fixed-depth search (choose_move_with_values only
+    # works when time_limit_ms <= 0).
+    ab_time_limit = int(args.ab_time_limit)
+    if args.ab_scored and ab_time_limit > 0:
+        print(f"WARNING: --ab-scored requires fixed-depth search. Overriding --ab-time-limit {ab_time_limit} -> 0.")
+        ab_time_limit = 0
     print(
-        f"AB game generation: games={int(args.games)} time_limit_ms={int(args.ab_time_limit)} "
+        f"AB game generation: games={int(args.games)} time_limit_ms={ab_time_limit} "
         f"depth={int(args.ab_depth)} nn_ordering_depth={int(args.ab_nn_ordering_depth)} "
         f"randomize_start={bool(args.ab_randomize_start)}"
     )
@@ -148,7 +156,7 @@ def _run_ab_supervised_iteration(
         num_games=int(args.games),
         save_games_dir=saved_games_path,
         seed_base=int(iter_seed),
-        ab_time_limit_ms=int(args.ab_time_limit),
+        ab_time_limit_ms=ab_time_limit,
         ab_depth=int(args.ab_depth),
         ab_max_depth=int(args.ab_max_depth),
         ab_move_cap=int(args.ab_move_cap),
@@ -193,11 +201,18 @@ def _run_ab_supervised_iteration(
         "--lr", str(args.lr),
         "--device", str(args.device),
         "--out", str(gnn_eval_ckpt),
-        "--soft-labels",
-        "--augment-sym",
         "--only-extra-dirs",
         "--extra-dirs", *train_game_dirs,
     ]
+    if args.ab_scored:
+        gnn_cmd += [
+            "--ab-scored",
+            "--policy-weight", str(args.policy_weight),
+            "--score-temperature", str(args.score_temperature),
+            "--policy-temperature", str(args.policy_temperature),
+        ]
+    else:
+        gnn_cmd += ["--soft-labels", "--augment-sym"]
     if prev_eval_ckpt is not None:
         gnn_cmd += ["--init-from", str(prev_eval_ckpt)]
         print(f"Warm-starting from {prev_eval_ckpt}")
@@ -205,7 +220,11 @@ def _run_ab_supervised_iteration(
     subprocess.run(gnn_cmd, check=True)
     print("Supervised retraining completed for iteration", i)
 
-    return list(train_game_dirs), None
+    # Export native binary for C++ NativeNNEval.
+    native_bin = ensure_native_bin(gnn_eval_ckpt)
+    print(f"Native binary checkpoint: {native_bin}")
+
+    return list(train_game_dirs), gnn_eval_ckpt
 
 
 # ---------------------------------------------------------------------------
@@ -464,9 +483,13 @@ def _run_evaluation(i: int, args, gnn_eval_ckpt: Path, policy_ckpt: Path | None,
         return None
 
     if str(args.loop_mode) == "ab-supervised":
+        # Primary eval: AB engine (with trained model for NN ordering) vs Random.
+        native_bin = ensure_native_bin(gnn_eval_ckpt) if gnn_eval_ckpt.exists() else None
+        native_model_str = str(native_bin) if native_bin is not None else str(args.ab_native_model)
         print(
             f"Evaluating AB engine vs Random ({int(args.eval_games)} games, "
-            f"time_limit={int(args.ab_time_limit)}ms, depth={int(args.ab_depth)})..."
+            f"time_limit={int(args.ab_time_limit)}ms, depth={int(args.ab_depth)}, "
+            f"native_model={native_model_str})..."
         )
         record = evaluate_ab_vs_random(
             eval_games=int(args.eval_games),
@@ -479,7 +502,7 @@ def _run_evaluation(i: int, args, gnn_eval_ckpt: Path, policy_ckpt: Path | None,
             ab_max_depth=int(args.ab_max_depth),
             ab_move_cap=int(args.ab_move_cap),
             ab_use_heuristic=bool(args.ab_use_heuristic),
-            native_model=str(args.ab_native_model),
+            native_model=native_model_str,
             nn_ordering_depth=int(args.ab_nn_ordering_depth),
             randomize_max_sticks=int(args.randomize_max_sticks),
         )
@@ -558,12 +581,52 @@ def _run_optional_evals(
 
     # Ladder: vs previous checkpoints
     if int(args.eval_vs_prev) > 0:
-        if str(args.backend) != "cpp":
-            print("Note: --eval-vs-prev requires --backend=cpp.")
-        elif i <= 1:
+        if i <= 1:
             pass
         elif int(args.eval_vs_prev_every) > 1 and (int(i) % int(args.eval_vs_prev_every) != 0):
             pass
+        elif str(args.loop_mode) == "ab-supervised":
+            # AB vs AB: current model vs previous models for NN ordering
+            prev_n = int(args.eval_vs_prev)
+            start_opp = max(1, int(i) - prev_n)
+            vs_prev: dict[str, dict] = {}
+            current_bin = ensure_native_bin(gnn_eval_ckpt)
+            for opp_iter in range(start_opp, int(i)):
+                opp_ckpt = out_dir / f"gnn_eval_iter_{opp_iter}.pt"
+                if not opp_ckpt.exists():
+                    continue
+                opp_bin = ensure_native_bin(opp_ckpt)
+                print(f"Evaluating AB(iter {i}) vs AB(iter {opp_iter})...")
+                res = evaluate_ab_vs_ab(
+                    eval_games=int(args.eval_prev_games),
+                    eval_max_moves=int(args.eval_max_moves),
+                    eval_seed=int(args.eval_seed) + 100000 * int(opp_iter),
+                    eval_randomize_start=bool(args.eval_randomize_start),
+                    iteration=int(i),
+                    ab_time_limit_ms=int(args.ab_time_limit),
+                    ab_depth=int(args.ab_depth),
+                    ab_max_depth=int(args.ab_max_depth),
+                    ab_move_cap=int(args.ab_move_cap),
+                    ab_use_heuristic=bool(args.ab_use_heuristic),
+                    model_a_path=str(current_bin),
+                    model_b_path=str(opp_bin),
+                    model_a_label=f"iter_{i}",
+                    model_b_label=f"iter_{opp_iter}",
+                    nn_ordering_depth=int(args.ab_nn_ordering_depth),
+                    randomize_max_sticks=int(args.randomize_max_sticks),
+                )
+                vs_prev[str(opp_iter)] = {
+                    "wins": int(res["wins"]),
+                    "losses": int(res["losses"]),
+                    "draws": int(res["draws"]),
+                    "win_rate": float(res["win_rate"]),
+                    "eval_games": int(res["eval_games"]),
+                    "avg_moves": str(res.get("avg_moves", "")),
+                    "seconds": float(res["seconds"]),
+                }
+            record["vs_prev_checkpoints"] = vs_prev
+        elif str(args.backend) != "cpp":
+            print("Note: --eval-vs-prev requires --backend=cpp.")
         else:
             prev_n = int(args.eval_vs_prev)
             start_opp = max(0, int(i) - prev_n)
@@ -657,8 +720,10 @@ def main() -> None:
 
     # Detect existing checkpoints to resume numbering.
     max_existing = 0
-    for ckpt in out_dir.glob("gnn_az_iter_*.pt"):
-        m = re.search(r"gnn_az_iter_(\d+)\.pt$", ckpt.name)
+    glob_pattern = "gnn_eval_iter_*.pt" if str(args.loop_mode) == "ab-supervised" else "gnn_az_iter_*.pt"
+    regex_pattern = r"gnn_(?:eval|az)_iter_(\d+)\.pt$"
+    for ckpt in out_dir.glob(glob_pattern):
+        m = re.search(regex_pattern, ckpt.name)
         if m:
             try:
                 n = int(m.group(1))
@@ -695,7 +760,7 @@ def main() -> None:
         train_dataset_paths: list[str] = []
 
         if str(args.loop_mode) == "ab-supervised":
-            train_dataset_paths, _ = _run_ab_supervised_iteration(
+            train_dataset_paths, policy_ckpt = _run_ab_supervised_iteration(
                 i, args, saved_games_path, iter_seed, gnn_eval_ckpt, out_dir, replay_window,
             )
         else:

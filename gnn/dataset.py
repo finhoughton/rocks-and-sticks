@@ -4,6 +4,8 @@ import os
 import random
 from glob import glob
 
+import torch
+
 from game import Game
 from gnn.encode import EncodedGraph, encode_game_to_graph
 from models import PASS, Move
@@ -155,3 +157,138 @@ def load_balanced_saved_game_samples(
 
     random.shuffle(combined)
     return combined
+
+
+# ---------------------------------------------------------------------------
+# New: load samples with AB search scores + policy targets
+# ---------------------------------------------------------------------------
+
+PolicySample = tuple[EncodedGraph, float, float, torch.Tensor | None, torch.Tensor | None]
+# (encoding, value_label, weight, move_feats [K, 16] or None, policy_probs [K] or None)
+
+
+def _move_dict_to_feat(m: dict) -> torch.Tensor:
+    """Encode a move dict as a 16-dim feature vector (same layout as rl/convert.py move_to_feat)."""
+    from models import D, calculate_end
+
+    x = float(m.get("x", 0))
+    y = float(m.get("y", 0))
+    t = str(m.get("t", "P"))
+    is_pass = 1.0 if t == "P" else 0.0
+    is_rock = 1.0 if t == "R" else 0.0
+
+    if t in ("P", "R"):
+        return torch.tensor(
+            [x, y, is_pass, is_rock, x, y, 0.0, 0.0] + [0.0] * 8,
+            dtype=torch.float32,
+        )
+
+    # Stick direction
+    try:
+        d_obj = D[t]
+    except KeyError:
+        return torch.tensor(
+            [x, y, 0.0, 0.0, x, y, 0.0, 0.0] + [0.0] * 8,
+            dtype=torch.float32,
+        )
+
+    dx, dy = float(d_obj.delta[0]), float(d_obj.delta[1])
+    ex, ey = calculate_end((int(x), int(y)), d_obj)
+    onehot = [0.0] * 8
+    idx = int(d_obj.as_int)
+    if 0 <= idx < 8:
+        onehot[idx] = 1.0
+    return torch.tensor(
+        [x, y, 0.0, 0.0, float(ex), float(ey), dx, dy] + onehot,
+        dtype=torch.float32,
+    )
+
+
+def load_ab_scored_samples(
+    *dirs: str,
+    gamma: float = 0.9,
+    score_temperature: float = 3.0,
+    policy_temperature: float = 1.0,
+    balance_classes: bool = False,
+    balance_seed: int | None = None,
+) -> list[PolicySample]:
+    """Load training samples from AB game files that contain ``ab_values``.
+
+    Value labels are derived from the AB search score of the best move
+    (converted to probability via sigmoid).  Policy targets are a softmax
+    distribution over the AB values of all evaluated moves.
+    """
+
+    def _score_to_prob(score: float, temp: float) -> float:
+        logit = score / temp
+        logit = max(-20.0, min(20.0, logit))
+        return 1.0 / (1.0 + math.exp(-logit))
+
+    samples: list[PolicySample] = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        paths = sorted(glob(os.path.join(d, "game_*.json")))
+        for path in paths:
+            with open(path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            moves_raw = payload.get("moves", [])
+            ab_values_raw = payload.get("ab_values", [])
+            winner = payload.get("winner", None)
+
+            players: list[Player] = [RandomPlayer(0), RandomPlayer(1)]
+            game = Game(players)
+
+            n = len(moves_raw)
+            for i, mv_dict in enumerate(moves_raw):
+                enc = encode_game_to_graph(game)
+
+                # Value label: use AB score of best move if available, else game outcome
+                ab_vals = ab_values_raw[i] if i < len(ab_values_raw) else None
+                if isinstance(ab_vals, list) and ab_vals:
+                    best_score = float(ab_vals[0]["value"])
+                    value_label = _score_to_prob(best_score, score_temperature)
+
+                    # Policy target: softmax over AB values
+                    scores = torch.tensor(
+                        [float(v["value"]) / policy_temperature for v in ab_vals],
+                        dtype=torch.float32,
+                    )
+                    policy_probs = torch.softmax(scores, dim=0)
+                    move_feats = torch.stack([_move_dict_to_feat(v) for v in ab_vals])
+                else:
+                    # Fallback to game outcome
+                    value_label = 0.5 if winner is None else float(winner == enc.perspective)
+                    policy_probs = None
+                    move_feats = None
+
+                weight = gamma ** (n - i - 1)
+                samples.append((enc, value_label, weight, move_feats, policy_probs))
+
+                # Advance game state
+                mv = Move(int(mv_dict["x"]), int(mv_dict["y"]), str(mv_dict["t"])) if mv_dict["t"] != "P" else PASS
+                try:
+                    mover = int(mv_dict.get("p", game.current_player))
+                    game.do_move(mover, mv)
+                except Exception:
+                    break
+                if game.winner is not None:
+                    break
+
+    # Balance classes (same logic as load_balanced_saved_game_samples)
+    if balance_classes and samples:
+        if balance_seed is not None:
+            random.seed(balance_seed)
+        pos = [s for s in samples if s[1] > 0.5]
+        neg = [s for s in samples if s[1] < 0.5]
+        draws = [s for s in samples if s[1] == 0.5]
+        if pos and neg:
+            target = max(len(pos), len(neg))
+            if len(pos) < target:
+                pos = pos + [random.choice(pos) for _ in range(target - len(pos))]
+            if len(neg) < target:
+                neg = neg + [random.choice(neg) for _ in range(target - len(neg))]
+        samples = pos + neg + draws
+
+    random.shuffle(samples)
+    return samples

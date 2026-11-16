@@ -158,7 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Iterative deepening max depth cap for ab-supervised generation.')
     p.add_argument('--ab-move-cap', type=int, default=48,
                    help='Move cap passed to C++ AlphaBeta for ab-supervised generation.')
-    p.add_argument('--ab-max-moves', type=int, default=200,
+    p.add_argument('--ab-max-moves', type=int, default=80,
                    help='Max moves per generated AB game before draw.')
     p.add_argument('--ab-use-heuristic',
                    action=argparse.BooleanOptionalAction, default=True,
@@ -171,5 +171,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--ab-randomize-start',
                    action=argparse.BooleanOptionalAction, default=True,
                    help='Randomize openings for ab-supervised generation.')
+
+    # Policy/value training from AB search scores
+    p.add_argument('--ab-scored', action='store_true', default=False,
+                   help='Train on AB search scores (policy+value) instead of game outcomes.')
+    p.add_argument('--policy-weight', type=float, default=1.0,
+                   help='Weight of policy loss in dual (value+policy) training.')
+    p.add_argument('--score-temperature', type=float, default=3.0,
+                   help='Temperature for converting AB scores to value labels via sigmoid.')
+    p.add_argument('--policy-temperature', type=float, default=1.0,
+                   help='Temperature for softmax over AB move scores for policy targets.')
 
     return p

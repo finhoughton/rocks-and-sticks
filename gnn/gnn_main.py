@@ -5,8 +5,8 @@ import random
 import time
 from typing import Callable
 
-from gnn.augment import samples_to_data
-from gnn.dataset import load_balanced_saved_game_samples
+from gnn.augment import policy_samples_to_data, samples_to_data
+from gnn.dataset import load_ab_scored_samples, load_balanced_saved_game_samples
 from gnn.encode import EncodedGraph
 from gnn.game_generation import generate_self_play_games
 from gnn.plotting import plot_losses
@@ -164,6 +164,30 @@ def main() -> None:
         default=None,
         help="warm-start training from this GNNEval checkpoint (fine-tune instead of training from scratch)",
     )
+    parser.add_argument(
+        "--ab-scored",
+        action="store_true",
+        default=False,
+        help="Use AB search scores as value labels and policy targets (requires ab_values in game files)",
+    )
+    parser.add_argument(
+        "--policy-weight",
+        type=float,
+        default=1.0,
+        help="Weight for policy loss relative to value loss (default: 1.0, 0 = value only)",
+    )
+    parser.add_argument(
+        "--score-temperature",
+        type=float,
+        default=3.0,
+        help="Temperature for converting AB scores to value labels via sigmoid (default: 3.0)",
+    )
+    parser.add_argument(
+        "--policy-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for softmax over AB scores for policy targets (default: 1.0)",
+    )
 
     args = parser.parse_args()
     seed_base = args.seed_base
@@ -226,36 +250,60 @@ def main() -> None:
     else:
         # Only training, not generating new games
         extra_dirs = [d for d in args.extra_dirs if isinstance(d, str) and d.strip()]
-        if args.only_extra_dirs:
-            base_ab = "__none__/saved_games_ab2"
-            base_mcts = "__none__/saved_games_mcts"
-            base_human = "__none__/saved_games_human"
-            print("Loading balanced dataset from extras only...")
+        if args.ab_scored:
+            # Load samples with AB search scores as value/policy targets
+            if args.only_extra_dirs:
+                load_dirs = extra_dirs
+            else:
+                load_dirs = ["saved_games_ab2", "saved_games_mcts", "saved_games_human"] + extra_dirs
+            print(f"Loading AB-scored samples from {load_dirs}...")
+            ab_samples = load_ab_scored_samples(
+                *load_dirs,
+                score_temperature=args.score_temperature,
+                policy_temperature=args.policy_temperature,
+                balance_classes=args.balance_classes,
+                balance_seed=args.balance_seed,
+            )
+            idx = list(range(len(ab_samples)))
+            random.shuffle(idx)
+            split = max(1, int(len(idx) * args.val_frac))
+            train_samples = [ab_samples[i] for i in idx[split:]]
+            val_samples = [ab_samples[i] for i in idx[:split]]
+            # For policy training we use batch_size=1 to handle variable-length move lists
+            train_dataset = policy_samples_to_data(train_samples, augment_sym=False)
+            val_dataset = policy_samples_to_data(val_samples, augment_sym=False) if val_samples else []
+            print(f"  AB-scored dataset: {len(train_dataset)} train, {len(val_dataset)} val")
         else:
-            base_ab = "saved_games_ab2"
-            base_mcts = "saved_games_mcts"
-            base_human = "saved_games_human"
-            print("Loading balanced dataset from saved_games_ab2, saved_games_mcts, saved_games_human + extras...")
+            if args.only_extra_dirs:
+                base_ab = "__none__/saved_games_ab2"
+                base_mcts = "__none__/saved_games_mcts"
+                base_human = "__none__/saved_games_human"
+                print("Loading balanced dataset from extras only...")
+            else:
+                base_ab = "saved_games_ab2"
+                base_mcts = "saved_games_mcts"
+                base_human = "saved_games_human"
+                print("Loading balanced dataset from saved_games_ab2, saved_games_mcts, saved_games_human + extras...")
 
-        samples = load_balanced_saved_game_samples(
-            base_ab,
-            base_mcts,
-            base_human,
-            balance_classes=args.balance_classes,
-            balance_strategy=args.balance_strategy,
-            balance_seed=args.balance_seed,
-            soft_labels=args.soft_labels,
-            soft_label_blend=args.soft_label_blend,
-            soft_label_temperature=args.soft_label_temperature,
-            extra_dirs=extra_dirs,
-        )
-        idx = list(range(len(samples)))
-        random.shuffle(idx)
-        split = max(1, int(len(idx) * args.val_frac))
-        train_samples = [samples[i] for i in idx[split:]]
-        val_samples = [samples[i] for i in idx[:split]]
-        train_dataset = samples_to_data(train_samples, augment_sym=args.augment_sym)
-        val_dataset = samples_to_data(val_samples, augment_sym=args.augment_sym) if val_samples else []
+            samples = load_balanced_saved_game_samples(
+                base_ab,
+                base_mcts,
+                base_human,
+                balance_classes=args.balance_classes,
+                balance_strategy=args.balance_strategy,
+                balance_seed=args.balance_seed,
+                soft_labels=args.soft_labels,
+                soft_label_blend=args.soft_label_blend,
+                soft_label_temperature=args.soft_label_temperature,
+                extra_dirs=extra_dirs,
+            )
+            idx = list(range(len(samples)))
+            random.shuffle(idx)
+            split = max(1, int(len(idx) * args.val_frac))
+            train_samples = [samples[i] for i in idx[split:]]
+            val_samples = [samples[i] for i in idx[:split]]
+            train_dataset = samples_to_data(train_samples, augment_sym=args.augment_sym)
+            val_dataset = samples_to_data(val_samples, augment_sym=args.augment_sym) if val_samples else []
 
     if args.epochs > 0:
         if not train_dataset:
@@ -270,6 +318,7 @@ def main() -> None:
             device=args.device,
             best_model_out=args.out,
             init_from=args.init_from,
+            policy_weight=args.policy_weight,
         )
         # `train` will save the best checkpoint to args.out when validation improves.
         if not args.out:

@@ -159,6 +159,31 @@ bool NativeNNEval::load_weights(const std::string &path)
     if (!read_float32(f, head3_b_))
         return false;
 
+    // Optional policy head: look for "PLCY" marker
+    has_policy_ = false;
+    move_feat_dim_ = 0;
+    char pol_magic[4] = {0};
+    f.read(pol_magic, 4);
+    if (f.good() && std::strncmp(pol_magic, "PLCY", 4) == 0)
+    {
+        int32_t mfd;
+        if (!read_int32(f, mfd))
+            return false;
+        move_feat_dim_ = mfd;
+        int policy_in = hidden + gfd + mfd;
+        if (!read_floats(f, pol0_w_, hidden * policy_in))
+            return false;
+        if (!read_floats(f, pol0_b_, hidden))
+            return false;
+        if (!read_floats(f, pol2_w_, hidden))
+            return false;
+        if (!read_float32(f, pol2_b_))
+            return false;
+        has_policy_ = true;
+        std::cerr << "NativeNNEval: loaded policy head (mfd=" << mfd << ")" << std::endl;
+    }
+    // else: no policy head, which is fine for backward compatibility
+
     loaded_ = true;
     return true;
 }
@@ -346,4 +371,156 @@ std::vector<float> NativeNNEval::evaluate_batch(const std::vector<NNInput> &inpu
     for (auto &inp : inputs)
         results.push_back(evaluate(inp));
     return results;
+}
+
+// ---- Backbone forward (GNN + pooling, no value head) ----
+
+std::vector<float> NativeNNEval::backbone_forward(const NNInput &input) const
+{
+    if (!loaded_)
+        return {};
+
+    int N = input.num_nodes;
+    int E = input.num_edges;
+    int cat_dim = hidden_ + global_feat_dim_;
+
+    if (N == 0)
+        return std::vector<float>(cat_dim, 0.0f);
+
+    // Run GNN layers (same as evaluate, up to and including pooling)
+    buf_h_.assign(N * hidden_, 0.0f);
+    buf_h_in_.resize(N * hidden_);
+    auto &h = buf_h_;
+    auto &h_in = buf_h_in_;
+
+    for (int layer = 0; layer < num_layers_; ++layer)
+    {
+        const auto &cw = conv_weights_[layer];
+        const auto &nw = norm_weights_[layer];
+        int in_ch = cw.in_ch;
+        int out_ch = cw.out_ch;
+
+        const float *x = (layer == 0) ? input.node_feats.data() : h.data();
+
+        if (in_ch == out_ch)
+            std::copy(x, x + N * in_ch, h_in.begin());
+
+        buf_edge_proj_.assign(E * in_ch, 0.0f);
+        if (E > 0)
+        {
+            matmul(input.edge_attr.data(), cw.lin_w.data(), buf_edge_proj_.data(), E, in_ch, edge_dim_);
+            add_bias(buf_edge_proj_.data(), cw.lin_b.data(), E, in_ch);
+        }
+
+        buf_msg_.assign(E * in_ch, 0.0f);
+        for (int e = 0; e < E; ++e)
+        {
+            int src = input.edge_src[e];
+            for (int c = 0; c < in_ch; ++c)
+            {
+                float val = x[src * in_ch + c] + buf_edge_proj_[e * in_ch + c];
+                buf_msg_[e * in_ch + c] = val > 0.0f ? val : 0.0f;
+            }
+        }
+
+        buf_agg_.assign(N * in_ch, 0.0f);
+        for (int e = 0; e < E; ++e)
+        {
+            int dst = input.edge_dst[e];
+            for (int c = 0; c < in_ch; ++c)
+                buf_agg_[dst * in_ch + c] += buf_msg_[e * in_ch + c];
+        }
+
+        buf_combined_.resize(N * in_ch);
+        float eps_factor = 1.0f + cw.eps;
+        for (int i = 0; i < N * in_ch; ++i)
+            buf_combined_[i] = buf_agg_[i] + eps_factor * x[i];
+
+        buf_temp_.assign(N * out_ch, 0.0f);
+        matmul(buf_combined_.data(), cw.nn0_w.data(), buf_temp_.data(), N, out_ch, in_ch);
+        add_bias(buf_temp_.data(), cw.nn0_b.data(), N, out_ch);
+        relu_inplace(buf_temp_.data(), N * out_ch);
+
+        std::fill(h.begin(), h.begin() + N * out_ch, 0.0f);
+        matmul(buf_temp_.data(), cw.nn2_w.data(), h.data(), N, out_ch, out_ch);
+        add_bias(h.data(), cw.nn2_b.data(), N, out_ch);
+
+        buf_mean_.assign(out_ch, 0.0f);
+        float inv_N = 1.0f / static_cast<float>(N);
+        for (int i = 0; i < N; ++i)
+            for (int c = 0; c < out_ch; ++c)
+                buf_mean_[c] += h[i * out_ch + c];
+        for (int c = 0; c < out_ch; ++c)
+            buf_mean_[c] *= inv_N;
+
+        for (int i = 0; i < N; ++i)
+            for (int c = 0; c < out_ch; ++c)
+                h[i * out_ch + c] -= nw.mean_scale[c] * buf_mean_[c];
+
+        buf_var_.assign(out_ch, 0.0f);
+        for (int i = 0; i < N; ++i)
+            for (int c = 0; c < out_ch; ++c)
+            {
+                float v = h[i * out_ch + c];
+                buf_var_[c] += v * v;
+            }
+        for (int c = 0; c < out_ch; ++c)
+            buf_var_[c] *= inv_N;
+
+        for (int c = 0; c < out_ch; ++c)
+        {
+            float std_inv = 1.0f / std::sqrt(buf_var_[c] + 1e-5f);
+            for (int i = 0; i < N; ++i)
+                h[i * out_ch + c] = nw.weight[c] * h[i * out_ch + c] * std_inv + nw.bias[c];
+        }
+
+        relu_inplace(h.data(), N * out_ch);
+
+        if (in_ch == out_ch)
+            for (int i = 0; i < N * out_ch; ++i)
+                h[i] += h_in[i];
+    }
+
+    // Global mean pool
+    buf_pooled_.assign(hidden_, 0.0f);
+    float inv_N2 = 1.0f / static_cast<float>(N);
+    for (int i = 0; i < N; ++i)
+        for (int c = 0; c < hidden_; ++c)
+            buf_pooled_[c] += h[i * hidden_ + c];
+    for (int c = 0; c < hidden_; ++c)
+        buf_pooled_[c] *= inv_N2;
+
+    // Cat [pooled, global_feats]
+    std::vector<float> result(cat_dim);
+    std::copy(buf_pooled_.begin(), buf_pooled_.end(), result.begin());
+    std::copy(input.global_feats.begin(), input.global_feats.end(), result.begin() + hidden_);
+    return result;
+}
+
+// ---- Policy score for a single move ----
+
+float NativeNNEval::policy_score(const std::vector<float> &backbone_out,
+                                  const float *move_feat, int mfd) const
+{
+    if (!has_policy_ || !loaded_)
+        return 0.0f;
+
+    // Concatenate [backbone_out, move_feat] → [policy_in]
+    int bb_dim = hidden_ + global_feat_dim_;
+    int policy_in = bb_dim + mfd;
+    buf_pol_in_.resize(policy_in);
+    std::copy(backbone_out.begin(), backbone_out.end(), buf_pol_in_.begin());
+    std::copy(move_feat, move_feat + mfd, buf_pol_in_.begin() + bb_dim);
+
+    // Linear(policy_in, hidden) → ReLU → Linear(hidden, 1)
+    buf_pol_hidden_.assign(hidden_, 0.0f);
+    matmul(buf_pol_in_.data(), pol0_w_.data(), buf_pol_hidden_.data(), 1, hidden_, policy_in);
+    add_bias(buf_pol_hidden_.data(), pol0_b_.data(), 1, hidden_);
+    relu_inplace(buf_pol_hidden_.data(), hidden_);
+
+    float logit = pol2_b_;
+    for (int c = 0; c < hidden_; ++c)
+        logit += buf_pol_hidden_[c] * pol2_w_[c];
+
+    return logit;
 }
