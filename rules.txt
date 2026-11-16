@@ -17,6 +17,7 @@ additionally:
 - rocks are refilled to only after placing a stick
 - cannot cross sticks diagonally 
 - the three sided polygon with area 0.5 does not count. it does not give you any area
+- a stick that completes more than one polygon scores the smallest one (so if the smallest is the 0.5 triangle it scores nothing). which end you place the stick from makes no difference
 - you cannot place a rock on your first move
 - if the player who went first is the first to get area, the second player gets one additional move to match or exceed the area. if they match the area the game continues, otherwise the player with more area wins.
 

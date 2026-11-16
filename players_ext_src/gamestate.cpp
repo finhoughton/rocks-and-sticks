@@ -56,8 +56,16 @@ GameState::GameState(const GameState &other)
         do_move(rec.m, rec.mover);
     }
 
-    // (No additional overwrites here - keep replay-only copy-construction to
-    // preserve incremental caches and avoid subtle side-effects.)
+    // The replay rebuilds the board, but whose turn it is cannot be replayed: callers such as
+    // randomize_start place moves out of turn and then call set_current_player0(), which is
+    // not a move. Take the turn state (and the undo records that restore it) from the source,
+    // otherwise the copy can have the wrong player to move for the rest of the game.
+    turn_number = other.turn_number;
+    current_player = other.current_player;
+    players_scores = other.players_scores;
+    num_rocks = other.num_rocks;
+    winner = other.winner;
+    history = other.history;
 }
 
 GameState &GameState::operator=(const GameState &other)
@@ -351,108 +359,78 @@ int GameState::best_new_cycle_area2(Node *start, Node *end, std::uint64_t &out_e
     if (!start || !end || start == end)
         return 0;
 
-    // The original implementation enumerated up to MAX_CYCLE_PATHS paths start->end
-    // and chose the smallest-area cycle. That approach explodes in dense graphs.
-    //
-    // Actually, placing a new stick can only create cycles corresponding to the two regions on either side of the new edge.
-    // We can obtain those candidates by a wall-following trace on each side.
-    // it's not free though, we need to be careful of sticks pointing into the interior of the region, since they can appear to be counted twice
-
-    static const int CW_ORDER[8] = {1, 3, 7, 5, 6, 4, 0, 2};  // E, SE, S, SW, W, NW, N, NE
+    // Twice the area of the smallest polygon that the stick start-end completes (the stick may
+    // already be placed, or be hypothetical). Same method as game.py _path_of_smallest_area:
+    // sticks never cross, so the smallest polygon through a stick is the outline of the smaller
+    // of the two faces beside it. Each face is found by walking its boundary, always turning to
+    // the next stick anticlockwise from the one just walked, and cutting out the loops made by
+    // dead ends and by anything that hangs off the boundary at a single vertex.
     static const int ACW_ORDER[8] = {1, 2, 0, 4, 6, 5, 7, 3}; // E, NE, N, NW, W, SW, S, SE
-    // pos_lookup[d] gives the index i such that order[i] == d.
-    static const int CW_POS[8] = {6, 0, 7, 1, 5, 3, 4, 2};
     static const int ACW_POS[8] = {2, 0, 1, 7, 3, 5, 4, 6};
 
-    auto trace_side = [&](bool clockwise, std::vector<Node *> &out_path) -> bool
+    const int dir_se = dir_from_delta(end->x - start->x, end->y - start->y);
+    if (dir_se < 0)
+        return 0;
+    const int dir_es = reverse_dir(dir_se);
+
+    // neighbour along d, treating start-end as present even if it is only hypothetical
+    auto neighbour = [&](Node *n, int d) -> Node *
     {
-        out_path.clear();
-        out_path.reserve(64);
+        if (n == start && d == dir_se)
+            return end;
+        if (n == end && d == dir_es)
+            return start;
+        return n->neighbours[d];
+    };
+    auto degree = [&](Node *n) -> int
+    {
+        int c = 0;
+        for (int d = 0; d < 8; ++d)
+            if (neighbour(n, d))
+                c++;
+        return c;
+    };
+    if (degree(start) < 2 || degree(end) < 2)
+        return 0; // one end hangs free: nothing is enclosed
 
-        Node *prev = end;
-        Node *cur = start;
-
-        int incoming_dir = dir_from_delta(prev->x - cur->x, prev->y - cur->y);
-        if (incoming_dir < 0)
-            return false;
-
-        const int *order = clockwise ? CW_ORDER : ACW_ORDER;
-        const int *pos_lookup = clockwise ? CW_POS : ACW_POS;
-        out_path.push_back(cur);
-        size_t max_steps = (size_t)connected_points.size() * 8 + 32;
-        if (max_steps < 128)
-            max_steps = 128;
-
-        Node *start_prev = prev;
-        Node *start_cur = cur;
-
-        for (size_t steps = 0; steps < max_steps; ++steps)
+    auto trace = [&](Node *u, Node *v, std::vector<Node *> &path) -> bool
+    {
+        path.clear();
+        path.push_back(v);
+        Node *cur = v;
+        int back = (u == start) ? dir_es : dir_se;
+        size_t max_steps = (size_t)connected_points.size() * 8 + 64;
+        for (size_t step = 0; step < max_steps; ++step)
         {
-            int pos = pos_lookup[incoming_dir & 7];
-            int chosen_dir = -1;
-            Node *chosen_next = nullptr;
-            for (int i = 1; i <= 8; ++i)
+            int d = back;
+            Node *nxt = nullptr;
+            for (int k = 1; k <= 8; ++k)
             {
-                int d = order[(pos + i) & 7];
-                if (d == incoming_dir)
-                    continue;
-                Node *nxt = cur->neighbours[d];
-                if (!nxt)
-                    continue;
-                chosen_dir = d;
-                chosen_next = nxt;
-                break;
+                d = ACW_ORDER[(ACW_POS[back] + k) & 7];
+                nxt = neighbour(cur, d);
+                if (nxt)
+                    break;
             }
-
-            if (!chosen_next)
-            {
-                chosen_dir = incoming_dir;
-                chosen_next = cur->neighbours[chosen_dir];
-                if (!chosen_next)
-                    return false;
-            }
-
-            Node *next = chosen_next;
-
-            // Cancel immediate backtracks: ... A, B, A ... => ... A ...
-            if (out_path.size() >= 2 && next == out_path[out_path.size() - 2])
-            {
-                out_path.pop_back();
-            }
+            if (!nxt)
+                return false;
+            if (cur == u && nxt == v)
+                return path.size() >= 3;
+            // loop erasure: paths are short, a linear scan is cheapest
+            size_t j = path.size();
+            for (size_t i = 0; i < path.size(); ++i)
+                if (path[i] == nxt)
+                {
+                    j = i;
+                    break;
+                }
+            if (j == path.size())
+                path.push_back(nxt);
             else
-            {
-                out_path.push_back(next);
-            }
-
-            prev = cur;
-            cur = next;
-            incoming_dir = reverse_dir(chosen_dir);
-
-            if (prev == start_prev && cur == start_cur)
-                break;
+                path.resize(j + 1);
+            back = reverse_dir(d);
+            cur = nxt;
         }
-        if (out_path.size() >= 2 && out_path.back() == start)
-            out_path.pop_back();
-
-        if (out_path.size() < 3)
-            return false;
-        if (out_path.front() != start)
-            return false;
-        if (out_path.back() != end)
-            return false;
-
-        // Enforce a simple path (no repeated vertices). Using an unordered_set here was
-        // showing up in profiles; paths are typically short, so a quadratic scan is cheaper.
-        for (size_t i = 0; i < out_path.size(); ++i)
-        {
-            Node *a = out_path[i];
-            for (size_t j = 0; j < i; ++j)
-            {
-                if (out_path[j] == a)
-                    return false;
-            }
-        }
-        return true;
+        return false;
     };
 
     int best_area2 = 0;
@@ -460,36 +438,24 @@ int GameState::best_new_cycle_area2(Node *start, Node *end, std::uint64_t &out_e
     bool have_best = false;
 
     std::vector<Node *> path;
-    if (trace_side(true, path))
+    path.reserve(64);
+    for (int side = 0; side < 2; ++side)
     {
+        Node *u = side == 0 ? start : end;
+        Node *v = side == 0 ? end : start;
+        if (!trace(u, v, path))
+            continue;
         int area2 = polygon_area2_from_path(path);
-        if (area2 != 0)
+        if (area2 == 0)
+            continue;
+        std::uint64_t ek = region_edge_key_digest_from_path(path);
+        if (ek != 0 && claimed_cycle_keys.find(ek) != claimed_cycle_keys.end())
+            continue;
+        if (!have_best || area2 < best_area2)
         {
-            std::uint64_t ek = region_edge_key_digest_from_path(path);
-            if (ek == 0 || claimed_cycle_keys.find(ek) == claimed_cycle_keys.end())
-            {
-                have_best = true;
-                best_area2 = area2;
-                best_key = ek;
-            }
-        }
-    }
-
-    if (trace_side(false, path))
-    {
-        int area2 = polygon_area2_from_path(path);
-        if (area2 != 0)
-        {
-            std::uint64_t ek = region_edge_key_digest_from_path(path);
-            if (ek == 0 || claimed_cycle_keys.find(ek) == claimed_cycle_keys.end())
-            {
-                if (!have_best || area2 < best_area2)
-                {
-                    have_best = true;
-                    best_area2 = area2;
-                    best_key = ek;
-                }
-            }
+            have_best = true;
+            best_area2 = area2;
+            best_key = ek;
         }
     }
 

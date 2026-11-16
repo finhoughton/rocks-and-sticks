@@ -122,7 +122,6 @@ public:
     std::vector<Move> get_possible_moves_for_player(int player_number);
 
     static constexpr bool HALF_AREA_COUNTS = false;
-    static constexpr int MAX_CYCLE_PATHS = 100;
 
     static bool coord_lt(Coord a, Coord b);
     static bool coord_leq(Coord a, Coord b);

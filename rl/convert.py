@@ -249,14 +249,16 @@ def convert_games_to_dataset(
             # Pre-transform the base graph once per symmetry transform.
             base_tf = base_data.clone()
             x_all = base_tf.x
-            if x_all is not None and x_all.shape[1] >= 2:
-                feats = x_all[:, :-2]
-                coords = x_all[:, -2:]
+            if x_all is not None and x_all.shape[1] >= 3:
+                # node features end with [x, y, r2]; r2 is unchanged by every symmetry
+                feats = x_all[:, :-3]
+                coords = x_all[:, -3:-1]
+                r2 = x_all[:, -1:]
                 a = coords[:, 0]
                 b = coords[:, 1]
                 tx, ty = tf(a, b)
                 coords_tf = torch.stack((tx, ty), dim=1)
-                base_tf.x = torch.cat((feats, coords_tf), dim=1)
+                base_tf.x = torch.cat((feats, coords_tf, r2), dim=1)
 
             if hasattr(base_tf, "node_coords"):
                 nc = base_tf.node_coords

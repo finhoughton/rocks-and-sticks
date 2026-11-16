@@ -70,9 +70,19 @@ class Player:
         return self
 
 
+class Resigned(Exception):
+    """Raised by a player who gives up instead of moving; `player` is their number."""
+
+    def __init__(self, player: int) -> None:
+        super().__init__(f"Player {player + 1} resigned")
+        self.player = player
+
+
 class HumanPlayer(Player):
     def get_move(self, game: Game) -> Move:
-        inp = game.wait_for_move_input(f"Player {self.number + 1}, enter move: ")
+        inp = game.wait_for_move_input(f"Player {self.number + 1}, enter move (or 'resign'): ")
+        if inp.strip().lower() == "resign":
+            raise Resigned(self.number)
         if inp == "P":
             from models import PASS
 

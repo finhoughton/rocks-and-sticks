@@ -14,6 +14,7 @@ from models import (
     Stick,
     calculate_area,
     calculate_end,
+    delta_to_direction,
 )
 from players import Player  # type: ignore
 
@@ -87,6 +88,11 @@ def _point_in_polygon_strict(point: tuple[int, int], poly: tuple[tuple[int, int]
             inside = not inside
         j = i
     return inside
+
+# Directions in anticlockwise order, used to walk round faces.
+_ACW = (D.E, D.NE, D.N, D.NW, D.W, D.SW, D.S, D.SE)
+_ACW_POS = {d: i for i, d in enumerate(_ACW)}
+
 
 class GameProtocol(Protocol):
     players: list[Player]
@@ -165,6 +171,11 @@ class Game:
         self._render_input_ax: "Axes | None" = None
         self._render_text_box: "TextBox | None" = None
         self._pending_input_text: str | None = None
+        self._render_rock_texts: list[Any] = []
+        self._render_resign_button: Any = None
+        self._resign_armed = False
+        # set by the caller when a game ends some other way than by the rules (a resignation)
+        self.result_note: str | None = None
 
         self.add_node_and_neighbours((0, 0))
         if STARTING_STICK:
@@ -259,58 +270,84 @@ class Game:
         self._reachable_highy = highy
         self._reachable_coords = reachable
     
-    def _all_paths(self, start: Node, end: Node) -> list[list[Node]]:
-        if start is end:
-            return [[start]]
-        if not (start.connected and end.connected):
-            return []
+    def _face_cycle(self, u: Node, v: Node) -> list[Node] | None:
+        """Walk round the face that lies on one side of the stick u-v.
 
-        MAX_PATHS = 100
-        paths: list[list[Node]] = []
-        neighbours_cache: dict[Node, tuple[Node, ...]] = {}
-
-        stack: list[tuple[Node, list[Node], set[Node]]] = [(start, [start], {start})]
-        while stack and len(paths) < MAX_PATHS:
-            node, path, path_set = stack.pop()
-            ordered = neighbours_cache.get(node)
-            if ordered is None:
-                # sort for deterministic ordering
-                ordered = tuple(sorted(node.neighbours_list, key=lambda n: n.c))
-                neighbours_cache[node] = ordered
-            for nbr in ordered:
-                if nbr in path_set: # no repeated nodes in the path
-                    continue
-                next_path = path + [nbr]
-                if nbr is end:
-                    paths.append(next_path)
-                    if len(paths) >= MAX_PATHS:
-                        break
-                else:
-                    stack.append((nbr, next_path, path_set | {nbr}))
-        return paths
-    
-    def _path_of_smallest_area(self, start: Node, end: Node) -> tuple[int, tuple[tuple[int, int], ...], frozenset[Edge]] | None:
-        all_paths = self._all_paths(start, end)
-        best_area2 = None
-        best_vertices = None
-        best_edge_key = None
-
-        for path in all_paths:
-            vertices = tuple(p.c for p in path)
-            edge_key = _region_edge_key(vertices)
-            if edge_key in self._claimed_edge_keys():
-                continue
-            area2 = calculate_area(path)
-            if area2 == 0:
-                continue
-            if best_area2 is None or area2 < best_area2:
-                best_area2 = area2
-                best_vertices = vertices
-                best_edge_key = edge_key
-
-        if best_area2 is not None and best_vertices is not None and best_edge_key is not None:
-            return (best_area2, best_vertices, best_edge_key)
+        Starting along u -> v, always turn to the next stick in anticlockwise order after the
+        one just walked; that follows the boundary of a single face. Dead-end branches and
+        anything hanging off the boundary at a single vertex make the walk revisit a vertex,
+        and those loops are cut out, leaving the simple polygon v ... u (closed by u -> v).
+        Returns None if the stick has no polygon on this side.
+        """
+        path: list[Node] = [v]
+        index: dict[Node, int] = {v: 0}
+        cur = v
+        back = _ACW_POS[delta_to_direction((u.x - v.x, u.y - v.y))]  # type: ignore[index]
+        for _ in range(4 * len(self.sticks) + 16):
+            nxt = None
+            for k in range(1, 9):
+                d = _ACW[(back + k) % 8]
+                nxt = cur.neighbours[d.as_int]
+                if nxt is not None:
+                    break
+            if nxt is None:
+                return None
+            if cur is u and nxt is v:
+                return path if len(path) >= 3 else None
+            j = index.get(nxt)
+            if j is None:
+                index[nxt] = len(path)
+                path.append(nxt)
+            else:
+                for dropped in path[j + 1:]:
+                    del index[dropped]
+                del path[j + 1:]
+            back = _ACW_POS[d.reversed]
+            cur = nxt
         return None
+
+    def _path_of_smallest_area(self, start: Node, end: Node) -> tuple[int, tuple[tuple[int, int], ...], frozenset[Edge]] | None:
+        """The smallest polygon that the stick start-end completes (or would complete).
+
+        Sticks never cross, so they divide the plane into faces, and every polygon through a
+        stick contains the face on one of its two sides. The smallest polygon is therefore the
+        smaller of those two faces' outlines, which is found by walking round each.
+        Returns (twice the area, polygon vertices, edge key) or None if there is no polygon.
+        """
+        if start is end or not (start.connected and end.connected):
+            return None
+        d = delta_to_direction((end.x - start.x, end.y - start.y))
+        if d is None:
+            return None
+        hypothetical = start.neighbours[d.as_int] is None
+        if hypothetical:
+            if self.intersects_stick(start.c, d):
+                return None  # the stick could never be placed
+            start.set_neighbour(d, end)
+            end.set_neighbour(d.reversed, start)
+        try:
+            best: tuple[int, tuple[tuple[int, int], ...], frozenset[Edge]] | None = None
+            if start.neighbour_count < 2 or end.neighbour_count < 2:
+                return None  # one end hangs free: nothing is enclosed
+            claimed = self._claimed_edge_keys()
+            for u, v in ((start, end), (end, start)):
+                cycle = self._face_cycle(u, v)
+                if cycle is None:
+                    continue
+                area2 = calculate_area(cycle)
+                if area2 == 0:
+                    continue
+                vertices = tuple(p.c for p in cycle)
+                edge_key = _region_edge_key(vertices)
+                if edge_key in claimed:
+                    continue
+                if best is None or area2 < best[0]:
+                    best = (area2, vertices, edge_key)
+            return best
+        finally:
+            if hypothetical:
+                start.clear_neighbour(d)
+                end.clear_neighbour(d.reversed)
 
     def __deepcopy__(self, memo: dict[int, object]) -> Game:
         # Deepcopy is used by MCTS to create a private working game.
@@ -616,6 +653,7 @@ class Game:
 
         print(prompt, flush=True)
         self._pending_input_text = None
+        self._set_resign_armed(False)
         while self._pending_input_text is None:
             try:
                 plt.pause(0.05)  # type: ignore
@@ -626,9 +664,17 @@ class Game:
         self._pending_input_text = None
         return text
 
+    def _set_resign_armed(self, armed: bool) -> None:
+        """The Resign button asks for a second click before it resigns."""
+        self._resign_armed = armed
+        button = self._render_resign_button
+        if button is not None:
+            button.label.set_text("Click again\nto resign" if armed else "Resign")
+            button.ax.figure.canvas.draw_idle()
+
     def render(self, block: bool = False, game_index: int | None = None, total_games: int | None = None) -> None:
         import matplotlib.pyplot as plt
-        from matplotlib.widgets import TextBox
+        from matplotlib.widgets import Button, TextBox
 
         if self._render_fig is None or self._render_ax is None:
             fig_ax: tuple[Figure, Axes] = plt.subplots()  # type: ignore
@@ -653,6 +699,24 @@ class Game:
 
             self._render_input_ax = input_ax
             self._render_text_box = text_box
+
+            # Rocks each player may still place before their next stick, right of the input box.
+            self._render_rock_texts = [
+                fig.text(0.525, 0.115 - 0.045 * i, "", color=f"C{i}", fontsize=10, va="center") for i in range(self.num_players)
+            ]
+
+            # Resign: the same as typing "resign". Two clicks, so a stray click cannot end the game.
+            def _on_resign(_event: Any) -> None:
+                if not self._resign_armed:
+                    self._set_resign_armed(True)
+                    return
+                self._set_resign_armed(False)
+                self._pending_input_text = "resign"
+
+            resign_button = Button(fig.add_axes((0.81, 0.06, 0.13, 0.08)), "Resign")  # type: ignore
+            resign_button.label.set_fontsize(9)
+            resign_button.on_clicked(_on_resign)
+            self._render_resign_button = resign_button
 
         ax = self._render_ax
         ax_any: Any = ax
@@ -698,7 +762,17 @@ class Game:
                 prefix = f"Game {game_index + 1}/{total_games} — "
             else:
                 prefix = f"Game {game_index + 1} — "
-        ax_any.set_title(f"{prefix}Turn {self.turn_number} — Player {self.current_player + 1} to move")
+        if self.winner is not None:
+            status = f"Player {self.winner + 1} wins" + (f" ({self.result_note})" if self.result_note else "")
+        else:
+            status = f"Player {self.current_player + 1} to move"
+        ax_any.set_title(f"{prefix}Turn {self.turn_number} — {status}")
+
+        humans = [p.__class__.__name__ == "HumanPlayer" for p in self.players]
+        for i, text in enumerate(self._render_rock_texts):
+            who = " (you)" if humans[i] and sum(humans) == 1 else ""
+            left = self.num_rocks[i]
+            text.set_text(f"Player {i + 1}{who} rocks  " + "●" * left + "○" * (N_ROCKS - left))
 
         try:
             plt.pause(0.01)  # type: ignore
