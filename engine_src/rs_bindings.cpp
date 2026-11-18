@@ -111,8 +111,14 @@ class Engine
     void stop() { par.request_abort(); }
     void clear_stop() { par.clear_abort(); }
 
-    py::dict search(int time_ms, int max_depth, std::int64_t max_nodes, bool keep_stop)
+    // exclude: root moves the search must not choose ("the best move other than these");
+    // the result's move is (0, 0, "P") with depth 0 if nothing else is legal.
+    py::dict search(int time_ms, int max_depth, std::int64_t max_nodes, bool keep_stop, const std::vector<std::tuple<int, int, std::string>> &exclude)
     {
+        std::vector<Move> excluded;
+        for (const auto &m : exclude)
+            excluded.push_back(move_from_py(std::get<0>(m), std::get<1>(m), std::get<2>(m)));
+        par.set_excluded(excluded);
         if (!keep_stop)
             par.clear_abort();
         SearchLimits lim;
@@ -125,7 +131,7 @@ class Engine
             r = par.search(state, lim);
         }
         py::dict d;
-        d["move"] = move_to_py(r.best);
+        d["move"] = r.best == MOVE_NONE ? py::make_tuple(0, 0, "P") : move_to_py(r.best);
         d["score"] = r.score;
         d["depth"] = r.depth;
         d["nodes"] = r.nodes;
@@ -220,7 +226,8 @@ PYBIND11_MODULE(RS_MODULE_NAME, m)
         .def("legal_moves", &Engine::legal_moves, py::arg("dedupe") = false)
         .def("stop", &Engine::stop)
         .def("clear_stop", &Engine::clear_stop)
-        .def("search", &Engine::search, py::arg("time_ms") = 1000, py::arg("max_depth") = 0, py::arg("max_nodes") = 0, py::arg("keep_stop") = false)
+        .def("search", &Engine::search, py::arg("time_ms") = 1000, py::arg("max_depth") = 0, py::arg("max_nodes") = 0, py::arg("keep_stop") = false,
+             py::arg("exclude") = std::vector<std::tuple<int, int, std::string>>())
         .def("eval", &Engine::eval)
         .def("qeval", &Engine::qeval)
         .def("features", &Engine::features)

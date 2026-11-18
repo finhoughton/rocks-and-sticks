@@ -1,12 +1,13 @@
 """Opening book for the rs engine: positions mapped to a move found by a long search.
 
-The starting stick runs from (0,0) to (0,1), and the rules treat every direction alike, so the
-game has four symmetries: the left-right mirror (x -> -x), the top-bottom mirror (y -> 1 - y)
-and both together (a half turn). Each position is stored under whichever of its images sorts
-first, and the stored move is turned back to fit the game it is looked up for.
+The rules treat every direction and every place on the grid alike, so a position is the same
+position wherever it sits and whichever way round it is: turned by quarter turns, mirrored,
+or shifted. Each position is stored under whichever of its eight images (shifted against the
+axes) sorts first, and the stored move is turned back to fit the game it is looked up for.
 
-Book files written before November 2026 (format 1) used only the left-right mirror; they can
-still be read, with lookups that match how they were written.
+Older book files knew fewer symmetries and can still be read, with lookups that match how
+they were written: format 1 only the left-right mirror, format 2 the four symmetries that
+leave the starting stick (0,0)-(0,1) where it is.
 
 Built by tools/build_book.py.
 """
@@ -23,13 +24,15 @@ from models import PASS, Move
 if TYPE_CHECKING:
     from game import GameProtocol
 
-# (flip x, flip y); each is its own inverse
-Symmetry = tuple[bool, bool]
-SYMMETRIES: tuple[Symmetry, ...] = ((False, False), (True, False), (False, True), (True, True))
-FORMAT = 2
+# A symmetry moves a point by: swap x and y, negate x, negate y (each if set), then add (dx, dy)
+Symmetry = tuple[bool, bool, bool, int, int]
+IDENTITY: Symmetry = (False, False, False, 0, 0)
+# the four that leave the starting stick (0,0)-(0,1) where it is
+SYMMETRIES: tuple[Symmetry, ...] = (IDENTITY, (False, True, False, 0, 0), (False, False, True, 0, 1), (False, True, True, 0, 1))
+FORMAT = 3
 
-FLIP_X = {"N": "N", "S": "S", "E": "W", "W": "E", "NE": "NW", "NW": "NE", "SE": "SW", "SW": "SE", "R": "R", "P": "P"}
-FLIP_Y = {"N": "S", "S": "N", "E": "E", "W": "W", "NE": "SE", "SE": "NE", "NW": "SW", "SW": "NW", "R": "R", "P": "P"}
+DELTA = {"N": (0, 1), "NE": (1, 1), "E": (1, 0), "SE": (1, -1), "S": (0, -1), "SW": (-1, -1), "W": (-1, 0), "NW": (-1, 1)}
+DIRECTION = {d: name for name, d in DELTA.items()}
 
 DEFAULT_BOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "engine_src", "book.json")
 
@@ -37,23 +40,47 @@ MoveTuple = tuple[int, int, str]
 
 
 def transform_point(x: int, y: int, sym: Symmetry) -> tuple[int, int]:
-    return (-x if sym[0] else x, 1 - y if sym[1] else y)
+    swap, flip_x, flip_y, dx, dy = sym
+    if swap:
+        x, y = y, x
+    return ((-x if flip_x else x) + dx, (-y if flip_y else y) + dy)
+
+
+def inverse(sym: Symmetry) -> Symmetry:
+    """The symmetry that undoes `sym`."""
+    swap, flip_x, flip_y, dx, dy = sym
+    if swap:
+        flip_x, flip_y = flip_y, flip_x
+    back = (swap, flip_x, flip_y, 0, 0)
+    x, y = transform_point(dx, dy, back)
+    return (swap, flip_x, flip_y, -x, -y)
 
 
 def transform_move(m: MoveTuple, sym: Symmetry) -> MoveTuple:
     x, y, t = m
     if t == "P":
         return (0, 0, "P")
-    if sym[0]:
-        x, t = -x, FLIP_X[t]
-    if sym[1]:
-        y, t = 1 - y, FLIP_Y[t]
-    return (x, y, t)
+    if t != "R":
+        t = DIRECTION[transform_point(*DELTA[t], sym[:3] + (0, 0))]
+    return (*transform_point(x, y, sym), t)
 
 
 def mirror_move(m: MoveTuple) -> MoveTuple:
     """The left-right mirror image of a move."""
-    return transform_move(m, (True, False))
+    return transform_move(m, SYMMETRIES[1])
+
+
+def all_symmetries(game: "GameProtocol") -> list[Symmetry]:
+    """The eight turns and mirrors of the grid, each shifted to put the position's sticks
+    against the axes, so that the images do not depend on where the position sits."""
+    points = [(p.x, p.y) for s in game.sticks for p in (s.start, s.end)]
+    out = []
+    for swap in (False, True):
+        for flip_x in (False, True):
+            for flip_y in (False, True):
+                image = [transform_point(x, y, (swap, flip_x, flip_y, 0, 0)) for x, y in points]
+                out.append((swap, flip_x, flip_y, -min(x for x, _ in image), -min(y for _, y in image)))
+    return out
 
 
 def _describe(game: "GameProtocol", sym: Symmetry) -> str:
@@ -67,10 +94,10 @@ def _describe(game: "GameProtocol", sym: Symmetry) -> str:
     return repr((sticks, rocks, state))
 
 
-def position_key(game: "GameProtocol", symmetries: tuple[Symmetry, ...] = SYMMETRIES) -> tuple[str, Symmetry]:
+def position_key(game: "GameProtocol", symmetries: tuple[Symmetry, ...] | None = None) -> tuple[str, Symmetry]:
     """(key, sym): the key of the position's canonical image, and the symmetry that turns the
-    game into that image (and back again)."""
-    text, sym = min((_describe(game, s), s) for s in symmetries)
+    game into that image. `symmetries` limits the images considered (for old book files)."""
+    text, sym = min((_describe(game, s), s) for s in symmetries or all_symmetries(game))
     return hashlib.sha1(text.encode()).hexdigest()[:20], sym
 
 
@@ -84,8 +111,8 @@ class Book:
                 data = json.load(fh)
             self.entries = data.get("entries", {})
             self.format = int(data.get("version", 1))
-        # format 1 books were keyed with the left-right mirror only
-        self.symmetries = SYMMETRIES if self.format >= 2 else SYMMETRIES[:2]
+        # older books were keyed with fewer symmetries
+        self.symmetries = {1: SYMMETRIES[:2], 2: SYMMETRIES}.get(self.format)
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -99,8 +126,57 @@ class Book:
         e = self.entries.get(key)
         if e is None:
             return None
-        m = transform_move((int(e["m"][0]), int(e["m"][1]), str(e["m"][2])), sym)
+        m = transform_move((int(e["m"][0]), int(e["m"][1]), str(e["m"][2])), inverse(sym))
         return {"move": m, "score": int(e["s"]), "depth": int(e["d"])}
+
+    def _options(self, game: "GameProtocol") -> list[tuple[list[MoveTuple], int]]:
+        """Every move the book can judge here, best first: ([the move and its images], its
+        value to the mover). Moves that lead to images of the same position are one option;
+        the book's own way of playing its move comes first among its images."""
+        entry = self.lookup(game)
+        if entry is None:
+            return []
+        mover = game.current_player
+        game.do_move(mover, to_move(entry["move"]))
+        own = self.key(game)[0]  # (the same stick can be named from either end: compare positions)
+        game.undo_move()
+        by_position: dict[str, tuple[list[MoveTuple], int]] = {}
+        for m in list(game.get_possible_moves(mover)):
+            t: MoveTuple = (0, 0, "P") if m is PASS else (m.c[0], m.c[1], m.t)
+            game.do_move(mover, m)
+            key = self.key(game)[0]
+            child = None if game.winner is not None else self.entries.get(key)
+            game.undo_move()
+            if key in by_position:
+                by_position[key][0].append(t)
+            elif child is not None:
+                by_position[key] = ([t], -int(child["s"]))  # the deeper look at this move
+            elif key == own:
+                by_position[key] = ([t], entry["score"])
+        if own in by_position:
+            by_position[own][0].sort(key=lambda t: t != entry["move"])
+        return sorted(by_position.values(), key=lambda mv: -mv[1])
+
+    def choices(self, game: "GameProtocol") -> list[tuple[MoveTuple, int]]:
+        """Every move the book can judge here, best first, with its value to the mover: the
+        book's own move, and any other move leading to a position the book has an entry for
+        (searched from the opponent's side, so worth minus that entry's score). Moves that
+        lead to images of the same position are listed once. Empty if the position itself is
+        not in the book. Makes and unmakes moves on `game`."""
+        return [(moves[0], value) for moves, value in self._options(game)]
+
+    def pick(self, game: "GameProtocol", margin: int, rng) -> dict | None:
+        """A book move for this position: with margin > 0, a random one of the moves the book
+        rates within `margin` of its best here, played in a random one of its mirror images
+        (so repeated games vary); otherwise the book's own move. None if the position is not
+        in the book."""
+        entry = self.lookup(game)
+        if entry is None or margin <= 0:
+            return entry
+        options = self._options(game)
+        viable = [(ms, v) for ms, v in options if v >= options[0][1] - margin]
+        moves, value = rng.choice(viable)
+        return {"move": rng.choice(moves), "score": value, "depth": entry["depth"], "choices": len(viable)}
 
     def store(self, game: "GameProtocol", move: MoveTuple, score: int, depth: int) -> None:
         if self.format < FORMAT:

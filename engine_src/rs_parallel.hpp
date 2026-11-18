@@ -41,6 +41,11 @@ class ParallelSearcher
     // Stop a search running in another thread as soon as possible. The flag stays set (and
     // stops every later search at once) until clear_abort(); a caller that starts a search in
     // a background thread clears it first, so a request to stop can never be lost.
+    void set_excluded(const std::vector<Move> &moves)
+    {
+        for (auto &wk : workers)
+            wk->excluded_root = moves;
+    }
     void request_abort() { abort.store(true); }
     void clear_abort() { abort.store(false); }
 

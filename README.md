@@ -156,11 +156,24 @@ python3 tools/analyse.py --moves "0,1NE 0,0E" --minutes 10
 
 Opening book. `engine_src/book.json` maps early positions to moves found by searches of
 minutes rather than seconds; the engine plays from it when it can and searches as usual
-otherwise. Build or extend it (it resumes where it stopped, and can be interrupted):
+otherwise. A position counts as the same position however it is turned, mirrored or
+shifted on the grid, so each is stored once. Where the book rates several moves within a
+small margin of its best (`BOOK_VARIETY` in `players/rs_player.py`), the engine picks one of
+them at random, and plays it in a random one of its mirror images, so games do not all open
+the same way. The builder evaluates the mover's other promising moves in the first few
+positions (`--variety-ply`) to give it moves to choose between. Build or extend the book (it
+resumes where it stopped, and can be interrupted):
 
 ```bash
 caffeinate -i python3 tools/build_book.py --hours 8
+caffeinate -i python3 tools/build_book.py --first "0,0S 0,-1S 0,-1R" --hours 0.01   # check one line now
 ```
+
+The builder checks its own work: every new entry is played on for a few moves, and when a
+line turns out worse than the book move leading to it promised, that move is marked as bad
+and replaced by the best move that holds up, back up the line as far as needed. Bot-vs-bot
+games that all collapse the same way after the opening are the sign of a bad line: pass
+its moves to `--first`.
 
 Retrain the evaluation network from fresh self-play (about an hour of data on 4 cores):
 

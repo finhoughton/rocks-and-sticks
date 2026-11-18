@@ -142,6 +142,21 @@ class Searcher
     // that staggers the depths helpers search.
     std::atomic<bool> *shared_stop = nullptr;
     int helper_id = 0;
+    // Root moves the search must not consider (the book builder asks for "the best move other
+    // than these"). The root is never stored in the transposition table, so this is safe.
+    std::vector<Move> excluded_root;
+    static Move canonical_move(Move m)
+    {
+        const int t = move_type(m);
+        return (t >= 4 && t < 8) ? make_move(move_idx(m) + DOFF[t], 7 - t) : m; // a stick, named from either end
+    }
+    bool is_excluded(Move m) const
+    {
+        for (Move x : excluded_root)
+            if (canonical_move(x) == canonical_move(m))
+                return true;
+        return false;
+    }
     // A request from outside to stop now (ParallelSearcher::request_abort), for every worker.
     std::atomic<bool> *abort_flag = nullptr;
 
@@ -182,12 +197,13 @@ class Searcher
         s->gen_moves(root_moves, true);
         if (s->winner >= 0 || root_moves.empty())
             return res;
-        res.best = root_moves[0];
-
         std::vector<std::pair<Move, int>> scored;
         for (Move m : root_moves)
-            if (move_type(m) != T_ROCK || rock_relevant(move_idx(m)))
+            if ((move_type(m) != T_ROCK || rock_relevant(move_idx(m))) && !is_excluded(m))
                 scored.push_back({m, 0});
+        if (scored.empty())
+            return res; // every move is excluded: best stays MOVE_NONE
+        res.best = scored[0].first;
         order_root(scored);
 
         int prev_score = 0;

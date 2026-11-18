@@ -9,6 +9,7 @@ from __future__ import annotations
 import atexit
 import importlib
 import os
+import random
 import threading
 import weakref
 from typing import TYPE_CHECKING
@@ -32,7 +33,7 @@ MATE_BOUND = 29000  # scores at or above this are forced wins (see engine_src/rs
 # count. Before bumping, freeze the current version so it can still play rated games:
 # copy the engine sources, the evaluation file it plays with (as weights.txt) and book.json to
 # engine_src/versions/v<old>/ and run ./build_engine.sh (bots then name it with ":v<old>").
-ENGINE_VERSION = "6"
+ENGINE_VERSION = "7"
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Two evaluations (both read by Engine.load_weights; the file says which kind it is):
@@ -44,27 +45,34 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # helping, then hurts, once the search itself looks further. So the engine picks by budget.
 LINEAR_WEIGHTS = os.path.join(_ROOT, "engine_src", "weights.txt")
 BLEND_WEIGHTS = os.path.join(_ROOT, "engine_src", "eval.txt")
+# In the opening book the engine picks at random among the moves the book rates within this
+# much of its best (200 = from an even game to about 27%), so games do not all open the same
+# way. Frozen versions before 7 always play the book's first choice.
+BOOK_VARIETY = 40
 DEEP_SEARCH_NODES = 400_000   # from about here on the linear evaluation plays better
 NODES_PER_MS = 600            # rough positions per millisecond of a timed search, one thread
 # Long analysis and book building search deep: they use the linear evaluation.
 DEFAULT_WEIGHTS = LINEAR_WEIGHTS
 
 
-def default_weights(time_ms: int = 0, max_nodes: int = 0, threads: int = 1) -> str:
-    """The evaluation the current engine plays best with for this search budget."""
+def default_weights(time_ms: int = 0, max_nodes: int = 0, threads: int = 1, folder: str | None = None) -> str:
+    """The evaluation the engine plays best with for this search budget (from `folder` for a
+    frozen version that has both kinds)."""
+    linear = os.path.join(folder, "weights.txt") if folder else LINEAR_WEIGHTS
+    blend = os.path.join(folder, "eval.txt") if folder else BLEND_WEIGHTS
     if max_nodes > 0:
         nodes = max_nodes
     elif time_ms > 0:
         # extra threads deepen a search less than they multiply its positions
         nodes = time_ms * NODES_PER_MS * (1 + 0.5 * (max(1, threads) - 1))
     else:
-        return LINEAR_WEIGHTS  # depth-limited or unlimited: assume a deep search
-    return BLEND_WEIGHTS if nodes < DEEP_SEARCH_NODES else LINEAR_WEIGHTS
+        return linear  # depth-limited or unlimited: assume a deep search
+    return blend if nodes < DEEP_SEARCH_NODES else linear
 
 
 def version_files(version: str | None) -> tuple[object, str | None, str | None]:
-    """(engine module, weights path, book path) for an engine version; None means current, whose
-    weights depend on the search budget (default_weights)."""
+    """(engine module, folder, book path) for an engine version; None means current. A frozen
+    version's folder holds weights.txt (and, from version 6, eval.txt: see default_weights)."""
     if version is None or str(version) == ENGINE_VERSION:
         return rs_engine, None, None
     folder = os.path.join(_ROOT, "engine_src", "versions", f"v{version}")
@@ -74,7 +82,7 @@ def version_files(version: str | None) -> tuple[object, str | None, str | None]:
         module = importlib.import_module(f"rs_engine_v{version}")
     except ImportError as e:
         raise ImportError(f"engine version {version} is not built; run ./build_engine.sh") from e
-    return module, os.path.join(folder, "weights.txt"), os.path.join(folder, "book.json")
+    return module, folder, os.path.join(folder, "book.json")
 
 
 def sync_engine(engine: "rs_engine.Engine", game: "GameProtocol") -> None:
@@ -115,17 +123,18 @@ class RSPlayer(Player):
         version: str | None = None,
         ponder: bool = False,
         ponder_ms: int = 600_000,
+        book_variety: int | None = None,
     ) -> None:
         super().__init__(player_number)
-        module, version_weights, version_book = version_files(version)
+        module, version_folder, version_book = version_files(version)
         self.version = ENGINE_VERSION if version is None else str(version)
         self.engine = module.Engine(int(tt_bits), max(1, int(threads)))
         if weights is not None:
             path = weights
-        elif version_weights is not None:
-            path = version_weights
+        elif version_folder is not None and not os.path.exists(os.path.join(version_folder, "eval.txt")):
+            path = os.path.join(version_folder, "weights.txt")
         else:
-            path = default_weights(int(time_ms), int(max_nodes), int(threads))
+            path = default_weights(int(time_ms), int(max_nodes), int(threads), version_folder)
         self.weights_path = path
         if path and os.path.exists(path):
             if not self.engine.load_weights(path):
@@ -145,6 +154,10 @@ class RSPlayer(Player):
         if book is None:
             book = version_book or DEFAULT_BOOK
         self.book = Book(book) if book != "" else None
+        if book_variety is None:
+            book_variety = BOOK_VARIETY if version_folder is None else 0
+        self.book_variety = int(book_variety)
+        self._book_rng = random.Random(seed)
         self.last_info: dict = {}
         self._win_announced_at = -10  # len(game.moves) when a forced win was last announced
         # Pondering: after moving, keep searching the position the opponent faces until they
@@ -184,7 +197,8 @@ class RSPlayer(Player):
 
     def _choose_move(self, game: "GameProtocol") -> Move:
         if self.book is not None and len(self.book):
-            entry = self.book.lookup(game)
+            # (the plain Python game: choosing among book moves makes and unmakes moves)
+            entry = self.book.pick(getattr(game, "py", game), self.book_variety, self._book_rng)
             if entry is not None:
                 mv = to_py_move(entry["move"])
                 if game.valid_move(mv, self.number):
