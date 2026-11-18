@@ -17,7 +17,8 @@ Two adjustments keep small samples sensible:
   * the scale is fixed by one reference player, the old depth-3 alpha-beta (ab:3) at 1000.
     Players with no chain of games linking them to it are placed relative to each other only.
 
-Recording: tools/rate.py plays rated bot matches; main.py records your games against bots.
+Recording: main.py records every game it plays between two differently named players;
+tools/rate.py shows the table and takes results entered by hand.
 """
 
 from __future__ import annotations

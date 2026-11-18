@@ -10,6 +10,14 @@
                          against people; it needs a time budget). :v<n> plays a frozen
                          older engine version (engine_src/versions).
 
+The older bots take options as extra :key=value parts, for the model-backed variants:
+
+    ab:<depth>[:time=<ms>][:gnn=<checkpoint>][:native=<weights.bin>][:order=<depth>]
+    mcts:<rollouts>[:gnn=<checkpoint>][:policy=<checkpoint>]
+    pymcts:<rollouts>[:time=<seconds>][:gnn=<checkpoint>]     the Python MCTS
+    pyab[:gnn=<checkpoint>]                                   the Python alpha-beta
+    ppo:<checkpoint>                                          the PPO policy network
+
 Different spellings of the same configuration canonicalise to the same id (rs:0.5s and
 rs:500ms are both "rs:500ms"), which the rating system uses as the bot's name.
 
@@ -82,14 +90,35 @@ def _fmt_nodes(n: int) -> str:
     return str(n)
 
 
+# options the older bots accept, by kind
+_OLD_OPTS = {"ab": {"time", "gnn", "native", "order"}, "mcts": {"gnn", "policy"}, "pymcts": {"time", "gnn"}, "pyab": {"gnn"}}
+
+
+def _parse_old(parts: list[str]) -> tuple[int, dict[str, str]]:
+    """(number, options) of an older bot's spec: ab:3, mcts:3000:gnn=x.pt, pyab, ..."""
+    kind, rest = parts[0], parts[1:]
+    n = 0
+    if kind != "pyab":
+        if not rest or not rest[0].isdigit() or int(rest[0]) <= 0:
+            raise ValueError(f"{kind} needs a positive number, e.g. {kind}:3")
+        n, rest = int(rest[0]), rest[1:]
+    opts = dict(o.split("=", 1) for o in rest if "=" in o)
+    if len(opts) != len(rest) or not set(opts) <= _OLD_OPTS[kind]:
+        raise ValueError(f"bad options for {kind}: use {', '.join(sorted(_OLD_OPTS[kind]))} as key=value")
+    return n, opts
+
+
 def canonical(spec: str) -> str:
     """The canonical id of a bot spec. Raises ValueError if it is not one."""
     parts = spec.strip().split(":")
     kind = parts[0]
     if kind == "random" and len(parts) == 1:
         return "random"
-    if kind in ("ab", "mcts") and len(parts) == 2 and parts[1].isdigit() and int(parts[1]) > 0:
-        return f"{kind}:{int(parts[1])}"
+    if kind in _OLD_OPTS:
+        n, opts = _parse_old(parts)
+        return ":".join([kind] + ([str(n)] if n else []) + [f"{k}={v}" for k, v in sorted(opts.items())])
+    if kind == "ppo" and len(parts) >= 2 and parts[1]:
+        return spec.strip()
     if kind == "rs":
         cfg = _parse_rs(parts[1:])
         out = "rs:" + (_fmt_time(cfg["time_ms"]) if cfg["time_ms"] else _fmt_nodes(cfg["nodes"]))
@@ -132,10 +161,10 @@ def describe(spec: str) -> str:
     parts = spec.split(":")
     if parts[0] == "random":
         return "random moves"
-    if parts[0] == "ab":
-        return f"old alpha-beta, depth {parts[1]}"
-    if parts[0] == "mcts":
-        return f"old MCTS, {parts[1]} rollouts"
+    if parts[0] in _OLD_OPTS or parts[0] == "ppo":
+        names = {"ab": "old alpha-beta, depth {}", "mcts": "old MCTS, {} rollouts", "pymcts": "Python MCTS, {} rollouts", "pyab": "Python alpha-beta", "ppo": "PPO policy"}
+        extra = ", " + ", ".join(parts[2:]) if parts[0] != "ppo" and len(parts) > 2 else ""
+        return names[parts[0]].format(parts[1] if len(parts) > 1 else "") + extra
     cfg = _parse_rs(parts[1:])
     if cfg["time_ms"]:
         budget = f"{cfg['time_ms'] / 1000:g} s/move"
@@ -147,6 +176,63 @@ def describe(spec: str) -> str:
     if cfg["version"]:
         extra += f", version {cfg['version']}"
     return f"rs engine, {budget}{extra}"
+
+
+def needs_cpp_state(spec: str) -> bool:
+    """The older C++ bots need the game wrapped in players.game_total.GameTotal."""
+    return spec.split(":")[0] in ("ab", "mcts")
+
+
+def _make_old_bot(parts: list[str], number: int, seed: int | None) -> Player:
+    """The bots that predate the rs engine, with or without a trained model."""
+    kind = parts[0]
+    if kind == "ppo":
+        import torch
+
+        from gnn.encode import SAMPLE_ENC
+        from rl.PPO import PPOGNNPolicy, PPOPlayer
+
+        model = PPOGNNPolicy(node_feat_dim=SAMPLE_ENC.data.x.size(1), global_feat_dim=SAMPLE_ENC.data.global_feats.size(1))  # type: ignore
+        model.load_state_dict(torch.load(":".join(parts[1:]), map_location="cpu"))
+        model.eval()
+        return PPOPlayer(number, model, device="cpu")
+    n, opts = _parse_old(parts)
+    gnn = opts.get("gnn")
+    if kind == "ab":
+        from .alphabeta_cpp import AlphaBetaPlayerCPP
+
+        ab = AlphaBetaPlayerCPP(number, seed=seed or 0, depth=n, use_heuristic=gnn is None, time_limit_ms=int(opts.get("time", 0)),
+                                native_model=opts.get("native", ""), nn_ordering_depth=int(opts.get("order", 2)))
+        if gnn:
+            ab.set_model_checkpoint(gnn, device="cpu")
+        return ab
+    if kind == "mcts":
+        from .mcts_cpp import MCTSPlayerCPP
+
+        if gnn:
+            p = MCTSPlayerCPP(number, seed=seed or 0, n_rollouts=n, use_nn_value=True)
+            p.set_model_checkpoint(gnn, device="cpu")
+            if "policy" in opts:
+                p.set_policy_checkpoint(opts["policy"], device="cpu")
+                p.engine.set_prior_params(0.04, 1.0)
+        else:
+            p = MCTSPlayerCPP(number, seed=seed or 0, n_rollouts=n, use_nn_value=False, use_heuristic_rollout=True)
+        p.set_exploration(dirichlet_alpha=0.0, dirichlet_epsilon=0.0, temperature=0.0, temperature_moves=0)
+        return p
+    # the Python bots read a globally loaded GNN evaluator
+    if gnn:
+        from gnn.encode import SAMPLE_ENC
+        from gnn.model import load_model
+
+        load_model(gnn, SAMPLE_ENC.data.x.size(1), SAMPLE_ENC.data.global_feats.size(1), device="cpu")  # type: ignore
+    if kind == "pymcts":
+        from .mcts import MCTSPlayer
+
+        return MCTSPlayer(number, seed=seed, n_rollouts=n, time_limit=float(opts["time"]) if "time" in opts else None,
+                          use_gnn=bool(gnn), check_forced_losses=not gnn)
+    from .ai import AlphaBetaPlayer
+
+    return AlphaBetaPlayer(number, use_gnn=bool(gnn))
 
 
 def make_bot(spec: str, number: int, seed: int | None = None, verbose: bool = False) -> Player:
@@ -161,16 +247,8 @@ def make_bot(spec: str, number: int, seed: int | None = None, verbose: bool = Fa
         seed %= 2**31 - 1  # the C++ engines take 32-bit seeds
     if kind == "random":
         return RandomPlayer(number, seed=seed)
-    if kind == "ab":
-        from .alphabeta_cpp import AlphaBetaPlayerCPP
-
-        return AlphaBetaPlayerCPP(number, seed=seed or 0, depth=int(parts[1]), use_heuristic=True)
-    if kind == "mcts":
-        from .mcts_cpp import MCTSPlayerCPP
-
-        p = MCTSPlayerCPP(number, seed=seed or 0, n_rollouts=int(parts[1]), use_nn_value=False, use_heuristic_rollout=True)
-        p.set_exploration(dirichlet_alpha=0.0, dirichlet_epsilon=0.0, temperature=0.0, temperature_moves=0)
-        return p
+    if kind in _OLD_OPTS or kind == "ppo":
+        return _make_old_bot(parts, number, seed)
     from .rs_player import RSPlayer
 
     cfg = _parse_rs(parts[1:])

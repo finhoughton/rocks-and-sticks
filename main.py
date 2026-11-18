@@ -1,254 +1,315 @@
+"""Play, watch or replay Rocks and Sticks.
+
+    python3 main.py                              # you against the engine, you move first
+    python3 main.py rs:100k                      # you against a particular bot
+    python3 main.py rs:5s:4t:ponder human        # the engine moves first
+    python3 main.py human human                  # two people at one screen
+    python3 main.py rs:2s:4t rs:2s:4t --games 3  # watch two bots
+    python3 main.py rs:100k ab:3 --games 20 --no-display --jobs 4   # a quick match, no window
+    python3 main.py --replay saved_games_human/game_00040.json --analyse 2
+
+The two arguments are Player 1 and Player 2. Each is a bot (rs:5s:4t, rs:100k, ab:3,
+mcts:3000, random, ...: see players/specs.py) or a person: "human", or any other name. With
+no arguments you play rs:5s:4t:ponder.
+
+In the window, type a move into the box: "X Y D" for a stick from X,Y in direction N, NE, E,
+SE, S, SW, W or NW; "X Y R" for a rock; "P" to pass. Type "resign" or click Resign twice to
+give up.
+
+Every finished game between two differently named players is added to the ratings
+(python3 tools/rate.py shows the table) unless --no-rate is given. Games played in a window
+are saved (yours to saved_games_human/, bot games to saved_games_bots/) and can be replayed
+with --replay.
+"""
+
+from __future__ import annotations
+
 import argparse
 import glob
 import json
 import os
+import random
 import time
+from concurrent.futures import ProcessPoolExecutor
+from typing import Iterator
 
-import torch
+import ratings
+from game import Game
+from models import PASS, Move
+from players.base import HumanPlayer, Player, RandomPlayer, Resigned
+from players.specs import canonical, is_bot_spec, make_bot, needs_cpp_state
 
-from game import Game, GameProtocol
-from gnn.encode import SAMPLE_ENC
-from gnn.model import load_model
-from players import AlphaBetaPlayer, HumanPlayer, MCTSPlayer, Player
-from players.base import Resigned
-from players.alphabeta_cpp import AlphaBetaPlayerCPP
-from players.game_total import GameTotal
-from players.mcts_cpp import MCTSPlayerCPP
-from rl.PPO import PPOGNNPolicy, PPOPlayer
+DEFAULT_OPPONENT = "rs:5s:4t:ponder"
+# where games played in a window are saved: with a person in them, and between bots
+SAVE_DIRS = ("saved_games_human", "saved_games_bots")
 
 
-def _next_save_path(save_dir: str) -> str:
+def player_id(token: str, name: str) -> str:
+    """The rating name of a player argument: a bot's canonical spec, or a person's name."""
+    if is_bot_spec(token):
+        return canonical(token)
+    if ":" in token:
+        canonical(token)  # looks like a bot spec but is not one: raise its error
+    return name if token == "human" else token
+
+
+def save_game(game, ids: list[str], evals: list, resigned: int | None, save_dir: str) -> str:
     os.makedirs(save_dir, exist_ok=True)
-    existing = [p for p in glob.glob(os.path.join(save_dir, "game_*.json"))]
-    start_idx = 0
-    if existing:
-        def _idx(p: str) -> int:
-            stem = os.path.basename(p)
-            try:
-                return int(stem.split("_")[1].split(".")[0])
-            except Exception:
-                return -1
-        start_idx = max(map(_idx, existing)) + 1
-    return os.path.join(save_dir, f"game_{start_idx:05d}.json")
-
-def _save_game(game: GameProtocol, opponent: Player, save_dir: str = "saved_games_human", evals: list | None = None,
-               human_player: int | None = None, bot_spec: str | None = None, resigned: int | None = None) -> str:
-    path = _next_save_path(save_dir)
-    payload: dict[str, object] = {
+    taken = [int(os.path.basename(p)[5:10]) for p in glob.glob(os.path.join(save_dir, "game_*.json"))]
+    path = os.path.join(save_dir, f"game_{max(taken, default=-1) + 1:05d}.json")
+    humans = [i for i, pid in enumerate(ids) if not is_bot_spec(pid)]
+    payload = {
         "winner": game.winner,
         "moves": [{"x": m.c[0], "y": m.c[1], "t": m.t} for m in game.moves],
-        "max_moves_reached": False,
-        # one entry per move: the rs engine's search result for its own moves, None otherwise
-        "evals": evals if evals is not None else [],
+        # one entry per move: the engine's search result for its own moves, None otherwise
+        "evals": evals,
         "meta": {
-            "mode": "human-vs-bot",
-            "bot": opponent.__class__.__name__,
-            "time_limit": getattr(opponent, "time_limit", None),
-            "human_player": human_player,
-            "bot_spec": bot_spec,
-            # the player (0 or 1) who resigned, if the game ended that way
+            "players": ids,
+            "human_player": humans[0] if len(humans) == 1 else None,
+            "bot_spec": next((pid for pid in ids if is_bot_spec(pid)), None),
             "resigned": resigned,
         },
     }
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
-    print(f"Saved game to {path}")
     return path
 
 
-def _rate_game(game: GameProtocol, name: str, human_num: int, bot_spec: str, game_path: str) -> None:
-    """Record the result in ratings.jsonl and show the updated ratings of both sides."""
-    import ratings
-
-    p1, p2 = (name, bot_spec) if human_num == 0 else (bot_spec, name)
-    rec = ratings.record_game(p1, p2, game.winner, plies=len(game.moves), source="human", note=game_path)
-    fit = ratings.fit(ratings.load_games())
-    for r in fit.ratings:
-        if r.name in (rec["p1"], rec["p2"]):
-            print(f"  rating  {r.name:14s} {r.elo:6.0f} ± {r.ci95:.0f}   ({r.wins}-{r.losses} in {r.games} rated games)")
-    print("  (full table: python3 tools/rate.py)")
-
-def _load_gnn(model_path: str, device: str) -> None:
-    node_dim, global_dim = SAMPLE_ENC.data.x.size(1), SAMPLE_ENC.data.global_feats.size(1) # type: ignore
-    load_model(model_path, node_dim, global_dim, device=device)
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Play Rocks and Sticks")
-    parser.add_argument("--ai", choices=["rs", "mcts", "alphabeta", "ppo", "mcts-cpp", "alphabeta-cpp", "none"], default="none",
-                        help="opponent: rs = the strong alpha-beta engine (recommended); the others are the older bots")
-    parser.add_argument("--bot", type=str, default=None,
-                        help="play a bot by spec, e.g. rs:5s:4t, rs:100k, ab:3, mcts:3000 or random (see players/specs.py); "
-                             "overrides --ai. Games against --bot and --ai rs opponents are rated (python3 tools/rate.py)")
-    parser.add_argument("--name", type=str, default="you", help="your name in the ratings table (default: you)")
-    parser.add_argument("--no-rate", action="store_true", help="do not record this game in the ratings")
-    parser.add_argument("--rs-time", type=float, default=5.0, help="thinking time per move in seconds for --ai rs (default: 5)")
-    parser.add_argument("--rs-threads", type=int, default=4, help="search threads for --ai rs (default: 4)")
-    parser.add_argument("--no-ponder", action="store_true", help="--ai rs: do not let the engine think while you do")
-    parser.add_argument("--show-eval", action="store_true", help="draw the engine's evaluation bar while you play (--ai rs)")
-    parser.add_argument("--rs-weights", type=str, default=None, help="evaluation file for --ai rs (default: chosen by thinking time, see players/rs_player.py)")
-    parser.add_argument("--mcts-time-limit", type=float, default=None, help="time limit (seconds) for MCTS simulations")
-    parser.add_argument("--mcts-rollouts",type=int,default=None,help="number of rollouts for MCTS simulations")
-    parser.add_argument("--model", type=str, default=None, help="path to GNN weights to enable NN eval or PPO model for --ai ppo")
-    parser.add_argument("--policy", type=str, default=None, help="path to PolicyValueNet checkpoint for policy priors (mcts-cpp)")
-    parser.add_argument("--device", type=str, default="cpu", help="device for GNN)")
-    parser.add_argument("--ab-depth", type=int, default=3, help="search depth for alphabeta-cpp (default: 3)")
-    parser.add_argument("--ab-time-limit", type=int, default=0, help="time limit (ms) for alphabeta-cpp iterative deepening (0=use fixed depth)")
-    parser.add_argument("--native-model", type=str, default=None, help="path to native NN weights (.bin) for AB move ordering")
-    parser.add_argument("--nn-ordering-depth", type=int, default=2, help="min AB depth for NN move ordering (default: 2)")
-    parser.add_argument("--human-player", type=int, default=0, choices=[0, 1], help="which player the human controls (0 or 1)")
-    args = parser.parse_args()
-
-    cpp = args.ai in {"mcts-cpp", "alphabeta-cpp"}
-    human_num = int(args.human_player)
-    bot_num = 1 - human_num
-
-    if args.ai == "ppo":
-        if not args.model:
-            raise ValueError("--model (path to PPO model) is required for --ai ppo")
-        node_feat_dim = SAMPLE_ENC.data.x.size(1) # type: ignore
-        global_feat_dim = SAMPLE_ENC.data.global_feats.size(1)
-        model = PPOGNNPolicy(node_feat_dim=node_feat_dim, global_feat_dim=global_feat_dim)
-        state = torch.load(args.model, map_location=args.device)
-        model.load_state_dict(state)
-        model.eval()
-        opponent = PPOPlayer(bot_num, model, device=args.device)
-        print(f"Loaded PPO agent from {args.model} on device {args.device}.")
-    elif args.model:
-        print(f"Using GNN evaluator from {args.model} on device {args.device}.")
-        _load_gnn(args.model, args.device)
-
-    # bot_spec names the opponent exactly (players/specs.py); games against it are rated
-    bot_spec: str | None = None
-    if args.ai == "rs" and args.bot is None:
-        if args.rs_weights:
-            from players.rs_player import RSPlayer
-
-            opponent = RSPlayer(bot_num, time_ms=int(args.rs_time * 1000), weights=args.rs_weights, threads=args.rs_threads, tt_bits=23, verbose=True)
-            print("Custom weights: this game will not be rated.")
+def play_one(ids: list[str], seed: int, opts: dict) -> dict:
+    """Play one game between Player 1 = ids[0] and Player 2 = ids[1]; returns its result."""
+    display, show_eval = opts["display"], opts["show_eval"]
+    humans = [not is_bot_spec(pid) for pid in ids]
+    players: list[Player] = []
+    for n, pid in enumerate(ids):
+        if humans[n]:
+            players.append(HumanPlayer(n))
         else:
-            args.bot = f"rs:{int(round(args.rs_time * 1000))}ms:{args.rs_threads}t" + ("" if args.no_ponder else ":ponder")
-    if args.bot is not None:
-        from players.specs import canonical, describe, make_bot
-
-        bot_spec = canonical(args.bot)
-        opponent = make_bot(bot_spec, bot_num, seed=int.from_bytes(os.urandom(3), "little"), verbose=True)
-        print(f"Opponent: {bot_spec} ({describe(bot_spec)})")
-        cpp = True  # the old bots need the C++ game state alongside; harmless for the others
-    elif args.ai == "rs":
-        pass
-    elif args.ai == "mcts":
-        opponent = MCTSPlayer(bot_num, time_limit=args.mcts_time_limit, n_rollouts=args.mcts_rollouts, use_gnn=bool(args.model), check_forced_losses=not bool(args.model))
-    elif args.ai == "alphabeta":
-        opponent = AlphaBetaPlayer(bot_num, use_gnn=bool(args.model))
-    elif args.ai == "mcts-cpp":
-        rollouts = args.mcts_rollouts or 1200
-        if args.model:
-            opponent = MCTSPlayerCPP(bot_num, n_rollouts=rollouts, use_nn_value=True)
-            opponent.set_model_checkpoint(args.model, device=args.device)
-            if args.policy:
-                opponent.set_policy_checkpoint(args.policy, device=args.device)
-                try:
-                    opponent.engine.set_prior_params(0.04, 1.0)
-                except Exception:
-                    pass
-            opponent.set_exploration(dirichlet_alpha=0.0, dirichlet_epsilon=0.0,
-                                    temperature=0.0, temperature_moves=0)
-            print(f"C++ MCTS: {rollouts} rollouts, model={args.model}, policy={args.policy}")
-        else:
-            # No model: use heuristic evaluation at leaf nodes (much better than random rollouts)
-            opponent = MCTSPlayerCPP(bot_num, n_rollouts=rollouts,
-                                      use_nn_value=False, use_heuristic_rollout=True)
-            opponent.set_exploration(dirichlet_alpha=0.0, dirichlet_epsilon=0.0,
-                                    temperature=0.0, temperature_moves=0)
-            print(f"C++ MCTS: {rollouts} rollouts, heuristic eval (no GNN)")
-    elif args.ai == "alphabeta-cpp":
-        ab_depth = args.ab_depth
-        ab_time = args.ab_time_limit
-        native_model = getattr(args, 'native_model', None)
-        nn_ord_depth = getattr(args, 'nn_ordering_depth', 2)
-        if args.model:
-            opponent = AlphaBetaPlayerCPP(bot_num, depth=ab_depth, time_limit_ms=ab_time, max_depth=20,
-                                          native_model=native_model or "", nn_ordering_depth=nn_ord_depth)
-            opponent.set_model_checkpoint(args.model, device=args.device)
-            print(f"C++ AlphaBeta: depth={ab_depth}, time={ab_time}ms, GNN model={args.model}")
-        else:
-            opponent = AlphaBetaPlayerCPP(bot_num, depth=ab_depth, use_heuristic=True,
-                                          time_limit_ms=ab_time, max_depth=20,
-                                          native_model=native_model or "", nn_ordering_depth=nn_ord_depth)
-            if native_model:
-                print(f"C++ AlphaBeta: heuristic eval + native NN ordering (depth>={nn_ord_depth})")
-            if ab_time > 0:
-                print(f"C++ AlphaBeta: iterative deepening, {ab_time}ms/move, heuristic eval")
-            else:
-                print(f"C++ AlphaBeta: depth={ab_depth}, heuristic eval (no GNN)")
-    else:
-        opponent = HumanPlayer(bot_num)
-
-    if bot_spec is None and args.ai not in ("none", "rs"):
-        print("This opponent is not rated; use --bot (e.g. --bot ab:3 or --bot mcts:3000) for rated games.")
-
-    player_list: list[Player | None] = [None, None]
-    player_list[human_num] = HumanPlayer(human_num)
-    player_list[bot_num] = opponent
-    players: list[Player] = [p for p in player_list if p is not None]  # type: ignore
-    game: GameProtocol
-    if cpp:
-        print("Using C++ GameState backend via pybind11.")
+            bot = make_bot(pid, n, seed=seed + n, verbose=display)
+            if opts["rs_weights"] and pid.startswith("rs:"):
+                bot.engine.load_weights(opts["rs_weights"])  # type: ignore[attr-defined]
+            players.append(bot)
+    game = Game(players)
+    if any(needs_cpp_state(pid) for pid in ids):
         import players_ext
-        game = GameTotal(Game(players=players), players_ext.GameState()) # type: ignore
-    else:
-        game = Game(players=players)
 
+        from players.game_total import GameTotal
 
+        game = GameTotal(game, players_ext.GameState())  # type: ignore
+    if opts["random_start"]:
+        from gnn.game_generation import randomize_start
+
+        random.seed(seed)
+        randomize_start(game, max_sticks=5)
+
+    def show(ev=None) -> None:
+        if not display:
+            return
+        import matplotlib.pyplot as plt
+
+        game.render(block=False, game_index=opts["index"], total_games=opts["total"])
+        if show_eval:
+            from players.rs_display import draw_eval_bar
+
+            draw_eval_bar(plt.gcf(), ev)
+        if not any(humans):
+            plt.pause(opts["delay"])
 
     evals: list = []
-    resigned: int | None = None
-    while True:
-        print(f"Turn {game.turn_number}")
-        for player in players:
-            game.render(block=False)
-            t0 = time.perf_counter()
-            try:
-                m = player.get_move(game)
-            except Resigned as r:
-                # the other player wins; the game is saved and rated like any other loss
-                resigned = r.player
-                game.winner = 1 - r.player
-                getattr(game, "py", game).result_note = f"Player {r.player + 1} resigned"
-                print(f"Player {r.player + 1} resigns.")
-                break
-            dt = time.perf_counter() - t0
-            info = getattr(player, "last_info", None) if player is opponent else None
-            evals.append({"score": int(info["score"]), "depth": int(info["depth"]), "mover": player.number} if info else None)
-            # Only print timing for non-human players (bots).
-            if player.__class__.__name__ != "HumanPlayer":
-                print(f"Player {player.number + 1} ({player.__class__.__name__}) move time: {dt:.3f}s")
-            if player.__class__.__name__ == "AlphaBetaPlayerCPP":
-                depth = int(getattr(player.engine, "last_depth_completed", -1)) # type: ignore
-                nodes = int(getattr(player.engine, "last_nodes_searched", -1)) # type: ignore
-                print(f"Player {player.number + 1} AlphaBeta stats: depth={depth}, nodes={nodes}")
-            print(f"Player {player.number + 1} plays {m}")
-            game.do_move(player.number, m)
-            game.render(block=False)
-            if info and args.show_eval:
-                import matplotlib.pyplot as plt
-
-                from players.rs_display import describe, draw_eval_bar
-
-                draw_eval_bar(plt.gcf(), describe(info["score"], player.number))
-
-        if game.winner is not None:
-            if resigned is None:
-                print(f"player {game.winner + 1} wins with area {game.players_scores[game.winner] / 2}")
-            else:
-                print(f"player {game.winner + 1} wins by resignation")
-            # save (and rate) before showing the final board: closing the terminal instead of
-            # the window must not lose the game
-            stop = getattr(opponent, "stop_pondering", None)
-            if stop is not None:
-                stop()
-            path = _save_game(game, opponent, save_dir="saved_games_human", evals=evals, human_player=human_num, bot_spec=bot_spec, resigned=resigned)
-            if bot_spec is not None and not args.no_rate:
-                _rate_game(game, args.name, human_num, bot_spec, path)
-            game.render(block=True)
+    book = [0, 0]
+    resigned = None
+    show()
+    while game.winner is None and len(game.moves) < opts["max_moves"]:
+        cp = game.current_player
+        t0 = time.perf_counter()
+        try:
+            m = players[cp].get_move(game)
+        except Resigned:
+            # the other player wins; the game is saved and rated like any other loss
+            resigned = cp
+            game.winner = 1 - cp
+            getattr(game, "py", game).result_note = f"Player {cp + 1} resigned"
             break
+        info = None if humans[cp] else getattr(players[cp], "last_info", None)
+        evals.append({"score": int(info["score"]), "depth": int(info["depth"]), "mover": cp} if info else None)
+        book[cp] += bool(info and info.get("book"))
+        if display:
+            took = "" if humans[cp] else f"  ({time.perf_counter() - t0:.1f}s)"
+            print(f"{len(game.moves) + 1:3d}. Player {cp + 1} ({ids[cp]}): {'pass' if m is PASS else f'{m.c[0]} {m.c[1]} {m.t}'}{took}")
+        game.do_move(cp, m)
+        ev = None
+        if show_eval and display:
+            from players.rs_display import describe, final
+
+            ev = final(game.winner) if game.winner is not None else (describe(info["score"], cp) if info else None)
+        show(ev)
+    for p in players:
+        getattr(p, "stop_pondering", lambda: None)()
+
+    result = {"winner": game.winner, "plies": len(game.moves), "moves": " ".join(repr(m) for m in game.moves), "book": book, "path": None}
+    if display:
+        if game.winner is None:
+            print(f"No winner after {len(game.moves)} moves")
+        else:
+            how = "by resignation" if resigned is not None else f"with area {game.players_scores[game.winner] / 2:g}"
+            print(f"Player {game.winner + 1} ({ids[game.winner]}) wins {how}")
+    save_dir = opts["save_dir"] or (SAVE_DIRS[0 if any(humans) else 1] if display else None)
+    if save_dir:
+        # saved before the final position is shown: closing the terminal must not lose the game
+        result["path"] = save_game(game, ids, evals, resigned, save_dir)
+        if display:
+            print(f"saved {result['path']}")
+    if resigned is not None:
+        show()
+    return result
+
+
+def _results(calls: list[tuple], jobs: int) -> Iterator[dict]:
+    if jobs > 1:
+        with ProcessPoolExecutor(max_workers=jobs) as ex:
+            yield from ex.map(play_one, *zip(*calls))
+    else:
+        for call in calls:
+            yield play_one(*call)
+
+
+def run_games(args) -> None:
+    try:
+        ids = [player_id(t, args.name) for t in args.players]
+    except ValueError as e:
+        raise SystemExit(str(e))
+    bots_only = all(is_bot_spec(pid) for pid in ids)
+    display = not args.no_display
+    if not bots_only and not display:
+        raise SystemExit("a person needs the window: drop --no-display")
+    rated = not args.no_rate and ids[0] != ids[1] and not args.random_start and not args.rs_weights
+    seed = args.seed if args.seed is not None else int.from_bytes(os.urandom(3), "little") * 1000
+    many = args.games > 1
+    opts = {
+        "display": display, "show_eval": args.show_eval or bots_only, "delay": args.delay, "max_moves": args.max_moves,
+        "random_start": args.random_start, "rs_weights": args.rs_weights, "save_dir": args.save_dir, "total": args.games if many else None,
+    }
+    # two different bots swap sides every game; a person keeps the side they asked for
+    swap = bots_only and ids[0] != ids[1]
+    order = [ids[::-1] if (swap and g % 2) else ids for g in range(args.games)]
+    # results are reported for Player 1 as named on the command line (for a bot against
+    # itself, simply for whoever moved first)
+    who = ids[0] if ids[0] != ids[1] else "Player 1"
+    jobs = 1 if display else max(1, args.jobs)
+    if jobs > 1 and any(pid.startswith("rs:") and pid.split(":")[1].endswith("s") for pid in ids):
+        print("note: a timed bot gets weaker when games run in parallel; consider --jobs 1 or a node budget such as rs:100k")
+    calls = [(order[g], seed + 10 * g, {**opts, "index": g if many else None}) for g in range(args.games)]
+
+    score, seen, book_moves = 0.0, set(), {pid: 0 for pid in ids}
+    for g, r in enumerate(_results(calls, jobs)):
+        p1, p2 = order[g]
+        if rated:
+            ratings.record_game(p1, p2, r["winner"], plies=r["plies"], source="match" if bots_only else "human", note=r["path"])
+        first = order[g] is ids
+        won = 0.5 if r["winner"] is None else float((r["winner"] == 0) == first)
+        score += won
+        seen.add(r["moves"])
+        book_moves[p1] += r["book"][0]
+        book_moves[p2] += r["book"][1]
+        if many or not display:
+            word = {1.0: "win", 0.0: "loss", 0.5: "unfinished"}[won]
+            print(f"  game {g + 1:3d}: {who} ({'first' if first else 'second'}) {word} in {r['plies']} moves   [{who} {score:g}/{g + 1}]", flush=True)
+        if display and g + 1 < args.games:
+            import matplotlib.pyplot as plt
+
+            plt.pause(max(3.0, 3 * args.delay))  # leave the final position up for a moment
+            plt.close("all")
+
+    if many:
+        print(f"{who} scored {score:g}/{args.games}" + (f" against {ids[1]}" if ids[0] != ids[1] else ""))
+        # repeated games add no information, so say how many were different
+        used = [f"{pid} {n / args.games / (2 if ids[0] == ids[1] else 1):.1f}" for pid, n in book_moves.items() if n]
+        print(f"{len(seen)} different games" + (f"; book moves per game: {', '.join(used)}" if used else ""))
+    if rated:
+        for r in ratings.fit(ratings.load_games()).ratings:
+            if r.name in ids:
+                print(f"  rating  {r.name:16s} {r.elo:6.0f} ± {r.ci95:.0f}   ({r.wins}-{r.losses} in {r.games} rated games)")
+        print("  (full table: python3 tools/rate.py)")
+    if display:
+        import matplotlib.pyplot as plt
+
+        print("Close the window to exit.")
+        plt.show()
+
+
+def replay(path: str, delay: float, analyse: float, threads: int) -> None:
+    """Show a saved game move by move, with the engine's evaluations if it has them (or, with
+    analyse > 0, with a fresh evaluation of every position after that many seconds' thought)."""
+    import matplotlib.pyplot as plt
+
+    from players.rs_display import describe, draw_eval_bar, final
+
+    with open(path, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    saved = payload.get("evals") or []
+    show_eval = analyse > 0 or any(saved)
+    analyst = None
+    if analyse > 0:
+        from players.rs_player import RSPlayer
+
+        analyst = RSPlayer(0, time_ms=int(analyse * 1000), threads=threads, tt_bits=22)
+    game = Game([RandomPlayer(0), RandomPlayer(1)])
+    game.render(block=False)
+    for i, mv in enumerate(payload["moves"]):
+        m = PASS if mv["t"] == "P" else Move(int(mv["x"]), int(mv["y"]), str(mv["t"]))
+        mover = int(mv["p"]) if mv.get("p") is not None else game.current_player
+        game.do_move(mover, m)
+        ev = None
+        if show_eval:
+            if game.winner is not None:
+                ev = final(game.winner)
+            elif analyst is not None:
+                info = analyst.analyse(game)
+                ev = describe(info["score"], info["mover"])
+            elif i < len(saved) and saved[i]:
+                # recorded by the engine just before it played this move
+                ev = describe(int(saved[i]["score"]), int(saved[i]["mover"]))
+        print(f"{i + 1:3d}. Player {mover + 1}: {m}" + (f"   {ev.text}" if ev is not None else ""))
+        game.render(block=False)
+        if show_eval:
+            draw_eval_bar(plt.gcf(), ev)
+        plt.pause(delay)
+    resigned = (payload.get("meta") or {}).get("resigned")
+    if game.winner is None and payload.get("winner") is not None and resigned is not None:
+        game.winner, game.result_note = payload["winner"], f"Player {resigned + 1} resigned"
+        game.render(block=False)
+    print(f"Game over. Winner: {'none' if payload.get('winner') is None else 'Player ' + str(payload['winner'] + 1)}")
+    plt.show()
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("players", nargs="*", help='Player 1 and Player 2: a bot spec, "human", or a person\'s name')
+    ap.add_argument("--games", type=int, default=1, help="games to play; bots swap sides each game")
+    ap.add_argument("--no-display", action="store_true", help="no window (bots only): just play and report")
+    ap.add_argument("--jobs", type=int, default=1, help="with --no-display: games played at once, one process each")
+    ap.add_argument("--delay", type=float, default=1.0, help="pause after each move when watching bots or a replay, in seconds")
+    ap.add_argument("--show-eval", action="store_true", help="draw the engine's evaluation bar while you play (always on when watching bots)")
+    ap.add_argument("--name", default="you", help='the rating name of "human" (default: you)')
+    ap.add_argument("--no-rate", action="store_true", help="do not add these games to the ratings")
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--max-moves", type=int, default=160, help="a game with no winner after this many moves is unfinished")
+    ap.add_argument("--random-start", action="store_true", help="start from a random position (unrated)")
+    ap.add_argument("--rs-weights", default=None, help="evaluation file for rs bots instead of their own (unrated)")
+    ap.add_argument("--save-dir", default=None, help=f"where to save games (default: {SAVE_DIRS[0]}/ or {SAVE_DIRS[1]}/ for games in a window, nowhere with --no-display)")
+    ap.add_argument("--replay", metavar="FILE", help="replay a saved game instead of playing")
+    ap.add_argument("--analyse", type=float, default=0.0, help="with --replay: have the engine evaluate each position for this many seconds")
+    ap.add_argument("--threads", type=int, default=4, help="search threads for --analyse")
+    args = ap.parse_args(argv)
+
+    if args.replay:
+        replay(args.replay, args.delay, args.analyse, args.threads)
+        return
+    if len(args.players) > 2:
+        ap.error("give at most two players")
+    if len(args.players) < 2:  # nobody named: you against the engine; one name: you against them
+        args.players = ["human"] + (args.players or [DEFAULT_OPPONENT])
+    run_games(args)
+
+
+if __name__ == "__main__":
+    main()

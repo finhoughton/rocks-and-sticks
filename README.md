@@ -1,24 +1,29 @@
 # Rocks and Sticks
 
-Implementation of the rocks and sicks abstract strategy game and AI opponents
-- Python game/rules logic
-- C++ search engine (`players_ext`) for fast AlphaBeta/MCTS
-- GNN value model training and evaluation
-- Self-play / retraining loops
+The rocks and sticks abstract strategy game (rules in `rules.txt`), with bots to play it.
 
-## Repository Layout
+## Where things are
 
-- `rules.txt`: rules of the game
-- `game.py`, `models.py`, `models.py`: core game logic
-- `main.py`: play games between human players or against a bot
-- `players_ext_src/`: C++ extension. Mainly for the oppoents but also has implementations of game logic etc for speed.
-- `engine_src/`: the `rs_engine` C++ alpha-beta engine (the strongest opponent) and its self-play tool
-- `tools/`: match runner and evaluation tuning for `rs_engine`
-- `players/`: AI Opponents
-- `gnn/`: GNN encoding, dataset loading, supervised training utilities
-- `rl/`: run-loop orchestration, self-play conversion/training pipeline
-- `scripts/`: scripts
-- `tests/`: pytest test suite
+Everything you run to play goes through one command, `main.py` (see "Playing" below).
+
+- `main.py`: play, watch, run matches, replay.
+- `game.py`, `models.py`, `constants.py`: the rules and the game window.
+- `players/`: every player. `specs.py` names the bots (`rs:5s:4t`, `ab:3`, ...); `rs_player.py`,
+  `rs_book.py` and `rs_display.py` wrap the rs engine, its opening book and its evaluation
+  display; the rest are the older bots.
+- `engine_src/`: the rs engine, the strongest bot (C++), with its opening book and
+  evaluation files. Built by `./build_engine.sh`.
+- `tools/`: working on the rs engine and the ratings: `rate.py` (ratings table),
+  `analyse.py` (search one position for a long time), `build_book.py` and `book_lines.py`
+  (opening book), `train_rs_mlp.py`, `tune_rs_eval.py` and `calibrate_rs_eval.py` (evaluation).
+- `ratings.py`, `ratings.jsonl`: the rating system and every rated game.
+- `tests/`: pytest suite.
+
+The older approach (a GNN evaluation trained by self-play, with C++ MCTS and alpha-beta),
+kept working but no longer developed:
+
+- `players_ext_src/`: the `players_ext` C++ extension (older alpha-beta, MCTS, game state).
+- `gnn/`, `rl/`, `scripts/`: GNN training, the self-play training loop and its evaluation scripts.
 
 ## Starting
 
@@ -40,22 +45,33 @@ python3 setup.py build_ext --inplace
 make test
 ```
 
-## Playing against the engine
+## Playing
+
+One command starts every kind of game. Its two arguments are Player 1 and Player 2: each a
+bot, or a person (`human`, or a name).
 
 ```bash
-python3 main.py --ai rs                    # you move first
-python3 main.py --ai rs --human-player 1   # the engine moves first
-python3 main.py --ai rs --rs-time 10       # seconds per engine move (default 5)
-python3 main.py --ai rs --no-ponder        # do not let it think while you do
+python3 main.py                              # you against the engine, you move first
+python3 main.py rs:5s:4t:ponder human        # the engine moves first
+python3 main.py rs:100k                      # you against a particular bot
+python3 main.py human human                  # two people at one screen
+python3 main.py rs:2s:4t rs:2s:4t --games 3  # watch two bots, with an evaluation bar
+python3 main.py rs:100k ab:3 --games 20 --no-display --jobs 4   # a quick match, no window
+python3 main.py --replay saved_games_human/game_00040.json --analyse 2   # replay a saved game
 ```
 
-With `--ai rs` the engine keeps thinking while you consider your move ("pondering"): it
-searches the position you face, so the search after your reply starts with much of its work
-done. The longer you think, the stronger its reply.
+Bots are named by spec (`players/specs.py`): `rs:<budget>[:<threads>t][:ponder][:nobook][:v<n>]`
+is the rs engine, with a budget of time per move (`5s`, `500ms`) or positions searched per
+move (`100k`, `1M`); `ab:<depth>`, `mcts:<rollouts>` and `random` are the older bots (their
+model-backed variants are listed in `specs.py`). With `:ponder` the engine keeps thinking
+while you consider your move, so the longer you think, the stronger its reply; the default
+opponent is `rs:5s:4t:ponder`.
 
-To watch the engine play itself: `python3 tools/watch.py` (see `--help` for time per move,
-number of games and pacing). To replay a saved game with the engine's evaluation of every
-position: `python3 scripts/rewatch.py saved_games_human/game_00036.json --analyse 2`.
+Games played in a window are saved (yours to `saved_games_human/`, bot games to
+`saved_games_bots/`) with the engine's evaluations, and `--replay` shows them move by move;
+`--analyse SECONDS` has the engine evaluate every position afresh. Every finished game
+between two differently named players is also added to the ratings (see below) unless you
+pass `--no-rate`. `python3 main.py --help` lists the remaining options.
 
 Evaluations read like chess ones. Positive favours Player 1, negative Player 2, scaled so
 a number means the same win chance as that many pawns on a chess analysis board (+1.0 is
@@ -99,7 +115,7 @@ line after each of its moves; add `--show-eval` to see the evaluation bar while 
 Compare engines or settings:
 
 ```bash
-python3 tools/arena.py --a rs:1s --b ab:3 --games 10       # against the older bots
+python3 main.py rs:1s ab:3 --games 10 --no-display          # against the older bots
 engine_src/rs_selfplay match --games 400 --nodes 100000 --threads 4 --open-min 0 --open-max 0 \
     --open-noise 40 --open-noise-plies 4 --weights engine_src/eval.txt --weights2 other.txt
 ```
@@ -117,20 +133,17 @@ the stronger side scores about 76%.
 
 ```bash
 python3 tools/rate.py                                 # the table
-python3 tools/rate.py match rs:100k ab:3 --games 20   # a rated bot-vs-bot match
 python3 tools/rate.py record you rs:5s:4t --winner 2  # a game played elsewhere
-python3 main.py --bot rs:100k                         # play a particular bot
+python3 main.py rs:100k ab:3 --games 20 --no-display  # a rated bot-vs-bot match
 ```
 
-Bots are named by spec (`players/specs.py`): `random`, `ab:<depth>`, `mcts:<rollouts>`,
-`rs:<budget>[:<threads>t][:nobook]` with a budget such as `5s`, `500ms`, `100k` or `1M`.
-Games you finish in `main.py` against `--bot` or `--ai rs` are recorded automatically under
-the name `you` (`--name` to change, `--no-rate` to skip). For bot-vs-bot matches prefer node
+Your games are recorded under the name `you` (`--name` to change, or give a name instead of
+`human`). For bot-vs-bot matches prefer node
 budgets: timed bots get weaker when something else is using the CPU. After changing how the
 engine plays, freeze the current version first (copy the engine sources, `eval.txt` as
 `weights.txt` and `book.json` to `engine_src/versions/v<n>/` and run `./build_engine.sh`), then
 bump `ENGINE_VERSION` in `players/rs_player.py`; benchmark with e.g.
-`python3 tools/rate.py match rs:100k rs:100k:v<n> --games 300 --jobs 4`. A match
+`python3 main.py rs:100k rs:100k:v<n> --games 300 --no-display --jobs 4`. A match
 ends by saying how many of its games were different (repeats add no information) and how
 many moves per game each bot took from the opening book.
 

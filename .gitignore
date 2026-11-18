@@ -9,7 +9,6 @@ test.txt
 !rl
 !players
 !scripts/eval.py
-!scripts/rewatch.py
 !tests
 !players_ext_src
 !engine_src
